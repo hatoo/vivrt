@@ -10,5 +10,8 @@ build = "build.rs"
 [dependencies]
 libloading = "0.8"
 
+[dev-dependencies]
+cudarc = { version = "0.19", default-features = false, features = ["driver", "dynamic-loading", "cuda-version-from-build-system"] }
+
 [build-dependencies]
 bindgen = "0.72"

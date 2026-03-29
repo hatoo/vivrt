@@ -3,7 +3,6 @@
 #![allow(non_snake_case)]
 
 mod init;
-pub mod cuda;
 
 // Generated FFI bindings from OptiX headers
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

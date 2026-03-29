@@ -1,15 +1,15 @@
+use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
 use optix::*;
 use optix::accel::{self, AccelBuildOptions, BuildInput, TriangleArrayInput};
-use optix_sys::cuda::{CudaApi, CUDA_SUCCESS};
-use std::ffi::c_void;
 use std::mem;
-use std::ptr;
+use std::sync::Arc;
 
 const WIDTH: u32 = 1024;
 const HEIGHT: u32 = 768;
 
 // Must match devicecode.h layout exactly
 #[repr(C)]
+#[derive(Copy, Clone)]
 struct Params {
     image: CUdeviceptr,
     image_width: u32,
@@ -35,198 +35,181 @@ struct MissData {
 #[derive(Copy, Clone)]
 struct HitGroupData {}
 
-macro_rules! cuda_check {
-    ($cuda:expr, $call:expr) => {
-        assert_eq!($call, CUDA_SUCCESS, "CUDA error");
-    };
+/// Allocate device memory and copy a value into it. Returns raw CUdeviceptr.
+fn alloc_and_copy<T>(stream: &Arc<cudarc::driver::CudaStream>, val: &T) -> CUdeviceptr {
+    let size = mem::size_of_val(val);
+    let cu_stream = stream.cu_stream();
+    unsafe {
+        let dptr = cudarc::driver::result::malloc_async(cu_stream, size).unwrap();
+        cudarc::driver::result::memcpy_htod_async(
+            dptr,
+            std::slice::from_raw_parts(val as *const T as *const u8, size),
+            cu_stream,
+        )
+        .unwrap();
+        dptr as CUdeviceptr
+    }
+}
+
+/// Get the raw CUdeviceptr from a CudaSlice.
+fn dptr<T>(slice: &CudaSlice<T>, stream: &cudarc::driver::CudaStream) -> CUdeviceptr {
+    let (ptr, _sync) = slice.device_ptr(stream);
+    ptr as CUdeviceptr
 }
 
 fn main() {
-    let cu = CudaApi::load().expect("Failed to load CUDA");
+    // --- CUDA init (via cudarc) ---
+    let cuda_ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+    let stream = cuda_ctx.default_stream();
+    let cu_stream = stream.cu_stream() as optix_sys::CUstream;
+
+    // --- OptiX init ---
     let optix_handle = optix::init().expect("Failed to initialize OptiX");
+    let ctx = DeviceContext::new(
+        &optix_handle,
+        cuda_ctx.cu_ctx() as optix_sys::CUcontext,
+        &DeviceContextOptions::default(),
+    )
+    .expect("Failed to create OptiX context");
 
-    unsafe {
-        // --- CUDA init ---
-        cuda_check!(cu, (cu.cuInit)(0));
-        let mut cu_device: i32 = 0;
-        cuda_check!(cu, (cu.cuDeviceGet)(&mut cu_device, 0));
-        let mut cu_ctx: CUcontext = ptr::null_mut();
-        cuda_check!(cu, (cu.cuCtxCreate_v2)(&mut cu_ctx, 0, cu_device));
-        let mut stream: CUstream = ptr::null_mut();
-        cuda_check!(cu, (cu.cuStreamCreate)(&mut stream, 0));
+    // --- Module ---
+    let pipeline_options = PipelineCompileOptions::new("params")
+        .traversable_graph_flags(TraversableGraphFlags::ALLOW_SINGLE_GAS)
+        .num_payload_values(3)
+        .num_attribute_values(3);
 
-        // --- OptiX context ---
-        let ctx = DeviceContext::new(&optix_handle, cu_ctx, &DeviceContextOptions::default())
-            .expect("Failed to create OptiX context");
-
-        // --- Module ---
-        let pipeline_options = PipelineCompileOptions::new("params")
-            .traversable_graph_flags(TraversableGraphFlags::ALLOW_SINGLE_GAS)
-            .num_payload_values(3)
-            .num_attribute_values(3);
-
-        let module_options = ModuleCompileOptions::default();
-        let ptx_path = std::path::Path::new(file!()).parent().unwrap().join("devicecode.ptx");
-        let ptx = std::fs::read_to_string(&ptx_path)
-            .unwrap_or_else(|_| panic!(
-                "Failed to load {}. Compile it first:\n  \
-                 nvcc -ptx examples/devicecode.cu -o examples/devicecode.ptx \
-                 -I\"<OptiX SDK>/include\" -Iexamples --use_fast_math",
-                ptx_path.display()
-            ));
-        let module = Module::new(&ctx, &module_options, &pipeline_options, ptx.as_bytes())
-            .expect("Failed to create module")
-            .value;
-
-        // --- Program groups ---
-        let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg")
-            .expect("raygen").value;
-        let miss_pg = ProgramGroup::miss(&ctx, &module, "__miss__ms")
-            .expect("miss").value;
-        let hitgroup_pg = ProgramGroup::hitgroup(&ctx)
-            .closest_hit(&module, "__closesthit__ch")
-            .build()
-            .expect("hitgroup").value;
-
-        // --- Pipeline ---
-        let link_options = PipelineLinkOptions { max_trace_depth: 1 };
-        let pipeline = Pipeline::new(
-            &ctx,
-            &pipeline_options,
-            &link_options,
-            &[&raygen_pg, &miss_pg, &hitgroup_pg],
+    let ptx_path = std::path::Path::new(file!()).parent().unwrap().join("devicecode.ptx");
+    let ptx = std::fs::read_to_string(&ptx_path).unwrap_or_else(|_| {
+        panic!(
+            "Failed to load {}. Compile it first:\n  \
+             nvcc -ptx examples/devicecode.cu -o examples/devicecode.ptx \
+             -I\"<OptiX SDK>/include\" -Iexamples --use_fast_math",
+            ptx_path.display()
         )
-        .expect("pipeline")
+    });
+    let module = Module::new(
+        &ctx,
+        &ModuleCompileOptions::default(),
+        &pipeline_options,
+        ptx.as_bytes(),
+    )
+    .expect("Failed to create module")
+    .value;
+
+    // --- Program groups ---
+    let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg")
+        .expect("raygen")
         .value;
-        pipeline.set_stack_size(2048, 2048, 2048, 1).expect("stack size");
+    let miss_pg = ProgramGroup::miss(&ctx, &module, "__miss__ms")
+        .expect("miss")
+        .value;
+    let hitgroup_pg = ProgramGroup::hitgroup(&ctx)
+        .closest_hit(&module, "__closesthit__ch")
+        .build()
+        .expect("hitgroup")
+        .value;
 
-        // --- Acceleration structure ---
-        let vertices: [[f32; 3]; 3] = [
-            [-0.5, -0.5, 0.0],
-            [0.5, -0.5, 0.0],
-            [0.0, 0.5, 0.0],
-        ];
-        let mut d_vertices: CUdeviceptr = 0;
-        cuda_check!(cu, (cu.cuMemAlloc_v2)(&mut d_vertices, mem::size_of_val(&vertices)));
-        cuda_check!(cu, (cu.cuMemcpyHtoD_v2)(d_vertices, vertices.as_ptr() as *const c_void, mem::size_of_val(&vertices)));
+    // --- Pipeline ---
+    let pipeline = Pipeline::new(
+        &ctx,
+        &pipeline_options,
+        &PipelineLinkOptions { max_trace_depth: 1 },
+        &[&raygen_pg, &miss_pg, &hitgroup_pg],
+    )
+    .expect("pipeline")
+    .value;
+    pipeline.set_stack_size(2048, 2048, 2048, 1).unwrap();
 
-        let vertex_buffers = [d_vertices];
-        let geo_flags = [GeometryFlags::NONE];
-        let tri_input = TriangleArrayInput::new(
+    // --- Acceleration structure ---
+    let vertices: [f32; 9] = [
+        -0.5, -0.5, 0.0,
+        0.5, -0.5, 0.0,
+        0.0, 0.5, 0.0,
+    ];
+    let d_vertices = stream.clone_htod(&vertices).unwrap();
+    let d_vertices_ptr = dptr(&d_vertices, &stream);
+    let vertex_buffers = [d_vertices_ptr];
+    let geo_flags = [GeometryFlags::NONE];
+
+    let build_options = AccelBuildOptions {
+        build_flags: BuildFlags::ALLOW_COMPACTION,
+        operation: BuildOperation::Build,
+    };
+
+    let make_tri_input = || {
+        TriangleArrayInput::new(
             &vertex_buffers, 3, VertexFormat::Float3,
             3 * mem::size_of::<f32>() as u32, &geo_flags,
-        );
+        )
+    };
 
-        let build_options = AccelBuildOptions {
-            build_flags: BuildFlags::ALLOW_COMPACTION,
-            operation: BuildOperation::Build,
-        };
+    let sizes = accel::accel_compute_memory_usage(
+        &ctx, &build_options, &[BuildInput::Triangles(make_tri_input())],
+    )
+    .expect("accel memory");
 
-        let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &[BuildInput::Triangles(tri_input)])
-            .expect("accel memory");
+    let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.unwrap();
+    let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
 
-        let mut d_temp: CUdeviceptr = 0;
-        let mut d_output: CUdeviceptr = 0;
-        cuda_check!(cu, (cu.cuMemAlloc_v2)(&mut d_temp, sizes.temp_size));
-        cuda_check!(cu, (cu.cuMemAlloc_v2)(&mut d_output, sizes.output_size));
+    let gas_handle = accel::accel_build(
+        &ctx, cu_stream, &build_options,
+        &[BuildInput::Triangles(make_tri_input())],
+        dptr(&d_temp, &stream), sizes.temp_size,
+        dptr(&d_output, &stream), sizes.output_size,
+    )
+    .expect("accel build");
 
-        // Need to recreate tri_input since it was moved
-        let tri_input2 = TriangleArrayInput::new(
-            &vertex_buffers, 3, VertexFormat::Float3,
-            3 * mem::size_of::<f32>() as u32, &geo_flags,
-        );
-        let gas_handle = accel::accel_build(
-            &ctx, stream, &build_options, &[BuildInput::Triangles(tri_input2)],
-            d_temp, sizes.temp_size, d_output, sizes.output_size,
-        ).expect("accel build");
+    stream.synchronize().unwrap();
+    drop(d_temp);
 
-        cuda_check!(cu, (cu.cuStreamSynchronize)(stream));
-        cuda_check!(cu, (cu.cuMemFree_v2)(d_temp));
+    // --- SBT ---
+    let raygen_record = SbtRecord::new(&raygen_pg, RayGenData {}).unwrap();
+    let miss_record = SbtRecord::new(&miss_pg, MissData { bg_color: [0.1, 0.1, 0.3] }).unwrap();
+    let hitgroup_record = SbtRecord::new(&hitgroup_pg, HitGroupData {}).unwrap();
 
-        // --- SBT ---
-        let raygen_record = SbtRecord::new(&raygen_pg, RayGenData {}).expect("raygen sbt");
-        let miss_record = SbtRecord::new(&miss_pg, MissData { bg_color: [0.1, 0.1, 0.3] }).expect("miss sbt");
-        let hitgroup_record = SbtRecord::new(&hitgroup_pg, HitGroupData {}).expect("hitgroup sbt");
+    let d_rg = alloc_and_copy(&stream, &raygen_record);
+    let d_ms = alloc_and_copy(&stream, &miss_record);
+    let d_hg = alloc_and_copy(&stream, &hitgroup_record);
 
-        let mut d_rg: CUdeviceptr = 0;
-        let mut d_ms: CUdeviceptr = 0;
-        let mut d_hg: CUdeviceptr = 0;
-        let rg_size = mem::size_of_val(&raygen_record);
-        let ms_size = mem::size_of_val(&miss_record);
-        let hg_size = mem::size_of_val(&hitgroup_record);
+    let sbt = ShaderBindingTableBuilder::new(d_rg)
+        .miss_records(d_ms, mem::size_of_val(&miss_record) as u32, 1)
+        .hitgroup_records(d_hg, mem::size_of_val(&hitgroup_record) as u32, 1)
+        .build()
+        .expect("SBT build");
 
-        cuda_check!(cu, (cu.cuMemAlloc_v2)(&mut d_rg, rg_size));
-        cuda_check!(cu, (cu.cuMemAlloc_v2)(&mut d_ms, ms_size));
-        cuda_check!(cu, (cu.cuMemAlloc_v2)(&mut d_hg, hg_size));
-        cuda_check!(cu, (cu.cuMemcpyHtoD_v2)(d_rg, &raygen_record as *const _ as *const c_void, rg_size));
-        cuda_check!(cu, (cu.cuMemcpyHtoD_v2)(d_ms, &miss_record as *const _ as *const c_void, ms_size));
-        cuda_check!(cu, (cu.cuMemcpyHtoD_v2)(d_hg, &hitgroup_record as *const _ as *const c_void, hg_size));
+    // --- Output image ---
+    let pixel_count = (WIDTH * HEIGHT) as usize;
+    let d_image: CudaSlice<u32> = stream.alloc_zeros(pixel_count).unwrap();
 
-        let sbt = ShaderBindingTableBuilder::new(d_rg)
-            .miss_records(d_ms, ms_size as u32, 1)
-            .hitgroup_records(d_hg, hg_size as u32, 1)
-            .build()
-            .expect("SBT build");
+    let params = Params {
+        image: dptr(&d_image, &stream),
+        image_width: WIDTH,
+        image_height: HEIGHT,
+        cam_eye: [0.0, 0.0, 2.0],
+        cam_u: [1.2, 0.0, 0.0],
+        cam_v: [0.0, 0.9, 0.0],
+        cam_w: [0.0, 0.0, -1.0],
+        handle: gas_handle,
+    };
+    let d_params = alloc_and_copy(&stream, &params);
 
-        // --- Output image ---
-        let image_size = (WIDTH * HEIGHT) as usize * mem::size_of::<u32>();
-        let mut d_image: CUdeviceptr = 0;
-        cuda_check!(cu, (cu.cuMemAlloc_v2)(&mut d_image, image_size));
+    // --- Launch ---
+    println!("Launching OptiX render ({WIDTH} x {HEIGHT})...");
+    pipeline
+        .launch(cu_stream, d_params, mem::size_of::<Params>(), &sbt, WIDTH, HEIGHT, 1)
+        .expect("launch");
+    stream.synchronize().unwrap();
 
-        let params = Params {
-            image: d_image,
-            image_width: WIDTH,
-            image_height: HEIGHT,
-            cam_eye: [0.0, 0.0, 2.0],
-            cam_u: [1.2, 0.0, 0.0],
-            cam_v: [0.0, 0.9, 0.0],
-            cam_w: [0.0, 0.0, -1.0],
-            handle: gas_handle,
-        };
-
-        let mut d_params: CUdeviceptr = 0;
-        let params_size = mem::size_of::<Params>();
-        cuda_check!(cu, (cu.cuMemAlloc_v2)(&mut d_params, params_size));
-        cuda_check!(cu, (cu.cuMemcpyHtoD_v2)(d_params, &params as *const _ as *const c_void, params_size));
-
-        // --- Launch ---
-        println!("Launching OptiX render ({} x {})...", WIDTH, HEIGHT);
-        pipeline.launch(stream, d_params, params_size, &sbt, WIDTH, HEIGHT, 1)
-            .expect("launch");
-        cuda_check!(cu, (cu.cuStreamSynchronize)(stream));
-
-        // --- Download and save ---
-        let mut pixels = vec![0u32; (WIDTH * HEIGHT) as usize];
-        cuda_check!(cu, (cu.cuMemcpyDtoH_v2)(pixels.as_mut_ptr() as *mut c_void, d_image, image_size));
-        save_ppm("output.ppm", WIDTH, HEIGHT, &pixels);
-        println!("Saved output.ppm ({} x {})", WIDTH, HEIGHT);
-
-        // --- Cleanup ---
-        // Drop OptiX resources before destroying CUDA context.
-        drop(pipeline);
-        drop(hitgroup_pg);
-        drop(miss_pg);
-        drop(raygen_pg);
-        drop(module);
-        drop(ctx);
-
-        cuda_check!(cu, (cu.cuMemFree_v2)(d_image));
-        cuda_check!(cu, (cu.cuMemFree_v2)(d_params));
-        cuda_check!(cu, (cu.cuMemFree_v2)(d_rg));
-        cuda_check!(cu, (cu.cuMemFree_v2)(d_ms));
-        cuda_check!(cu, (cu.cuMemFree_v2)(d_hg));
-        cuda_check!(cu, (cu.cuMemFree_v2)(d_output));
-        cuda_check!(cu, (cu.cuMemFree_v2)(d_vertices));
-
-        cuda_check!(cu, (cu.cuStreamDestroy_v2)(stream));
-        cuda_check!(cu, (cu.cuCtxDestroy_v2)(cu_ctx));
-    }
+    // --- Download and save ---
+    let pixels = stream.clone_dtoh(&d_image).unwrap();
+    save_ppm("output.ppm", WIDTH, HEIGHT, &pixels);
+    println!("Saved output.ppm ({WIDTH} x {HEIGHT})");
 }
 
 fn save_ppm(path: &str, width: u32, height: u32, pixels: &[u32]) {
     use std::io::Write;
     let mut file = std::fs::File::create(path).expect("Failed to create output file");
-    write!(file, "P6\n{} {}\n255\n", width, height).unwrap();
+    write!(file, "P6\n{width} {height}\n255\n").unwrap();
     for y in (0..height).rev() {
         for x in 0..width {
             let pixel = pixels[(y * width + x) as usize];
