@@ -485,14 +485,14 @@ fn parse_scene(input: &str) -> ParsedScene {
                     "bilinearmesh" => {
                         // Convert bilinear patch (4 vertices) to 2 triangles.
                         // PBRT vertex order: P0=bottom-left, P1=bottom-right,
-                        // P2=top-left, P3=top-right.
-                        // Use parametric (s,t) as UVs so linear interpolation
-                        // on triangles matches PBRT's bilinear interpolation.
+                        // P2=top-left, P3=top-right with parametric (s,t):
+                        // P0=(0,0), P1=(1,0), P2=(0,1), P3=(1,1).
+                        // Use parametric coords as UVs for correct linear
+                        // interpolation on the triangulated patch.
                         let verts: Vec<f32> = get_param_floats(params, "P")
                             .map(|v| v.iter().map(|x| *x as f32).collect())
                             .unwrap_or_default();
-                        let texcoords = if get_param_floats(params, "uv").is_some() {
-                            // Use parametric coords: P0=(0,0), P1=(1,0), P2=(0,1), P3=(1,1)
+                        let texcoords: Vec<f32> = if get_param_floats(params, "uv").is_some() {
                             vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]
                         } else {
                             Vec::new()
