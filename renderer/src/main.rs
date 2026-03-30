@@ -1034,18 +1034,20 @@ fn compute_camera(
     let wlen = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
     let w = [w[0] / wlen, w[1] / wlen, w[2] / wlen];
 
+    // u = normalize(cross(up, w)) = camera right
     let u = [
-        w[1] * up[2] - w[2] * up[1],
-        w[2] * up[0] - w[0] * up[2],
-        w[0] * up[1] - w[1] * up[0],
+        up[1] * w[2] - up[2] * w[1],
+        up[2] * w[0] - up[0] * w[2],
+        up[0] * w[1] - up[1] * w[0],
     ];
     let ulen = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
     let u = [u[0] / ulen, u[1] / ulen, u[2] / ulen];
 
+    // v = cross(w, u) = camera up
     let v = [
-        u[1] * w[2] - u[2] * w[1],
-        u[2] * w[0] - u[0] * w[2],
-        u[0] * w[1] - u[1] * w[0],
+        w[1] * u[2] - w[2] * u[1],
+        w[2] * u[0] - w[0] * u[2],
+        w[0] * u[1] - w[1] * u[0],
     ];
 
     let half_h = (fov.to_radians() * 0.5).tan();
