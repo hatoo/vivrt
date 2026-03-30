@@ -39,6 +39,7 @@ pub enum AccelEmitProperty {
 /// This enum replaces the raw `OptixBuildInput` union with a type-safe interface.
 pub enum BuildInput<'a> {
     Triangles(TriangleArrayInput<'a>),
+    Spheres(SphereArrayInput<'a>),
     CustomPrimitives(CustomPrimitiveInput<'a>),
     Instances(InstanceArrayInput),
 }
@@ -108,6 +109,20 @@ pub struct CustomPrimitiveInput<'a> {
     pub primitive_index_offset: u32,
 }
 
+/// Sphere primitive build input (uses OptiX built-in sphere intersection).
+pub struct SphereArrayInput<'a> {
+    /// Device pointer to sphere center positions (float3 per sphere).
+    pub vertex_buffers: &'a [optix_sys::CUdeviceptr],
+    pub vertex_stride: u32,
+    pub num_vertices: u32,
+    /// Device pointer to sphere radii (float per sphere, or single float if `single_radius` is true).
+    pub radius_buffers: &'a [optix_sys::CUdeviceptr],
+    pub radius_stride: u32,
+    pub single_radius: bool,
+    pub flags: &'a [GeometryFlags],
+    pub num_sbt_records: u32,
+}
+
 /// Instance array build input for IAS (Instance Acceleration Structure).
 pub struct InstanceArrayInput {
     pub instances: optix_sys::CUdeviceptr,
@@ -139,6 +154,24 @@ fn build_input_to_raw(input: &BuildInput, raw_flags: &mut Vec<u32>) -> optix_sys
                 ..Default::default()
             };
             raw.__bindgen_anon_1 = optix_sys::OptixBuildInput__bindgen_ty_1 { triangleArray: ta };
+        }
+        BuildInput::Spheres(sp) => {
+            raw.type_ = optix_sys::OptixBuildInputType::OPTIX_BUILD_INPUT_TYPE_SPHERES;
+            let flags_start = raw_flags.len();
+            raw_flags.extend(sp.flags.iter().map(|f| f.bits()));
+
+            let sa = optix_sys::OptixBuildInputSphereArray {
+                vertexBuffers: sp.vertex_buffers.as_ptr(),
+                vertexStrideInBytes: sp.vertex_stride,
+                numVertices: sp.num_vertices,
+                radiusBuffers: sp.radius_buffers.as_ptr(),
+                radiusStrideInBytes: sp.radius_stride,
+                singleRadius: sp.single_radius as i32,
+                flags: raw_flags[flags_start..].as_ptr(),
+                numSbtRecords: sp.num_sbt_records,
+                ..Default::default()
+            };
+            raw.__bindgen_anon_1 = optix_sys::OptixBuildInput__bindgen_ty_1 { sphereArray: sa };
         }
         BuildInput::CustomPrimitives(cp) => {
             raw.type_ = optix_sys::OptixBuildInputType::OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;

@@ -233,6 +233,36 @@ impl PixelFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimitiveType {
+    Triangle,
+    Sphere,
+    Custom,
+    RoundLinear,
+    RoundQuadraticBspline,
+    RoundCubicBspline,
+    RoundCatmullrom,
+    RoundCubicBezier,
+    FlatQuadraticBspline,
+}
+
+impl PrimitiveType {
+    pub(crate) fn to_raw(self) -> optix_sys::OptixPrimitiveType {
+        use optix_sys::OptixPrimitiveType as R;
+        match self {
+            Self::Triangle => R::OPTIX_PRIMITIVE_TYPE_TRIANGLE,
+            Self::Sphere => R::OPTIX_PRIMITIVE_TYPE_SPHERE,
+            Self::Custom => R::OPTIX_PRIMITIVE_TYPE_CUSTOM,
+            Self::RoundLinear => R::OPTIX_PRIMITIVE_TYPE_ROUND_LINEAR,
+            Self::RoundQuadraticBspline => R::OPTIX_PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE,
+            Self::RoundCubicBspline => R::OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BSPLINE,
+            Self::RoundCatmullrom => R::OPTIX_PRIMITIVE_TYPE_ROUND_CATMULLROM,
+            Self::RoundCubicBezier => R::OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BEZIER,
+            Self::FlatQuadraticBspline => R::OPTIX_PRIMITIVE_TYPE_FLAT_QUADRATIC_BSPLINE,
+        }
+    }
+}
+
 // --- Bitflags ---
 
 bitflags::bitflags! {

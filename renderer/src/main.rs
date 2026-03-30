@@ -603,19 +603,37 @@ fn main() {
     let ptx_src = ptx.to_src();
 
     // --- OptiX pipeline ---
-    let pipeline_options = PipelineCompileOptions::new("params")
-        .traversable_graph_flags(TraversableGraphFlags::ALLOW_SINGLE_GAS)
-        .num_payload_values(10)
-        .num_attribute_values(2);
+    let has_spheres = scene.objects.iter().any(|o| matches!(o.shape, SceneShape::Sphere { .. }));
 
-    let module = Module::new(
-        &ctx,
-        &ModuleCompileOptions::default(),
-        &pipeline_options,
-        ptx_src.as_bytes(),
-    )
-    .expect("module")
-    .value;
+    let mut prim_flags = PrimitiveTypeFlags::TRIANGLE;
+    if has_spheres {
+        prim_flags |= PrimitiveTypeFlags::SPHERE;
+    }
+
+    let pipeline_options = PipelineCompileOptions::new("params")
+        .traversable_graph_flags(if has_spheres {
+            TraversableGraphFlags::ALLOW_SINGLE_LEVEL_INSTANCING
+        } else {
+            TraversableGraphFlags::ALLOW_SINGLE_GAS
+        })
+        .num_payload_values(10)
+        .num_attribute_values(2)
+        .uses_primitive_type_flags(prim_flags);
+
+    let module_opts = ModuleCompileOptions::default();
+    let module = Module::new(&ctx, &module_opts, &pipeline_options, ptx_src.as_bytes())
+        .expect("module")
+        .value;
+
+    // Get built-in sphere intersection module if needed
+    let sphere_is_module = if has_spheres {
+        Some(
+            Module::builtin_is(&ctx, &module_opts, &pipeline_options, PrimitiveType::Sphere)
+                .expect("sphere IS module"),
+        )
+    } else {
+        None
+    };
 
     let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg")
         .expect("raygen")
@@ -624,17 +642,29 @@ fn main() {
         .expect("miss")
         .value;
 
-    // Two hit group programs: one for triangle meshes, one for spheres
     let hitgroup_tri_pg = ProgramGroup::hitgroup(&ctx)
         .closest_hit(&module, "__closesthit__ch")
         .build()
         .expect("hitgroup_tri")
         .value;
-    let hitgroup_sphere_pg = ProgramGroup::hitgroup(&ctx)
-        .closest_hit(&module, "__closesthit__sphere")
-        .build()
-        .expect("hitgroup_sphere")
-        .value;
+
+    let hitgroup_sphere_pg = if let Some(ref is_mod) = sphere_is_module {
+        Some(
+            ProgramGroup::hitgroup(&ctx)
+                .closest_hit(&module, "__closesthit__sphere")
+                .intersection(is_mod, "")
+                .build()
+                .expect("hitgroup_sphere")
+                .value,
+        )
+    } else {
+        None
+    };
+
+    let mut all_pgs: Vec<&ProgramGroup> = vec![&raygen_pg, &miss_pg, &hitgroup_tri_pg];
+    if let Some(ref pg) = hitgroup_sphere_pg {
+        all_pgs.push(pg);
+    }
 
     let pipeline = Pipeline::new(
         &ctx,
@@ -642,39 +672,67 @@ fn main() {
         &PipelineLinkOptions {
             max_trace_depth: scene.max_depth,
         },
-        &[&raygen_pg, &miss_pg, &hitgroup_tri_pg, &hitgroup_sphere_pg],
+        &all_pgs,
     )
     .expect("pipeline")
     .value;
-    pipeline.set_stack_size(2048, 2048, 2048, 1).unwrap();
+    pipeline.set_stack_size(2048, 2048, 2048, 2).unwrap();
 
     // --- Build geometry ---
-    // Collect all triangle meshes and spheres, build a single GAS
-    let mut build_inputs: Vec<BuildInput> = Vec::new();
-    // We need to keep device buffers alive
+    // Separate GASes for triangles and spheres (OptiX requires same prim type per GAS)
     let mut _device_buffers: Vec<CudaSlice<u8>> = Vec::new();
-    let mut _vertex_ptrs: Vec<Vec<optix_sys::CUdeviceptr>> = Vec::new();
-    let mut _flags: Vec<Vec<GeometryFlags>> = Vec::new();
-    let mut hitgroup_records: Vec<(bool, HitGroupData)> = Vec::new(); // (is_sphere, data)
+
+    struct GasEntry {
+        handle: optix_sys::OptixTraversableHandle,
+        sbt_offset: u32,
+        transform: [f32; 12],
+        is_sphere: bool,
+    }
+    let mut gas_entries: Vec<GasEntry> = Vec::new();
+    let mut tri_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
+    let mut sphere_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
+
+    let build_options = AccelBuildOptions {
+        build_flags: BuildFlags::PREFER_FAST_TRACE,
+        operation: BuildOperation::Build,
+    };
 
     for obj in &scene.objects {
         match &obj.shape {
             SceneShape::Sphere { radius } => {
-                // Create sphere as a set of triangles approximating it, OR use built-in sphere
-                // For simplicity, approximate sphere with an icosphere
-                let (verts, normals, indices) = make_sphere_mesh(*radius, 4);
+                // Single sphere: center at origin (transform applied via IAS instance)
+                let center = [0.0f32, 0.0, 0.0];
+                let radius_val = [*radius];
 
-                // Apply transform
-                let transformed_verts = transform_vertices(&verts, &obj.transform);
-                // Transform normals (rotation only, no translation)
-                let transformed_normals = transform_normals(&normals, &obj.transform);
+                let d_center = stream.clone_htod(&center).unwrap();
+                let d_radius = stream.clone_htod(&radius_val).unwrap();
+                let center_ptrs = [dptr(&d_center, &stream)];
+                let radius_ptrs = [dptr(&d_radius, &stream)];
+                let flags = [GeometryFlags::NONE];
 
-                let d_verts = stream.clone_htod(&transformed_verts).unwrap();
-                let d_normals = stream.clone_htod(&transformed_normals).unwrap();
-                let d_indices = stream.clone_htod(&indices).unwrap();
-                let vbuf = vec![dptr(&d_verts, &stream)];
+                let sphere_input = accel::SphereArrayInput {
+                    vertex_buffers: &center_ptrs,
+                    vertex_stride: 0,
+                    num_vertices: 1,
+                    radius_buffers: &radius_ptrs,
+                    radius_stride: 0,
+                    single_radius: true,
+                    flags: &flags,
+                    num_sbt_records: 1,
+                };
 
-                let flags = vec![GeometryFlags::NONE];
+                let bi = [BuildInput::Spheres(sphere_input)];
+                let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &bi)
+                    .expect("sphere accel memory");
+                let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.unwrap();
+                let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
+
+                let handle = accel::accel_build(
+                    &ctx, cu_stream, &build_options, &bi,
+                    dptr(&d_temp, &stream), sizes.temp_size,
+                    dptr(&d_output, &stream), sizes.output_size,
+                )
+                .expect("sphere accel build");
 
                 let hg_data = HitGroupData {
                     material_type: obj.material.material_type,
@@ -686,23 +744,27 @@ fn main() {
                     checker_color1: [0.0; 3],
                     checker_color2: [0.0; 3],
                     texcoords: 0,
-                    normals: dptr(&d_normals, &stream),
-                    indices: dptr(&d_indices, &stream),
-                    vertices: dptr(&d_verts, &stream),
-                    num_vertices: transformed_verts.len() as i32 / 3,
+                    normals: 0,
+                    indices: 0,
+                    vertices: 0,
+                    num_vertices: 0,
                 };
-                let nb: CudaSlice<u8> = unsafe { std::mem::transmute(d_normals) };
-                _device_buffers.push(nb);
 
-                _vertex_ptrs.push(vbuf);
-                _flags.push(flags);
-                hitgroup_records.push((false, hg_data));
+                let sbt_offset = sphere_hg_records.len() as u32;
+                sphere_hg_records
+                    .push(SbtRecord::new(hitgroup_sphere_pg.as_ref().unwrap(), hg_data).unwrap());
 
-                // Store device buffers to keep alive
-                let vb: CudaSlice<u8> = unsafe { std::mem::transmute(d_verts) };
-                let ib: CudaSlice<u8> = unsafe { std::mem::transmute(d_indices) };
-                _device_buffers.push(vb);
-                _device_buffers.push(ib);
+                gas_entries.push(GasEntry {
+                    handle,
+                    sbt_offset,
+                    transform: obj.transform,
+                    is_sphere: true,
+                });
+
+                _device_buffers.push(unsafe { std::mem::transmute(d_center) });
+                _device_buffers.push(unsafe { std::mem::transmute(d_radius) });
+                _device_buffers.push(d_temp);
+                _device_buffers.push(d_output);
             }
             SceneShape::TriangleMesh {
                 vertices,
@@ -710,21 +772,43 @@ fn main() {
                 texcoords,
             } => {
                 let transformed = transform_vertices(vertices, &obj.transform);
-
                 let d_verts = stream.clone_htod(&transformed).unwrap();
                 let d_indices: CudaSlice<i32> = stream.clone_htod(indices).unwrap();
                 let d_tc = if !texcoords.is_empty() {
                     let s = stream.clone_htod(texcoords).unwrap();
                     let ptr = dptr(&s, &stream);
-                    let sb: CudaSlice<u8> = unsafe { std::mem::transmute(s) };
-                    _device_buffers.push(sb);
+                    _device_buffers.push(unsafe { std::mem::transmute(s) });
                     ptr
                 } else {
                     0
                 };
 
-                let vbuf = vec![dptr(&d_verts, &stream)];
-                let flags = vec![GeometryFlags::NONE];
+                let vert_ptrs = [dptr(&d_verts, &stream)];
+                let flags = [GeometryFlags::NONE];
+                let num_verts = transformed.len() as u32 / 3;
+                let num_tris = indices.len() as u32 / 3;
+
+                let tri_input = TriangleArrayInput::new(
+                    &vert_ptrs, num_verts, VertexFormat::Float3,
+                    3 * mem::size_of::<f32>() as u32, &flags,
+                )
+                .with_indices(
+                    dptr(&d_indices, &stream), num_tris,
+                    IndicesFormat::UnsignedInt3, 3 * mem::size_of::<i32>() as u32,
+                );
+
+                let bi = [BuildInput::Triangles(tri_input)];
+                let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &bi)
+                    .expect("tri accel memory");
+                let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.unwrap();
+                let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
+
+                let handle = accel::accel_build(
+                    &ctx, cu_stream, &build_options, &bi,
+                    dptr(&d_temp, &stream), sizes.temp_size,
+                    dptr(&d_output, &stream), sizes.output_size,
+                )
+                .expect("tri accel build");
 
                 let hg_data = HitGroupData {
                     material_type: obj.material.material_type,
@@ -739,76 +823,83 @@ fn main() {
                     normals: 0,
                     indices: dptr(&d_indices, &stream),
                     vertices: dptr(&d_verts, &stream),
-                    num_vertices: transformed.len() as i32 / 3,
+                    num_vertices: num_verts as i32,
                 };
 
-                _vertex_ptrs.push(vbuf);
-                _flags.push(flags);
-                hitgroup_records.push((false, hg_data));
+                let sbt_offset = tri_hg_records.len() as u32;
+                tri_hg_records.push(SbtRecord::new(&hitgroup_tri_pg, hg_data).unwrap());
 
-                let vb: CudaSlice<u8> = unsafe { std::mem::transmute(d_verts) };
-                let ib: CudaSlice<u8> = unsafe { std::mem::transmute(d_indices) };
-                _device_buffers.push(vb);
-                _device_buffers.push(ib);
+                gas_entries.push(GasEntry {
+                    handle,
+                    sbt_offset,
+                    transform: obj.transform,
+                    is_sphere: false,
+                });
+
+                _device_buffers.push(unsafe { std::mem::transmute(d_verts) });
+                _device_buffers.push(unsafe { std::mem::transmute(d_indices) });
+                _device_buffers.push(d_temp);
+                _device_buffers.push(d_output);
             }
         }
     }
 
-    // Build build_inputs from stored pointers
-    for i in 0..hitgroup_records.len() {
-        let num_verts = hitgroup_records[i].1.num_vertices as u32;
-        let num_indices = if hitgroup_records[i].1.indices != 0 {
-            // Read from stored data - we know it from the scene objects
-            match &scene.objects[i].shape {
-                SceneShape::Sphere { radius } => {
-                    let (_, _, indices) = make_sphere_mesh(*radius, 4);
-                    indices.len() as u32 / 3
-                }
-                SceneShape::TriangleMesh { indices, .. } => indices.len() as u32 / 3,
-            }
-        } else {
-            0
-        };
-
-        let tri_input = TriangleArrayInput::new(
-            &_vertex_ptrs[i],
-            num_verts,
-            VertexFormat::Float3,
-            3 * mem::size_of::<f32>() as u32,
-            &_flags[i],
-        )
-        .with_indices(
-            hitgroup_records[i].1.indices as optix_sys::CUdeviceptr,
-            num_indices,
-            IndicesFormat::UnsignedInt3,
-            3 * mem::size_of::<i32>() as u32,
-        );
-        build_inputs.push(BuildInput::Triangles(tri_input));
-    }
-
-    let build_options = AccelBuildOptions {
-        build_flags: BuildFlags::PREFER_FAST_TRACE,
-        operation: BuildOperation::Build,
-    };
-
-    let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &build_inputs)
-        .expect("accel memory");
-    let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.unwrap();
-    let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
-
-    let gas_handle = accel::accel_build(
-        &ctx,
-        cu_stream,
-        &build_options,
-        &build_inputs,
-        dptr(&d_temp, &stream),
-        sizes.temp_size,
-        dptr(&d_output, &stream),
-        sizes.output_size,
-    )
-    .expect("accel build");
     stream.synchronize().unwrap();
-    drop(d_temp);
+
+    // --- Build IAS (or use single GAS if no spheres) ---
+    let traversable = if has_spheres {
+        // SBT layout: [tri_hg_records..., sphere_hg_records...]
+        let sphere_sbt_base = tri_hg_records.len() as u32;
+
+        let instances: Vec<optix_sys::OptixInstance> = gas_entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let sbt_offset = if entry.is_sphere {
+                    sphere_sbt_base + entry.sbt_offset
+                } else {
+                    entry.sbt_offset
+                };
+                let inst = optix_sys::OptixInstance {
+                    transform: entry.transform,
+                    instanceId: i as u32,
+                    sbtOffset: sbt_offset,
+                    visibilityMask: 255,
+                    flags: optix_sys::OptixInstanceFlags::OPTIX_INSTANCE_FLAG_NONE.0 as u32,
+                    traversableHandle: entry.handle,
+                    pad: [0; 2],
+                };
+                inst
+            })
+            .collect();
+
+        let d_instances = alloc_and_copy_slice(&stream, &instances);
+
+        let ias_input = [BuildInput::Instances(accel::InstanceArrayInput {
+            instances: d_instances,
+            num_instances: instances.len() as u32,
+        })];
+
+        let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &ias_input)
+            .expect("IAS memory");
+        let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.unwrap();
+        let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
+
+        let ias_handle = accel::accel_build(
+            &ctx, cu_stream, &build_options, &ias_input,
+            dptr(&d_temp, &stream), sizes.temp_size,
+            dptr(&d_output, &stream), sizes.output_size,
+        )
+        .expect("IAS build");
+        stream.synchronize().unwrap();
+
+        _device_buffers.push(d_temp);
+        _device_buffers.push(d_output);
+
+        ias_handle
+    } else {
+        gas_entries[0].handle
+    };
 
     // --- SBT ---
     let raygen_record = SbtRecord::new(&raygen_pg, RayGenData {}).unwrap();
@@ -823,19 +914,27 @@ fn main() {
     let d_rg = alloc_and_copy(&stream, &raygen_record);
     let d_ms = alloc_and_copy(&stream, &miss_record);
 
-    // Hitgroup records - one per geometry in the GAS
-    let mut hg_record_data = Vec::new();
-    for (_is_sphere, hg_data) in &hitgroup_records {
-        let record = SbtRecord::new(&hitgroup_tri_pg, *hg_data).unwrap();
-        hg_record_data.push(record);
-    }
-
+    // Hitgroup records: triangles first, then spheres
+    let mut all_hg_records: Vec<u8> = Vec::new();
     let hg_stride = mem::size_of::<SbtRecord<HitGroupData>>();
-    let d_hg = alloc_and_copy_slice(&stream, &hg_record_data);
+    for rec in &tri_hg_records {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(rec as *const _ as *const u8, hg_stride)
+        };
+        all_hg_records.extend_from_slice(bytes);
+    }
+    for rec in &sphere_hg_records {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(rec as *const _ as *const u8, hg_stride)
+        };
+        all_hg_records.extend_from_slice(bytes);
+    }
+    let total_hg_count = tri_hg_records.len() + sphere_hg_records.len();
+    let d_hg = alloc_and_copy_slice(&stream, &all_hg_records);
 
     let sbt = ShaderBindingTableBuilder::new(d_rg)
         .miss_records(d_ms, mem::size_of_val(&miss_record) as u32, 1)
-        .hitgroup_records(d_hg, hg_stride as u32, hg_record_data.len() as u32)
+        .hitgroup_records(d_hg, hg_stride as u32, total_hg_count as u32)
         .build()
         .expect("SBT");
 
@@ -869,7 +968,7 @@ fn main() {
         cam_u,
         cam_v,
         cam_w,
-        traversable: gas_handle,
+        traversable,
         ambient_light: scene.ambient_light,
         num_distant_lights: scene.distant_lights.len() as i32,
         distant_lights: d_lights,
@@ -953,94 +1052,7 @@ fn transform_vertices(verts: &[f32], t: &[f32; 12]) -> Vec<f32> {
     result
 }
 
-fn transform_normals(normals: &[f32], t: &[f32; 12]) -> Vec<f32> {
-    // Apply rotation only (no translation) and re-normalize
-    let mut result = Vec::with_capacity(normals.len());
-    for i in (0..normals.len()).step_by(3) {
-        let x = normals[i];
-        let y = normals[i + 1];
-        let z = normals[i + 2];
-        let nx = t[0] * x + t[1] * y + t[2] * z;
-        let ny = t[4] * x + t[5] * y + t[6] * z;
-        let nz = t[8] * x + t[9] * y + t[10] * z;
-        let len = (nx * nx + ny * ny + nz * nz).sqrt();
-        result.push(nx / len);
-        result.push(ny / len);
-        result.push(nz / len);
-    }
-    result
-}
 
-fn make_sphere_mesh(radius: f32, subdivisions: u32) -> (Vec<f32>, Vec<f32>, Vec<i32>) {
-    // Generate an icosphere
-    let t = (1.0 + 5.0_f32.sqrt()) / 2.0;
-
-    let mut verts = vec![
-        -1.0, t, 0.0, 1.0, t, 0.0, -1.0, -t, 0.0, 1.0, -t, 0.0, 0.0, -1.0, t, 0.0, 1.0, t, 0.0,
-        -1.0, -t, 0.0, 1.0, -t, t, 0.0, -1.0, t, 0.0, 1.0, -t, 0.0, -1.0, -t, 0.0, 1.0,
-    ];
-
-    let mut indices: Vec<i32> = vec![
-        0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11, 1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6, 7,
-        1, 8, 3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9, 4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9,
-        8, 1,
-    ];
-
-    // Normalize initial vertices
-    for i in (0..verts.len()).step_by(3) {
-        let len = (verts[i] * verts[i] + verts[i + 1] * verts[i + 1] + verts[i + 2] * verts[i + 2])
-            .sqrt();
-        verts[i] /= len;
-        verts[i + 1] /= len;
-        verts[i + 2] /= len;
-    }
-
-    // Subdivide
-    for _ in 0..subdivisions {
-        let mut new_indices = Vec::new();
-        let mut midpoint_cache = std::collections::HashMap::new();
-
-        let mut get_midpoint = |a: i32, b: i32, verts: &mut Vec<f32>| -> i32 {
-            let key = if a < b { (a, b) } else { (b, a) };
-            if let Some(&idx) = midpoint_cache.get(&key) {
-                return idx;
-            }
-            let ai = a as usize * 3;
-            let bi = b as usize * 3;
-            let mx = (verts[ai] + verts[bi]) * 0.5;
-            let my = (verts[ai + 1] + verts[bi + 1]) * 0.5;
-            let mz = (verts[ai + 2] + verts[bi + 2]) * 0.5;
-            let len = (mx * mx + my * my + mz * mz).sqrt();
-            let idx = (verts.len() / 3) as i32;
-            verts.push(mx / len);
-            verts.push(my / len);
-            verts.push(mz / len);
-            midpoint_cache.insert(key, idx);
-            idx
-        };
-
-        for tri in indices.chunks(3) {
-            let a = tri[0];
-            let b = tri[1];
-            let c = tri[2];
-            let ab = get_midpoint(a, b, &mut verts);
-            let bc = get_midpoint(b, c, &mut verts);
-            let ca = get_midpoint(c, a, &mut verts);
-            new_indices.extend_from_slice(&[a, ab, ca, b, bc, ab, c, ca, bc, ab, bc, ca]);
-        }
-        indices = new_indices;
-    }
-
-    // Normals = normalized positions (before scaling by radius)
-    let normals = verts.clone();
-
-    // Scale by radius
-    for v in &mut verts {
-        *v *= radius;
-    }
-
-    (verts, normals, indices)
-}
 
 fn find_optix_include() -> String {
     if let Ok(root) = std::env::var("OPTIX_ROOT") {

@@ -86,6 +86,41 @@ impl Module {
             log: crate::error::extract_log(&log, log_size),
         })
     }
+
+    /// Get a built-in intersection module for a primitive type (e.g., spheres, curves).
+    pub fn builtin_is(
+        ctx: &DeviceContext,
+        module_options: &ModuleCompileOptions,
+        pipeline_options: &PipelineCompileOptions,
+        primitive_type: crate::types::PrimitiveType,
+    ) -> Result<Self> {
+        let raw_module_opts = module_options.to_raw();
+        let raw_pipeline_opts = pipeline_options.to_raw();
+
+        let builtin_opts = optix_sys::OptixBuiltinISOptions {
+            builtinISModuleType: primitive_type.to_raw(),
+            usesMotionBlur: 0,
+            buildFlags: 0,
+            curveEndcapFlags: 0,
+        };
+
+        let mut raw: optix_sys::OptixModule = ptr::null_mut();
+        let result = unsafe {
+            (ctx.table.raw.optixBuiltinISModuleGet.unwrap())(
+                ctx.raw,
+                &raw_module_opts,
+                &raw_pipeline_opts,
+                &builtin_opts,
+                &mut raw,
+            )
+        };
+        error::check(result)?;
+
+        Ok(Self {
+            raw,
+            table: ctx.table.clone(),
+        })
+    }
 }
 
 impl Drop for Module {

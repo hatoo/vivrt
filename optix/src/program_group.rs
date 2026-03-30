@@ -191,6 +191,7 @@ impl<'a> HitgroupBuilder<'a> {
         let is_entry = self
             .intersection
             .as_ref()
+            .filter(|(_, e)| !e.is_empty())
             .map(|(_, e)| CString::new(e.as_str()).unwrap());
 
         let hitgroup = optix_sys::OptixProgramGroupHitgroup {
