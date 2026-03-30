@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use clap::Parser;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
 use optix::accel::{self, AccelBuildOptions, BuildInput, TriangleArrayInput};
@@ -93,44 +94,54 @@ struct HitGroupData {
     num_vertices: i32,
 }
 
+/// Extension trait to convert cudarc's DriverError to anyhow::Error.
+/// cudarc's DriverError doesn't implement std::error::Error.
+trait CudaResultExt<T> {
+    fn cuda(self) -> Result<T>;
+}
+
+impl<T> CudaResultExt<T> for std::result::Result<T, cudarc::driver::DriverError> {
+    fn cuda(self) -> Result<T> {
+        self.map_err(|e| anyhow::anyhow!("CUDA error: {e:?}"))
+    }
+}
+
 fn dptr<T>(slice: &CudaSlice<T>, stream: &cudarc::driver::CudaStream) -> optix_sys::CUdeviceptr {
     let (ptr, _sync) = slice.device_ptr(stream);
     ptr as optix_sys::CUdeviceptr
 }
 
-fn alloc_and_copy<T>(stream: &Arc<cudarc::driver::CudaStream>, val: &T) -> optix_sys::CUdeviceptr {
+fn alloc_and_copy<T>(stream: &Arc<cudarc::driver::CudaStream>, val: &T) -> Result<optix_sys::CUdeviceptr> {
     let size = mem::size_of_val(val);
     let cu_stream = stream.cu_stream();
     unsafe {
-        let dptr = cudarc::driver::result::malloc_async(cu_stream, size).unwrap();
+        let dptr = cudarc::driver::result::malloc_async(cu_stream, size).cuda()?;
         cudarc::driver::result::memcpy_htod_async(
             dptr,
             std::slice::from_raw_parts(val as *const T as *const u8, size),
             cu_stream,
-        )
-        .unwrap();
-        dptr as optix_sys::CUdeviceptr
+        ).cuda()?;
+        Ok(dptr as optix_sys::CUdeviceptr)
     }
 }
 
 fn alloc_and_copy_slice<T>(
     stream: &Arc<cudarc::driver::CudaStream>,
     data: &[T],
-) -> optix_sys::CUdeviceptr {
+) -> Result<optix_sys::CUdeviceptr> {
     let size = mem::size_of_val(data);
     if size == 0 {
-        return 0;
+        return Ok(0);
     }
     let cu_stream = stream.cu_stream();
     unsafe {
-        let dptr = cudarc::driver::result::malloc_async(cu_stream, size).unwrap();
+        let dptr = cudarc::driver::result::malloc_async(cu_stream, size).cuda()?;
         cudarc::driver::result::memcpy_htod_async(
             dptr,
             std::slice::from_raw_parts(data.as_ptr() as *const u8, size),
             cu_stream,
-        )
-        .unwrap();
-        dptr as optix_sys::CUdeviceptr
+        ).cuda()?;
+        Ok(dptr as optix_sys::CUdeviceptr)
     }
 }
 
@@ -528,13 +539,11 @@ impl Clone for SceneMaterial {
     }
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Args::parse();
 
-    let input = std::fs::read_to_string(&cli.input).unwrap_or_else(|e| {
-        eprintln!("Failed to read {}: {e}", cli.input);
-        std::process::exit(1);
-    });
+    let input = std::fs::read_to_string(&cli.input)
+        .context(format!("Failed to read {}", cli.input))?;
 
     let mut scene = parse_scene(&input);
 
@@ -565,17 +574,17 @@ fn main() {
     );
 
     // --- CUDA / OptiX init ---
-    let cuda_ctx = CudaContext::new(0).expect("CUDA context");
+    let cuda_ctx = CudaContext::new(0).cuda().context("CUDA context")?;
     let stream = cuda_ctx.default_stream();
     let cu_stream = stream.cu_stream() as optix_sys::CUstream;
 
-    let optix_handle = optix::init().expect("OptiX init");
+    let optix_handle = optix::init().context("OptiX init")?;
     let ctx = DeviceContext::new(
         &optix_handle,
         cuda_ctx.cu_ctx() as optix_sys::CUcontext,
         &DeviceContextOptions::default(),
     )
-    .expect("OptiX context");
+    .context("OptiX context")?;
 
     // --- Compile PTX ---
     let cu_src = include_str!("devicecode.cu");
@@ -587,8 +596,7 @@ fn main() {
         use_fast_math: Some(true),
         options: vec![format!(
             "--include-path={}",
-            std::env::current_dir()
-                .unwrap()
+            std::env::current_dir()?
                 .join("renderer/src")
                 .display()
         )],
@@ -603,10 +611,8 @@ fn main() {
     );
 
     println!("Compiling device code with NVRTC...");
-    let ptx = cudarc::nvrtc::compile_ptx_with_opts(&full_src, opts).unwrap_or_else(|e| {
-        eprintln!("NVRTC failed: {e:?}");
-        std::process::exit(1);
-    });
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(&full_src, opts)
+        .map_err(|e| anyhow::anyhow!("NVRTC compilation failed: {e:?}"))?;
     let ptx_src = ptx.to_src();
 
     // --- OptiX pipeline ---
@@ -632,30 +638,30 @@ fn main() {
 
     let module_opts = ModuleCompileOptions::default();
     let module = Module::new(&ctx, &module_opts, &pipeline_options, ptx_src.as_bytes())
-        .expect("module")
+        .context("module")?
         .value;
 
     // Get built-in sphere intersection module if needed
     let sphere_is_module = if has_spheres {
         Some(
             Module::builtin_is(&ctx, &module_opts, &pipeline_options, PrimitiveType::Sphere)
-                .expect("sphere IS module"),
+                .context("sphere IS module")?,
         )
     } else {
         None
     };
 
     let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg")
-        .expect("raygen")
+        .context("raygen")?
         .value;
     let miss_pg = ProgramGroup::miss(&ctx, &module, "__miss__ms")
-        .expect("miss")
+        .context("miss")?
         .value;
 
     let hitgroup_tri_pg = ProgramGroup::hitgroup(&ctx)
         .closest_hit(&module, "__closesthit__ch")
         .build()
-        .expect("hitgroup_tri")
+        .context("hitgroup_tri")?
         .value;
 
     let hitgroup_sphere_pg = if let Some(ref is_mod) = sphere_is_module {
@@ -664,7 +670,7 @@ fn main() {
                 .closest_hit(&module, "__closesthit__sphere")
                 .intersection(is_mod, "")
                 .build()
-                .expect("hitgroup_sphere")
+                .context("hitgroup_sphere")?
                 .value,
         )
     } else {
@@ -684,12 +690,11 @@ fn main() {
         },
         &all_pgs,
     )
-    .expect("pipeline")
+    .context("pipeline")?
     .value;
     let max_graph_depth = if has_spheres { 2 } else { 1 };
     pipeline
-        .set_stack_size(2048, 2048, 2048, max_graph_depth)
-        .unwrap();
+        .set_stack_size(2048, 2048, 2048, max_graph_depth)?;
 
     // --- Build geometry ---
     // Separate GASes for triangles and spheres (OptiX requires same prim type per GAS)
@@ -717,8 +722,8 @@ fn main() {
                 let center = [0.0f32, 0.0, 0.0];
                 let radius_val = [*radius];
 
-                let d_center = stream.clone_htod(&center).unwrap();
-                let d_radius = stream.clone_htod(&radius_val).unwrap();
+                let d_center = stream.clone_htod(&center).cuda()?;
+                let d_radius = stream.clone_htod(&radius_val).cuda()?;
                 let center_ptrs = [dptr(&d_center, &stream)];
                 let radius_ptrs = [dptr(&d_radius, &stream)];
                 let flags = [GeometryFlags::NONE];
@@ -736,9 +741,9 @@ fn main() {
 
                 let bi = [BuildInput::Spheres(sphere_input)];
                 let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &bi)
-                    .expect("sphere accel memory");
-                let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.unwrap();
-                let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
+                    .context("sphere accel memory")?;
+                let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
+                let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
                 let handle = accel::accel_build(
                     &ctx,
@@ -750,7 +755,7 @@ fn main() {
                     dptr(&d_output, &stream),
                     sizes.output_size,
                 )
-                .expect("sphere accel build");
+                .context("sphere accel build")?;
 
                 let hg_data = HitGroupData {
                     material_type: obj.material.material_type,
@@ -770,7 +775,7 @@ fn main() {
 
                 let sbt_offset = sphere_hg_records.len() as u32;
                 sphere_hg_records
-                    .push(SbtRecord::new(hitgroup_sphere_pg.as_ref().unwrap(), hg_data).unwrap());
+                    .push(SbtRecord::new(hitgroup_sphere_pg.as_ref().context("no sphere hitgroup")?, hg_data)?);
 
                 gas_entries.push(GasEntry {
                     handle,
@@ -790,10 +795,10 @@ fn main() {
                 texcoords,
             } => {
                 let transformed = transform_vertices(vertices, &obj.transform);
-                let d_verts = stream.clone_htod(&transformed).unwrap();
-                let d_indices: CudaSlice<i32> = stream.clone_htod(indices).unwrap();
+                let d_verts = stream.clone_htod(&transformed).cuda()?;
+                let d_indices: CudaSlice<i32> = stream.clone_htod(indices).cuda()?;
                 let d_tc = if !texcoords.is_empty() {
-                    let s = stream.clone_htod(texcoords).unwrap();
+                    let s = stream.clone_htod(texcoords).cuda()?;
                     let ptr = dptr(&s, &stream);
                     _device_buffers.push(unsafe { std::mem::transmute(s) });
                     ptr
@@ -822,9 +827,9 @@ fn main() {
 
                 let bi = [BuildInput::Triangles(tri_input)];
                 let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &bi)
-                    .expect("tri accel memory");
-                let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.unwrap();
-                let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
+                    .context("tri accel memory")?;
+                let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
+                let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
                 let handle = accel::accel_build(
                     &ctx,
@@ -836,7 +841,7 @@ fn main() {
                     dptr(&d_output, &stream),
                     sizes.output_size,
                 )
-                .expect("tri accel build");
+                .context("tri accel build")?;
 
                 let hg_data = HitGroupData {
                     material_type: obj.material.material_type,
@@ -855,7 +860,7 @@ fn main() {
                 };
 
                 let sbt_offset = tri_hg_records.len() as u32;
-                tri_hg_records.push(SbtRecord::new(&hitgroup_tri_pg, hg_data).unwrap());
+                tri_hg_records.push(SbtRecord::new(&hitgroup_tri_pg, hg_data)?);
 
                 gas_entries.push(GasEntry {
                     handle,
@@ -872,7 +877,7 @@ fn main() {
         }
     }
 
-    stream.synchronize().unwrap();
+    stream.synchronize().cuda()?;
 
     // --- Build IAS (or use single GAS if no spheres) ---
     let traversable = if has_spheres {
@@ -901,7 +906,7 @@ fn main() {
             })
             .collect();
 
-        let d_instances = alloc_and_copy_slice(&stream, &instances);
+        let d_instances = alloc_and_copy_slice(&stream, &instances)?;
 
         let ias_input = [BuildInput::Instances(accel::InstanceArrayInput {
             instances: d_instances,
@@ -909,9 +914,9 @@ fn main() {
         })];
 
         let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &ias_input)
-            .expect("IAS memory");
-        let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.unwrap();
-        let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
+            .context("IAS memory")?;
+        let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
+        let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
         let ias_handle = accel::accel_build(
             &ctx,
@@ -923,8 +928,8 @@ fn main() {
             dptr(&d_output, &stream),
             sizes.output_size,
         )
-        .expect("IAS build");
-        stream.synchronize().unwrap();
+        .context("IAS build")?;
+        stream.synchronize().cuda()?;
 
         _device_buffers.push(d_temp);
         _device_buffers.push(d_output);
@@ -935,17 +940,16 @@ fn main() {
     };
 
     // --- SBT ---
-    let raygen_record = SbtRecord::new(&raygen_pg, RayGenData {}).unwrap();
+    let raygen_record = SbtRecord::new(&raygen_pg, RayGenData {})?;
     let miss_record = SbtRecord::new(
         &miss_pg,
         MissData {
             bg_color: [0.0, 0.0, 0.0],
         },
-    )
-    .unwrap();
+    )?;
 
-    let d_rg = alloc_and_copy(&stream, &raygen_record);
-    let d_ms = alloc_and_copy(&stream, &miss_record);
+    let d_rg = alloc_and_copy(&stream, &raygen_record)?;
+    let d_ms = alloc_and_copy(&stream, &miss_record)?;
 
     // Hitgroup records: triangles first, then spheres
     let mut all_hg_records: Vec<u8> = Vec::new();
@@ -959,13 +963,13 @@ fn main() {
         all_hg_records.extend_from_slice(bytes);
     }
     let total_hg_count = tri_hg_records.len() + sphere_hg_records.len();
-    let d_hg = alloc_and_copy_slice(&stream, &all_hg_records);
+    let d_hg = alloc_and_copy_slice(&stream, &all_hg_records)?;
 
     let sbt = ShaderBindingTableBuilder::new(d_rg)
         .miss_records(d_ms, mem::size_of_val(&miss_record) as u32, 1)
         .hitgroup_records(d_hg, hg_stride as u32, total_hg_count as u32)
         .build()
-        .expect("SBT");
+        .context("SBT")?;
 
     // --- Camera ---
     let (cam_u, cam_v, cam_w) = compute_camera(
@@ -980,12 +984,12 @@ fn main() {
     let d_lights = if scene.distant_lights.is_empty() {
         0
     } else {
-        alloc_and_copy_slice(&stream, &scene.distant_lights)
+        alloc_and_copy_slice(&stream, &scene.distant_lights)?
     };
 
     // --- Output image ---
     let pixel_count = (scene.width * scene.height) as usize;
-    let d_image: CudaSlice<u32> = stream.alloc_zeros(pixel_count).unwrap();
+    let d_image: CudaSlice<u32> = stream.alloc_zeros(pixel_count).cuda()?;
 
     let launch_params = LaunchParams {
         image: dptr(&d_image, &stream),
@@ -1002,7 +1006,7 @@ fn main() {
         num_distant_lights: scene.distant_lights.len() as i32,
         distant_lights: d_lights,
     };
-    let d_params = alloc_and_copy(&stream, &launch_params);
+    let d_params = alloc_and_copy(&stream, &launch_params)?;
 
     // --- Launch ---
     println!(
@@ -1019,18 +1023,20 @@ fn main() {
             scene.height,
             1,
         )
-        .expect("launch");
-    stream.synchronize().unwrap();
+        .context("launch")?;
+    stream.synchronize().cuda()?;
 
     // --- Download and save ---
-    let pixels = stream.clone_dtoh(&d_image).unwrap();
+    let pixels = stream.clone_dtoh(&d_image).cuda()?;
 
     let mut output_file = scene.filename.replace(".exr", ".png");
     if !output_file.ends_with(".png") && !output_file.ends_with(".ppm") {
         output_file = format!("{output_file}.png");
     }
-    save_image(&output_file, scene.width, scene.height, &pixels);
+    save_image(&output_file, scene.width, scene.height, &pixels)?;
     println!("Saved {output_file}");
+
+    Ok(())
 }
 
 fn compute_camera(
@@ -1104,7 +1110,7 @@ fn find_optix_include() -> String {
     panic!("OptiX SDK not found. Set OPTIX_ROOT.");
 }
 
-fn save_image(path: &str, width: u32, height: u32, pixels: &[u32]) {
+fn save_image(path: &str, width: u32, height: u32, pixels: &[u32]) -> Result<()> {
     // Convert ABGR packed pixels to RGB bytes (flipped vertically)
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
     for y in (0..height).rev() {
@@ -1118,18 +1124,20 @@ fn save_image(path: &str, width: u32, height: u32, pixels: &[u32]) {
 
     if path.ends_with(".ppm") {
         use std::io::Write;
-        let mut file = std::fs::File::create(path).expect("Failed to create output file");
-        write!(file, "P6\n{width} {height}\n255\n").unwrap();
-        file.write_all(&rgb).unwrap();
+        let mut file = std::fs::File::create(path).context("Failed to create output file")?;
+        write!(file, "P6\n{width} {height}\n255\n")?;
+        file.write_all(&rgb)?;
     } else {
-        let file = std::fs::File::create(path).expect("Failed to create output file");
+        let file = std::fs::File::create(path).context("Failed to create output file")?;
         let w = std::io::BufWriter::new(file);
         let mut encoder = png::Encoder::new(w, width, height);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().expect("Failed to write PNG header");
+        let mut writer = encoder.write_header().context("Failed to write PNG header")?;
         writer
             .write_image_data(&rgb)
-            .expect("Failed to write PNG data");
+            .context("Failed to write PNG data")?;
     }
+
+    Ok(())
 }

@@ -10,3 +10,4 @@ pbrt-parser = { path = "../pbrt-parser" }
 cudarc = { version = "0.19", default-features = false, features = ["driver", "dynamic-loading", "cuda-version-from-build-system", "nvrtc"] }
 clap = { version = "4", features = ["derive"] }
 png = "0.17"
+anyhow = "1"
