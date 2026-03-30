@@ -850,7 +850,7 @@ fn main() {
                 gas_entries.push(GasEntry {
                     handle,
                     sbt_offset,
-                    transform: obj.transform,
+                    transform: identity_transform(), // vertices already pre-transformed
                     is_sphere: false,
                 });
 
