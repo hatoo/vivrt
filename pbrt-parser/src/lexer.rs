@@ -130,29 +130,26 @@ impl<'a> Lexer<'a> {
         loop {
             match self.advance() {
                 Some(b'"') => break,
-                Some(b'\\') => {
-                    match self.advance() {
-                        Some(b'n') => s.push(b'\n'),
-                        Some(b't') => s.push(b'\t'),
-                        Some(b'\\') => s.push(b'\\'),
-                        Some(b'"') => s.push(b'"'),
-                        Some(ch) => {
-                            s.push(b'\\');
-                            s.push(ch);
-                        }
-                        None => {
-                            return Err(ParseError::new("unterminated string", line, column));
-                        }
+                Some(b'\\') => match self.advance() {
+                    Some(b'n') => s.push(b'\n'),
+                    Some(b't') => s.push(b'\t'),
+                    Some(b'\\') => s.push(b'\\'),
+                    Some(b'"') => s.push(b'"'),
+                    Some(ch) => {
+                        s.push(b'\\');
+                        s.push(ch);
                     }
-                }
+                    None => {
+                        return Err(ParseError::new("unterminated string", line, column));
+                    }
+                },
                 Some(ch) => s.push(ch),
                 None => {
                     return Err(ParseError::new("unterminated string", line, column));
                 }
             }
         }
-        String::from_utf8(s)
-            .map_err(|_| ParseError::new("invalid UTF-8 in string", line, column))
+        String::from_utf8(s).map_err(|_| ParseError::new("invalid UTF-8 in string", line, column))
     }
 
     fn read_number(&mut self) -> Result<f64> {
@@ -196,7 +193,10 @@ impl<'a> Lexer<'a> {
 
     fn read_identifier(&mut self) -> String {
         let start = self.pos;
-        while matches!(self.peek(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')) {
+        while matches!(
+            self.peek(),
+            Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+        ) {
             self.advance();
         }
         String::from_utf8_lossy(&self.input[start..self.pos]).into_owned()

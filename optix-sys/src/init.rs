@@ -136,13 +136,7 @@ fn load_optix_library() -> Result<libloading::Library, OptixResult> {
                 // Open the subkey
                 let mut sub_hkey: HKEY = ptr::null_mut();
                 let status = unsafe {
-                    RegOpenKeyExA(
-                        hkey,
-                        subkey_name.as_ptr(),
-                        0,
-                        KEY_READ,
-                        &mut sub_hkey,
-                    )
+                    RegOpenKeyExA(hkey, subkey_name.as_ptr(), 0, KEY_READ, &mut sub_hkey)
                 };
                 if status != 0 {
                     continue;

@@ -117,9 +117,14 @@ fn main() {
         let mut log = [0u8; 2048];
         let mut log_size = log.len();
         optix_check!((optix.optixModuleCreate.unwrap())(
-            ctx, &module_options, &pipeline_options,
-            ptx_cstr.as_ptr(), ptx.len(),
-            log.as_mut_ptr() as *mut i8, &mut log_size, &mut module,
+            ctx,
+            &module_options,
+            &pipeline_options,
+            ptx_cstr.as_ptr(),
+            ptx.len(),
+            log.as_mut_ptr() as *mut i8,
+            &mut log_size,
+            &mut module,
         ));
 
         // --- Program groups ---
@@ -141,8 +146,13 @@ fn main() {
             };
             log_size = log.len();
             optix_check!((optix.optixProgramGroupCreate.unwrap())(
-                ctx, &desc, 1, &pg_options,
-                log.as_mut_ptr() as *mut i8, &mut log_size, &mut raygen_pg,
+                ctx,
+                &desc,
+                1,
+                &pg_options,
+                log.as_mut_ptr() as *mut i8,
+                &mut log_size,
+                &mut raygen_pg,
             ));
         }
 
@@ -159,8 +169,13 @@ fn main() {
             };
             log_size = log.len();
             optix_check!((optix.optixProgramGroupCreate.unwrap())(
-                ctx, &desc, 1, &pg_options,
-                log.as_mut_ptr() as *mut i8, &mut log_size, &mut miss_pg,
+                ctx,
+                &desc,
+                1,
+                &pg_options,
+                log.as_mut_ptr() as *mut i8,
+                &mut log_size,
+                &mut miss_pg,
             ));
         }
 
@@ -175,8 +190,13 @@ fn main() {
             };
             log_size = log.len();
             optix_check!((optix.optixProgramGroupCreate.unwrap())(
-                ctx, &desc, 1, &pg_options,
-                log.as_mut_ptr() as *mut i8, &mut log_size, &mut hitgroup_pg,
+                ctx,
+                &desc,
+                1,
+                &pg_options,
+                log.as_mut_ptr() as *mut i8,
+                &mut log_size,
+                &mut hitgroup_pg,
             ));
         }
 
@@ -186,18 +206,21 @@ fn main() {
         let mut pipeline: OptixPipeline = ptr::null_mut();
         log_size = log.len();
         optix_check!((optix.optixPipelineCreate.unwrap())(
-            ctx, &pipeline_options, &link_options,
-            program_groups.as_ptr(), program_groups.len() as u32,
-            log.as_mut_ptr() as *mut i8, &mut log_size, &mut pipeline,
+            ctx,
+            &pipeline_options,
+            &link_options,
+            program_groups.as_ptr(),
+            program_groups.len() as u32,
+            log.as_mut_ptr() as *mut i8,
+            &mut log_size,
+            &mut pipeline,
         ));
-        optix_check!((optix.optixPipelineSetStackSize.unwrap())(pipeline, 2048, 2048, 2048, 1));
+        optix_check!((optix.optixPipelineSetStackSize.unwrap())(
+            pipeline, 2048, 2048, 2048, 1
+        ));
 
         // --- Acceleration structure ---
-        let vertices: [f32; 9] = [
-            -0.5, -0.5, 0.0,
-            0.5, -0.5, 0.0,
-            0.0, 0.5, 0.0,
-        ];
+        let vertices: [f32; 9] = [-0.5, -0.5, 0.0, 0.5, -0.5, 0.0, 0.0, 0.5, 0.0];
         let d_vertices = stream.clone_htod(&vertices).unwrap();
         let d_vertices_ptr = dptr(&d_vertices, &stream);
 
@@ -214,7 +237,9 @@ fn main() {
 
         let build_input = OptixBuildInput {
             type_: OptixBuildInputType::OPTIX_BUILD_INPUT_TYPE_TRIANGLES,
-            __bindgen_anon_1: OptixBuildInput__bindgen_ty_1 { triangleArray: triangle_input },
+            __bindgen_anon_1: OptixBuildInput__bindgen_ty_1 {
+                triangleArray: triangle_input,
+            },
         };
 
         let accel_options = OptixAccelBuildOptions {
@@ -225,7 +250,11 @@ fn main() {
 
         let mut buffer_sizes = OptixAccelBufferSizes::default();
         optix_check!((optix.optixAccelComputeMemoryUsage.unwrap())(
-            ctx, &accel_options, &build_input, 1, &mut buffer_sizes,
+            ctx,
+            &accel_options,
+            &build_input,
+            1,
+            &mut buffer_sizes,
         ));
 
         let d_temp: CudaSlice<u8> = stream.alloc(buffer_sizes.tempSizeInBytes).unwrap();
@@ -233,23 +262,51 @@ fn main() {
 
         let mut gas_handle: OptixTraversableHandle = 0;
         optix_check!((optix.optixAccelBuild.unwrap())(
-            ctx, cu_stream, &accel_options, &build_input, 1,
-            dptr(&d_temp, &stream), buffer_sizes.tempSizeInBytes,
-            dptr(&d_output, &stream), buffer_sizes.outputSizeInBytes,
-            &mut gas_handle, ptr::null(), 0,
+            ctx,
+            cu_stream,
+            &accel_options,
+            &build_input,
+            1,
+            dptr(&d_temp, &stream),
+            buffer_sizes.tempSizeInBytes,
+            dptr(&d_output, &stream),
+            buffer_sizes.outputSizeInBytes,
+            &mut gas_handle,
+            ptr::null(),
+            0,
         ));
         stream.synchronize().unwrap();
         drop(d_temp);
 
         // --- SBT ---
-        let mut raygen_record = SbtRecord { header: [0u8; OPTIX_SBT_RECORD_HEADER_SIZE], data: RayGenData {} };
-        optix_check!((optix.optixSbtRecordPackHeader.unwrap())(raygen_pg, raygen_record.header.as_mut_ptr() as *mut c_void));
+        let mut raygen_record = SbtRecord {
+            header: [0u8; OPTIX_SBT_RECORD_HEADER_SIZE],
+            data: RayGenData {},
+        };
+        optix_check!((optix.optixSbtRecordPackHeader.unwrap())(
+            raygen_pg,
+            raygen_record.header.as_mut_ptr() as *mut c_void
+        ));
 
-        let mut miss_record = SbtRecord { header: [0u8; OPTIX_SBT_RECORD_HEADER_SIZE], data: MissData { bg_color: [0.1, 0.1, 0.3] } };
-        optix_check!((optix.optixSbtRecordPackHeader.unwrap())(miss_pg, miss_record.header.as_mut_ptr() as *mut c_void));
+        let mut miss_record = SbtRecord {
+            header: [0u8; OPTIX_SBT_RECORD_HEADER_SIZE],
+            data: MissData {
+                bg_color: [0.1, 0.1, 0.3],
+            },
+        };
+        optix_check!((optix.optixSbtRecordPackHeader.unwrap())(
+            miss_pg,
+            miss_record.header.as_mut_ptr() as *mut c_void
+        ));
 
-        let mut hitgroup_record = SbtRecord { header: [0u8; OPTIX_SBT_RECORD_HEADER_SIZE], data: HitGroupData {} };
-        optix_check!((optix.optixSbtRecordPackHeader.unwrap())(hitgroup_pg, hitgroup_record.header.as_mut_ptr() as *mut c_void));
+        let mut hitgroup_record = SbtRecord {
+            header: [0u8; OPTIX_SBT_RECORD_HEADER_SIZE],
+            data: HitGroupData {},
+        };
+        optix_check!((optix.optixSbtRecordPackHeader.unwrap())(
+            hitgroup_pg,
+            hitgroup_record.header.as_mut_ptr() as *mut c_void
+        ));
 
         let d_rg = alloc_and_copy(&stream, &raygen_record);
         let d_ms = alloc_and_copy(&stream, &miss_record);
@@ -288,9 +345,14 @@ fn main() {
         // --- Launch ---
         println!("Launching OptiX render ({WIDTH} x {HEIGHT})...");
         optix_check!((optix.optixLaunch.unwrap())(
-            pipeline, cu_stream,
-            d_params, mem::size_of::<Params>(),
-            &sbt, WIDTH, HEIGHT, 1,
+            pipeline,
+            cu_stream,
+            d_params,
+            mem::size_of::<Params>(),
+            &sbt,
+            WIDTH,
+            HEIGHT,
+            1,
         ));
         stream.synchronize().unwrap();
 

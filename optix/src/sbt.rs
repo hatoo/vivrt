@@ -78,14 +78,24 @@ impl ShaderBindingTableBuilder {
         self
     }
 
-    pub fn hitgroup_records(mut self, base: optix_sys::CUdeviceptr, stride: u32, count: u32) -> Self {
+    pub fn hitgroup_records(
+        mut self,
+        base: optix_sys::CUdeviceptr,
+        stride: u32,
+        count: u32,
+    ) -> Self {
         self.hitgroup_record_base = base;
         self.hitgroup_record_stride = stride;
         self.hitgroup_record_count = count;
         self
     }
 
-    pub fn callables_records(mut self, base: optix_sys::CUdeviceptr, stride: u32, count: u32) -> Self {
+    pub fn callables_records(
+        mut self,
+        base: optix_sys::CUdeviceptr,
+        stride: u32,
+        count: u32,
+    ) -> Self {
         self.callables_record_base = base;
         self.callables_record_stride = stride;
         self.callables_record_count = count;

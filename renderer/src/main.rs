@@ -1,13 +1,16 @@
 use clap::Parser;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
-use optix::*;
 use optix::accel::{self, AccelBuildOptions, BuildInput, TriangleArrayInput};
+use optix::*;
 use pbrt_parser::{self, Directive, ParamType, ParamValue};
 use std::mem;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "renderer", about = "OptiX path tracing renderer for PBRTv4 scenes")]
+#[command(
+    name = "renderer",
+    about = "OptiX path tracing renderer for PBRTv4 scenes"
+)]
 struct Args {
     /// Input .pbrt scene file
     #[arg(default_value = "test.pbrt")]
@@ -104,14 +107,20 @@ fn alloc_and_copy<T>(stream: &Arc<cudarc::driver::CudaStream>, val: &T) -> optix
             dptr,
             std::slice::from_raw_parts(val as *const T as *const u8, size),
             cu_stream,
-        ).unwrap();
+        )
+        .unwrap();
         dptr as optix_sys::CUdeviceptr
     }
 }
 
-fn alloc_and_copy_slice<T>(stream: &Arc<cudarc::driver::CudaStream>, data: &[T]) -> optix_sys::CUdeviceptr {
+fn alloc_and_copy_slice<T>(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    data: &[T],
+) -> optix_sys::CUdeviceptr {
     let size = mem::size_of_val(data);
-    if size == 0 { return 0; }
+    if size == 0 {
+        return 0;
+    }
     let cu_stream = stream.cu_stream();
     unsafe {
         let dptr = cudarc::driver::result::malloc_async(cu_stream, size).unwrap();
@@ -119,7 +128,8 @@ fn alloc_and_copy_slice<T>(stream: &Arc<cudarc::driver::CudaStream>, data: &[T])
             dptr,
             std::slice::from_raw_parts(data.as_ptr() as *const u8, size),
             cu_stream,
-        ).unwrap();
+        )
+        .unwrap();
         dptr as optix_sys::CUdeviceptr
     }
 }
@@ -153,7 +163,9 @@ impl Default for SceneMaterial {
 }
 
 enum SceneShape {
-    Sphere { radius: f32 },
+    Sphere {
+        radius: f32,
+    },
     TriangleMesh {
         vertices: Vec<f32>,  // 3 per vertex
         indices: Vec<i32>,   // 3 per triangle
@@ -183,10 +195,13 @@ struct ParsedScene {
 }
 
 fn get_param_floats<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a [f64]> {
-    params.iter().find(|p| p.name == name).and_then(|p| match &p.value {
-        ParamValue::Floats(v) => Some(v.as_slice()),
-        _ => None,
-    })
+    params
+        .iter()
+        .find(|p| p.name == name)
+        .and_then(|p| match &p.value {
+            ParamValue::Floats(v) => Some(v.as_slice()),
+            _ => None,
+        })
 }
 
 fn get_param_float(params: &[pbrt_parser::Param], name: &str) -> Option<f32> {
@@ -194,32 +209,44 @@ fn get_param_float(params: &[pbrt_parser::Param], name: &str) -> Option<f32> {
 }
 
 fn get_param_string<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a str> {
-    params.iter().find(|p| p.name == name).and_then(|p| match &p.value {
-        ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
-        _ => None,
-    })
+    params
+        .iter()
+        .find(|p| p.name == name)
+        .and_then(|p| match &p.value {
+            ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
+            _ => None,
+        })
 }
 
 fn get_param_ints<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a [i64]> {
-    params.iter().find(|p| p.name == name).and_then(|p| match &p.value {
-        ParamValue::Ints(v) => Some(v.as_slice()),
-        _ => None,
-    })
+    params
+        .iter()
+        .find(|p| p.name == name)
+        .and_then(|p| match &p.value {
+            ParamValue::Ints(v) => Some(v.as_slice()),
+            _ => None,
+        })
 }
 
 fn get_param_rgb(params: &[pbrt_parser::Param], name: &str) -> Option<[f32; 3]> {
     // Check for "rgb" typed param or "spectrum" with floats
-    params.iter().find(|p| p.name == name).and_then(|p| match &p.value {
-        ParamValue::Floats(v) if v.len() >= 3 => Some([v[0] as f32, v[1] as f32, v[2] as f32]),
-        _ => None,
-    })
+    params
+        .iter()
+        .find(|p| p.name == name)
+        .and_then(|p| match &p.value {
+            ParamValue::Floats(v) if v.len() >= 3 => Some([v[0] as f32, v[1] as f32, v[2] as f32]),
+            _ => None,
+        })
 }
 
 fn get_param_texture_ref<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a str> {
-    params.iter().find(|p| p.name == name && p.ty == ParamType::Texture).and_then(|p| match &p.value {
-        ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
-        _ => None,
-    })
+    params
+        .iter()
+        .find(|p| p.name == name && p.ty == ParamType::Texture)
+        .and_then(|p| match &p.value {
+            ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
+            _ => None,
+        })
 }
 
 fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
@@ -237,7 +264,8 @@ fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
     } else {
         let x = temp - 60.0;
         288.1221695283 * x.powf(-0.0755148492) / 255.0
-    }.clamp(0.0, 1.0);
+    }
+    .clamp(0.0, 1.0);
     let b = if temp >= 66.0 {
         1.0
     } else if temp <= 19.0 {
@@ -245,25 +273,27 @@ fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
     } else {
         let x = temp - 10.0;
         (138.5177312231 * x.ln() - 305.0447927307) / 255.0
-    }.clamp(0.0, 1.0);
+    }
+    .clamp(0.0, 1.0);
     [r, g, b]
 }
 
 fn identity_transform() -> [f32; 12] {
-    [1.0, 0.0, 0.0, 0.0,
-     0.0, 1.0, 0.0, 0.0,
-     0.0, 0.0, 1.0, 0.0]
+    [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 }
 
 fn parse_scene(input: &str) -> ParsedScene {
     let scene = pbrt_parser::parse(input).expect("Failed to parse PBRT scene");
 
     let mut parsed = ParsedScene {
-        width: 400, height: 400, fov: 90.0,
+        width: 400,
+        height: 400,
+        fov: 90.0,
         cam_eye: [0.0, 0.0, 0.0],
         cam_look: [0.0, 0.0, -1.0],
         cam_up: [0.0, 1.0, 0.0],
-        spp: 16, max_depth: 5,
+        spp: 16,
+        max_depth: 5,
         ambient_light: [0.0; 3],
         distant_lights: Vec::new(),
         objects: Vec::new(),
@@ -272,8 +302,10 @@ fn parse_scene(input: &str) -> ParsedScene {
 
     // Texture storage (name -> checkerboard params)
     struct CheckerTex {
-        scale_u: f32, scale_v: f32,
-        color1: [f32; 3], color2: [f32; 3],
+        scale_u: f32,
+        scale_v: f32,
+        color1: [f32; 3],
+        color2: [f32; 3],
     }
     let mut textures = std::collections::HashMap::<String, CheckerTex>::new();
 
@@ -352,13 +384,16 @@ fn parse_scene(input: &str) -> ParsedScene {
                             let dx = from[0] - to[0];
                             let dy = from[1] - to[1];
                             let dz = from[2] - to[2];
-                            let len = (dx*dx + dy*dy + dz*dz).sqrt();
-                            [dx/len, dy/len, dz/len]
+                            let len = (dx * dx + dy * dy + dz * dz).sqrt();
+                            [dx / len, dy / len, dz / len]
                         };
                         // Check for blackbody or RGB emission
                         let mut emission = get_param_rgb(params, "L").unwrap_or([1.0, 1.0, 1.0]);
                         // Check for blackbody L
-                        if let Some(p) = params.iter().find(|p| p.name == "L" && p.ty == ParamType::Blackbody) {
+                        if let Some(p) = params
+                            .iter()
+                            .find(|p| p.name == "L" && p.ty == ParamType::Blackbody)
+                        {
                             if let ParamValue::Floats(v) = &p.value {
                                 if let Some(&k) = v.first() {
                                     emission = blackbody_to_rgb(k as f32);
@@ -369,7 +404,10 @@ fn parse_scene(input: &str) -> ParsedScene {
                         emission[0] *= scale;
                         emission[1] *= scale;
                         emission[2] *= scale;
-                        parsed.distant_lights.push(DistantLight { direction: dir, emission });
+                        parsed.distant_lights.push(DistantLight {
+                            direction: dir,
+                            emission,
+                        });
                     }
                     _ => eprintln!("Unsupported light type: {ty}"),
                 }
@@ -400,13 +438,26 @@ fn parse_scene(input: &str) -> ParsedScene {
                     _ => eprintln!("Unsupported material type: {ty}"),
                 }
             }
-            Directive::Texture { name, class, params, .. } => {
+            Directive::Texture {
+                name,
+                class,
+                params,
+                ..
+            } => {
                 if class == "checkerboard" {
                     let scale_u = get_param_float(params, "uscale").unwrap_or(1.0);
                     let scale_v = get_param_float(params, "vscale").unwrap_or(1.0);
                     let color1 = get_param_rgb(params, "tex1").unwrap_or([1.0, 1.0, 1.0]);
                     let color2 = get_param_rgb(params, "tex2").unwrap_or([0.0, 0.0, 0.0]);
-                    textures.insert(name.clone(), CheckerTex { scale_u, scale_v, color1, color2 });
+                    textures.insert(
+                        name.clone(),
+                        CheckerTex {
+                            scale_u,
+                            scale_v,
+                            color1,
+                            color2,
+                        },
+                    );
                 }
             }
             Directive::Shape { ty, params } => {
@@ -425,7 +476,11 @@ fn parse_scene(input: &str) -> ParsedScene {
                         let texcoords: Vec<f32> = get_param_floats(params, "uv")
                             .map(|v| v.iter().map(|x| *x as f32).collect())
                             .unwrap_or_default();
-                        SceneShape::TriangleMesh { vertices: verts, indices, texcoords }
+                        SceneShape::TriangleMesh {
+                            vertices: verts,
+                            indices,
+                            texcoords,
+                        }
                     }
                     "bilinearmesh" => {
                         // Convert bilinear patch (4 vertices) to 2 triangles
@@ -436,7 +491,11 @@ fn parse_scene(input: &str) -> ParsedScene {
                             .map(|v| v.iter().map(|x| *x as f32).collect())
                             .unwrap_or_default();
                         let indices = vec![0, 1, 2, 0, 2, 3];
-                        SceneShape::TriangleMesh { vertices: verts, indices, texcoords }
+                        SceneShape::TriangleMesh {
+                            vertices: verts,
+                            indices,
+                            texcoords,
+                        }
                     }
                     _ => {
                         eprintln!("Unsupported shape type: {ty}");
@@ -465,20 +524,38 @@ impl Clone for SceneMaterial {
 fn main() {
     let cli = Args::parse();
 
-    let input = std::fs::read_to_string(&cli.input)
-        .unwrap_or_else(|e| { eprintln!("Failed to read {}: {e}", cli.input); std::process::exit(1); });
+    let input = std::fs::read_to_string(&cli.input).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {e}", cli.input);
+        std::process::exit(1);
+    });
 
     let mut scene = parse_scene(&input);
 
     // Apply CLI overrides
-    if let Some(spp) = cli.spp { scene.spp = spp; }
-    if let Some(depth) = cli.depth { scene.max_depth = depth; }
-    if let Some(w) = cli.width { scene.width = w; }
-    if let Some(h) = cli.height { scene.height = h; }
-    if let Some(ref o) = cli.output { scene.filename = o.clone(); }
+    if let Some(spp) = cli.spp {
+        scene.spp = spp;
+    }
+    if let Some(depth) = cli.depth {
+        scene.max_depth = depth;
+    }
+    if let Some(w) = cli.width {
+        scene.width = w;
+    }
+    if let Some(h) = cli.height {
+        scene.height = h;
+    }
+    if let Some(ref o) = cli.output {
+        scene.filename = o.clone();
+    }
 
-    println!("Scene: {}x{}, {} spp, {} objects, {} distant lights",
-        scene.width, scene.height, scene.spp, scene.objects.len(), scene.distant_lights.len());
+    println!(
+        "Scene: {}x{}, {} spp, {} objects, {} distant lights",
+        scene.width,
+        scene.height,
+        scene.spp,
+        scene.objects.len(),
+        scene.distant_lights.len()
+    );
 
     // --- CUDA / OptiX init ---
     let cuda_ctx = CudaContext::new(0).expect("CUDA context");
@@ -490,7 +567,8 @@ fn main() {
         &optix_handle,
         cuda_ctx.cu_ctx() as optix_sys::CUcontext,
         &DeviceContextOptions::default(),
-    ).expect("OptiX context");
+    )
+    .expect("OptiX context");
 
     // --- Compile PTX ---
     let cu_src = include_str!("devicecode.cu");
@@ -500,19 +578,28 @@ fn main() {
     let opts = cudarc::nvrtc::CompileOptions {
         include_paths: vec![optix_include],
         use_fast_math: Some(true),
-        options: vec![
-            format!("--include-path={}", std::env::current_dir().unwrap().join("renderer/src").display()),
-        ],
+        options: vec![format!(
+            "--include-path={}",
+            std::env::current_dir()
+                .unwrap()
+                .join("renderer/src")
+                .display()
+        )],
         ..Default::default()
     };
 
     // NVRTC doesn't support #include for local files easily, so inline the header
-    let full_src = format!("// Inlined devicecode.h\n{}\n// devicecode.cu\n{}", header_src, cu_src
-        .replace("#include \"devicecode.h\"", "// (inlined above)"));
+    let full_src = format!(
+        "// Inlined devicecode.h\n{}\n// devicecode.cu\n{}",
+        header_src,
+        cu_src.replace("#include \"devicecode.h\"", "// (inlined above)")
+    );
 
     println!("Compiling device code with NVRTC...");
-    let ptx = cudarc::nvrtc::compile_ptx_with_opts(&full_src, opts)
-        .unwrap_or_else(|e| { eprintln!("NVRTC failed: {e:?}"); std::process::exit(1); });
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(&full_src, opts).unwrap_or_else(|e| {
+        eprintln!("NVRTC failed: {e:?}");
+        std::process::exit(1);
+    });
     let ptx_src = ptx.to_src();
 
     // --- OptiX pipeline ---
@@ -521,25 +608,44 @@ fn main() {
         .num_payload_values(10)
         .num_attribute_values(2);
 
-    let module = Module::new(&ctx, &ModuleCompileOptions::default(), &pipeline_options, ptx_src.as_bytes())
-        .expect("module").value;
+    let module = Module::new(
+        &ctx,
+        &ModuleCompileOptions::default(),
+        &pipeline_options,
+        ptx_src.as_bytes(),
+    )
+    .expect("module")
+    .value;
 
-    let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg").expect("raygen").value;
-    let miss_pg = ProgramGroup::miss(&ctx, &module, "__miss__ms").expect("miss").value;
+    let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg")
+        .expect("raygen")
+        .value;
+    let miss_pg = ProgramGroup::miss(&ctx, &module, "__miss__ms")
+        .expect("miss")
+        .value;
 
     // Two hit group programs: one for triangle meshes, one for spheres
     let hitgroup_tri_pg = ProgramGroup::hitgroup(&ctx)
         .closest_hit(&module, "__closesthit__ch")
-        .build().expect("hitgroup_tri").value;
+        .build()
+        .expect("hitgroup_tri")
+        .value;
     let hitgroup_sphere_pg = ProgramGroup::hitgroup(&ctx)
         .closest_hit(&module, "__closesthit__sphere")
-        .build().expect("hitgroup_sphere").value;
+        .build()
+        .expect("hitgroup_sphere")
+        .value;
 
     let pipeline = Pipeline::new(
-        &ctx, &pipeline_options,
-        &PipelineLinkOptions { max_trace_depth: scene.max_depth },
+        &ctx,
+        &pipeline_options,
+        &PipelineLinkOptions {
+            max_trace_depth: scene.max_depth,
+        },
         &[&raygen_pg, &miss_pg, &hitgroup_tri_pg, &hitgroup_sphere_pg],
-    ).expect("pipeline").value;
+    )
+    .expect("pipeline")
+    .value;
     pipeline.set_stack_size(2048, 2048, 2048, 1).unwrap();
 
     // --- Build geometry ---
@@ -573,8 +679,10 @@ fn main() {
                     albedo: obj.material.albedo,
                     eta: obj.material.eta,
                     has_checkerboard: 0,
-                    checker_scale_u: 0.0, checker_scale_v: 0.0,
-                    checker_color1: [0.0; 3], checker_color2: [0.0; 3],
+                    checker_scale_u: 0.0,
+                    checker_scale_v: 0.0,
+                    checker_color1: [0.0; 3],
+                    checker_color2: [0.0; 3],
                     texcoords: 0,
                     indices: dptr(&d_indices, &stream),
                     vertices: dptr(&d_verts, &stream),
@@ -591,7 +699,11 @@ fn main() {
                 _device_buffers.push(vb);
                 _device_buffers.push(ib);
             }
-            SceneShape::TriangleMesh { vertices, indices, texcoords } => {
+            SceneShape::TriangleMesh {
+                vertices,
+                indices,
+                texcoords,
+            } => {
                 let transformed = transform_vertices(vertices, &obj.transform);
 
                 let d_verts = stream.clone_htod(&transformed).unwrap();
@@ -602,7 +714,9 @@ fn main() {
                     let sb: CudaSlice<u8> = unsafe { std::mem::transmute(s) };
                     _device_buffers.push(sb);
                     ptr
-                } else { 0 };
+                } else {
+                    0
+                };
 
                 let vbuf = vec![dptr(&d_verts, &stream)];
                 let flags = vec![GeometryFlags::NONE];
@@ -646,12 +760,18 @@ fn main() {
                 }
                 SceneShape::TriangleMesh { indices, .. } => indices.len() as u32 / 3,
             }
-        } else { 0 };
+        } else {
+            0
+        };
 
         let tri_input = TriangleArrayInput::new(
-            &_vertex_ptrs[i], num_verts, VertexFormat::Float3,
-            3 * mem::size_of::<f32>() as u32, &_flags[i],
-        ).with_indices(
+            &_vertex_ptrs[i],
+            num_verts,
+            VertexFormat::Float3,
+            3 * mem::size_of::<f32>() as u32,
+            &_flags[i],
+        )
+        .with_indices(
             hitgroup_records[i].1.indices as optix_sys::CUdeviceptr,
             num_indices,
             IndicesFormat::UnsignedInt3,
@@ -665,21 +785,34 @@ fn main() {
         operation: BuildOperation::Build,
     };
 
-    let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &build_inputs).expect("accel memory");
+    let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &build_inputs)
+        .expect("accel memory");
     let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.unwrap();
     let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
 
     let gas_handle = accel::accel_build(
-        &ctx, cu_stream, &build_options, &build_inputs,
-        dptr(&d_temp, &stream), sizes.temp_size,
-        dptr(&d_output, &stream), sizes.output_size,
-    ).expect("accel build");
+        &ctx,
+        cu_stream,
+        &build_options,
+        &build_inputs,
+        dptr(&d_temp, &stream),
+        sizes.temp_size,
+        dptr(&d_output, &stream),
+        sizes.output_size,
+    )
+    .expect("accel build");
     stream.synchronize().unwrap();
     drop(d_temp);
 
     // --- SBT ---
     let raygen_record = SbtRecord::new(&raygen_pg, RayGenData {}).unwrap();
-    let miss_record = SbtRecord::new(&miss_pg, MissData { bg_color: [0.0, 0.0, 0.0] }).unwrap();
+    let miss_record = SbtRecord::new(
+        &miss_pg,
+        MissData {
+            bg_color: [0.0, 0.0, 0.0],
+        },
+    )
+    .unwrap();
 
     let d_rg = alloc_and_copy(&stream, &raygen_record);
     let d_ms = alloc_and_copy(&stream, &miss_record);
@@ -702,8 +835,11 @@ fn main() {
 
     // --- Camera ---
     let (cam_u, cam_v, cam_w) = compute_camera(
-        &scene.cam_eye, &scene.cam_look, &scene.cam_up,
-        scene.fov, scene.width as f32 / scene.height as f32,
+        &scene.cam_eye,
+        &scene.cam_look,
+        &scene.cam_up,
+        scene.fov,
+        scene.width as f32 / scene.height as f32,
     );
 
     // --- Distant lights on device ---
@@ -724,7 +860,9 @@ fn main() {
         samples_per_pixel: scene.spp,
         max_depth: scene.max_depth,
         cam_eye: scene.cam_eye,
-        cam_u, cam_v, cam_w,
+        cam_u,
+        cam_v,
+        cam_w,
         traversable: gas_handle,
         ambient_light: scene.ambient_light,
         num_distant_lights: scene.distant_lights.len() as i32,
@@ -733,43 +871,64 @@ fn main() {
     let d_params = alloc_and_copy(&stream, &launch_params);
 
     // --- Launch ---
-    println!("Rendering {}x{} @ {} spp...", scene.width, scene.height, scene.spp);
-    pipeline.launch(cu_stream, d_params, mem::size_of::<LaunchParams>(), &sbt,
-        scene.width, scene.height, 1).expect("launch");
+    println!(
+        "Rendering {}x{} @ {} spp...",
+        scene.width, scene.height, scene.spp
+    );
+    pipeline
+        .launch(
+            cu_stream,
+            d_params,
+            mem::size_of::<LaunchParams>(),
+            &sbt,
+            scene.width,
+            scene.height,
+            1,
+        )
+        .expect("launch");
     stream.synchronize().unwrap();
 
     // --- Download and save ---
     let pixels = stream.clone_dtoh(&d_image).unwrap();
 
-    let output_file = scene.filename.replace(".png", ".ppm").replace(".exr", ".ppm");
+    let output_file = scene
+        .filename
+        .replace(".png", ".ppm")
+        .replace(".exr", ".ppm");
     save_ppm(&output_file, scene.width, scene.height, &pixels);
     println!("Saved {output_file}");
 }
 
-fn compute_camera(eye: &[f32; 3], look: &[f32; 3], up: &[f32; 3], fov: f32, aspect: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
-    let w = [look[0]-eye[0], look[1]-eye[1], look[2]-eye[2]];
-    let wlen = (w[0]*w[0] + w[1]*w[1] + w[2]*w[2]).sqrt();
-    let w = [w[0]/wlen, w[1]/wlen, w[2]/wlen];
+fn compute_camera(
+    eye: &[f32; 3],
+    look: &[f32; 3],
+    up: &[f32; 3],
+    fov: f32,
+    aspect: f32,
+) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let w = [look[0] - eye[0], look[1] - eye[1], look[2] - eye[2]];
+    let wlen = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+    let w = [w[0] / wlen, w[1] / wlen, w[2] / wlen];
 
     let u = [
-        w[1]*up[2] - w[2]*up[1],
-        w[2]*up[0] - w[0]*up[2],
-        w[0]*up[1] - w[1]*up[0],
+        w[1] * up[2] - w[2] * up[1],
+        w[2] * up[0] - w[0] * up[2],
+        w[0] * up[1] - w[1] * up[0],
     ];
-    let ulen = (u[0]*u[0] + u[1]*u[1] + u[2]*u[2]).sqrt();
-    let u = [u[0]/ulen, u[1]/ulen, u[2]/ulen];
+    let ulen = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+    let u = [u[0] / ulen, u[1] / ulen, u[2] / ulen];
 
     let v = [
-        u[1]*w[2] - u[2]*w[1],
-        u[2]*w[0] - u[0]*w[2],
-        u[0]*w[1] - u[1]*w[0],
+        u[1] * w[2] - u[2] * w[1],
+        u[2] * w[0] - u[0] * w[2],
+        u[0] * w[1] - u[1] * w[0],
     ];
 
     let half_h = (fov.to_radians() * 0.5).tan();
     let half_w = aspect * half_h;
 
-    let cam_u = [u[0]*half_w, u[1]*half_w, u[2]*half_w];
-    let cam_v = [v[0]*half_h, v[1]*half_h, v[2]*half_h];
+    let cam_u = [u[0] * half_w, u[1] * half_w, u[2] * half_w];
+    let cam_v = [v[0] * half_h, v[1] * half_h, v[2] * half_h];
     let cam_w = w;
 
     (cam_u, cam_v, cam_w)
@@ -778,10 +937,12 @@ fn compute_camera(eye: &[f32; 3], look: &[f32; 3], up: &[f32; 3], fov: f32, aspe
 fn transform_vertices(verts: &[f32], t: &[f32; 12]) -> Vec<f32> {
     let mut result = Vec::with_capacity(verts.len());
     for i in (0..verts.len()).step_by(3) {
-        let x = verts[i]; let y = verts[i+1]; let z = verts[i+2];
-        result.push(t[0]*x + t[1]*y + t[2]*z + t[3]);
-        result.push(t[4]*x + t[5]*y + t[6]*z + t[7]);
-        result.push(t[8]*x + t[9]*y + t[10]*z + t[11]);
+        let x = verts[i];
+        let y = verts[i + 1];
+        let z = verts[i + 2];
+        result.push(t[0] * x + t[1] * y + t[2] * z + t[3]);
+        result.push(t[4] * x + t[5] * y + t[6] * z + t[7]);
+        result.push(t[8] * x + t[9] * y + t[10] * z + t[11]);
     }
     result
 }
@@ -791,22 +952,23 @@ fn make_sphere_mesh(radius: f32, subdivisions: u32) -> (Vec<f32>, Vec<i32>) {
     let t = (1.0 + 5.0_f32.sqrt()) / 2.0;
 
     let mut verts = vec![
-        -1.0,  t,  0.0,   1.0,  t,  0.0,  -1.0, -t,  0.0,   1.0, -t,  0.0,
-         0.0, -1.0,  t,   0.0,  1.0,  t,   0.0, -1.0, -t,   0.0,  1.0, -t,
-         t,  0.0, -1.0,   t,  0.0,  1.0,  -t,  0.0, -1.0,  -t,  0.0,  1.0,
+        -1.0, t, 0.0, 1.0, t, 0.0, -1.0, -t, 0.0, 1.0, -t, 0.0, 0.0, -1.0, t, 0.0, 1.0, t, 0.0,
+        -1.0, -t, 0.0, 1.0, -t, t, 0.0, -1.0, t, 0.0, 1.0, -t, 0.0, -1.0, -t, 0.0, 1.0,
     ];
 
     let mut indices: Vec<i32> = vec![
-        0,11,5, 0,5,1, 0,1,7, 0,7,10, 0,10,11,
-        1,5,9, 5,11,4, 11,10,2, 10,7,6, 7,1,8,
-        3,9,4, 3,4,2, 3,2,6, 3,6,8, 3,8,9,
-        4,9,5, 2,4,11, 6,2,10, 8,6,7, 9,8,1,
+        0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11, 1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6, 7,
+        1, 8, 3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9, 4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9,
+        8, 1,
     ];
 
     // Normalize initial vertices
     for i in (0..verts.len()).step_by(3) {
-        let len = (verts[i]*verts[i] + verts[i+1]*verts[i+1] + verts[i+2]*verts[i+2]).sqrt();
-        verts[i] /= len; verts[i+1] /= len; verts[i+2] /= len;
+        let len = (verts[i] * verts[i] + verts[i + 1] * verts[i + 1] + verts[i + 2] * verts[i + 2])
+            .sqrt();
+        verts[i] /= len;
+        verts[i + 1] /= len;
+        verts[i + 2] /= len;
     }
 
     // Subdivide
@@ -822,17 +984,21 @@ fn make_sphere_mesh(radius: f32, subdivisions: u32) -> (Vec<f32>, Vec<i32>) {
             let ai = a as usize * 3;
             let bi = b as usize * 3;
             let mx = (verts[ai] + verts[bi]) * 0.5;
-            let my = (verts[ai+1] + verts[bi+1]) * 0.5;
-            let mz = (verts[ai+2] + verts[bi+2]) * 0.5;
-            let len = (mx*mx + my*my + mz*mz).sqrt();
+            let my = (verts[ai + 1] + verts[bi + 1]) * 0.5;
+            let mz = (verts[ai + 2] + verts[bi + 2]) * 0.5;
+            let len = (mx * mx + my * my + mz * mz).sqrt();
             let idx = (verts.len() / 3) as i32;
-            verts.push(mx/len); verts.push(my/len); verts.push(mz/len);
+            verts.push(mx / len);
+            verts.push(my / len);
+            verts.push(mz / len);
             midpoint_cache.insert(key, idx);
             idx
         };
 
         for tri in indices.chunks(3) {
-            let a = tri[0]; let b = tri[1]; let c = tri[2];
+            let a = tri[0];
+            let b = tri[1];
+            let c = tri[2];
             let ab = get_midpoint(a, b, &mut verts);
             let bc = get_midpoint(b, c, &mut verts);
             let ca = get_midpoint(c, a, &mut verts);
@@ -856,12 +1022,16 @@ fn find_optix_include() -> String {
     #[cfg(target_os = "windows")]
     {
         let default = r"C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.0.0\include";
-        if std::path::Path::new(default).exists() { return default.to_string(); }
+        if std::path::Path::new(default).exists() {
+            return default.to_string();
+        }
     }
     #[cfg(target_os = "linux")]
     {
         let default = "/usr/local/NVIDIA-OptiX-SDK-9.0.0/include";
-        if std::path::Path::new(default).exists() { return default.to_string(); }
+        if std::path::Path::new(default).exists() {
+            return default.to_string();
+        }
     }
     panic!("OptiX SDK not found. Set OPTIX_ROOT.");
 }

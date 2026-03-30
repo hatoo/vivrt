@@ -111,10 +111,7 @@ impl DeviceContext {
     /// Enable or disable the disk cache.
     pub fn set_cache_enabled(&self, enabled: bool) -> Result<()> {
         let result = unsafe {
-            (self.table.raw.optixDeviceContextSetCacheEnabled.unwrap())(
-                self.raw,
-                enabled as i32,
-            )
+            (self.table.raw.optixDeviceContextSetCacheEnabled.unwrap())(self.raw, enabled as i32)
         };
         error::check(result)
     }
@@ -123,22 +120,23 @@ impl DeviceContext {
     pub fn set_cache_location(&self, path: &str) -> Result<()> {
         let cpath = CString::new(path).map_err(|_| OptixError::InvalidValue)?;
         let result = unsafe {
-            (self.table.raw.optixDeviceContextSetCacheLocation.unwrap())(
-                self.raw,
-                cpath.as_ptr(),
-            )
+            (self.table.raw.optixDeviceContextSetCacheLocation.unwrap())(self.raw, cpath.as_ptr())
         };
         error::check(result)
     }
 
     /// Set the disk cache size limits.
-    pub fn set_cache_database_sizes(&self, low_water_mark: usize, high_water_mark: usize) -> Result<()> {
+    pub fn set_cache_database_sizes(
+        &self,
+        low_water_mark: usize,
+        high_water_mark: usize,
+    ) -> Result<()> {
         let result = unsafe {
-            (self.table.raw.optixDeviceContextSetCacheDatabaseSizes.unwrap())(
-                self.raw,
-                low_water_mark,
-                high_water_mark,
-            )
+            (self
+                .table
+                .raw
+                .optixDeviceContextSetCacheDatabaseSizes
+                .unwrap())(self.raw, low_water_mark, high_water_mark)
         };
         error::check(result)
     }

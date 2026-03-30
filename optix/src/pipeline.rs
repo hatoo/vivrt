@@ -35,16 +35,35 @@ impl PipelineCompileOptions {
             exception_flags: ExceptionFlags::NONE,
             uses_primitive_type_flags: PrimitiveTypeFlags::TRIANGLE,
             allow_opacity_micromaps: false,
-            launch_params_name: CString::new(launch_params_name).expect("invalid launch params name"),
+            launch_params_name: CString::new(launch_params_name)
+                .expect("invalid launch params name"),
         }
     }
 
-    pub fn uses_motion_blur(mut self, v: bool) -> Self { self.uses_motion_blur = v; self }
-    pub fn traversable_graph_flags(mut self, f: TraversableGraphFlags) -> Self { self.traversable_graph_flags = f; self }
-    pub fn num_payload_values(mut self, n: i32) -> Self { self.num_payload_values = n; self }
-    pub fn num_attribute_values(mut self, n: i32) -> Self { self.num_attribute_values = n; self }
-    pub fn exception_flags(mut self, f: ExceptionFlags) -> Self { self.exception_flags = f; self }
-    pub fn uses_primitive_type_flags(mut self, f: PrimitiveTypeFlags) -> Self { self.uses_primitive_type_flags = f; self }
+    pub fn uses_motion_blur(mut self, v: bool) -> Self {
+        self.uses_motion_blur = v;
+        self
+    }
+    pub fn traversable_graph_flags(mut self, f: TraversableGraphFlags) -> Self {
+        self.traversable_graph_flags = f;
+        self
+    }
+    pub fn num_payload_values(mut self, n: i32) -> Self {
+        self.num_payload_values = n;
+        self
+    }
+    pub fn num_attribute_values(mut self, n: i32) -> Self {
+        self.num_attribute_values = n;
+        self
+    }
+    pub fn exception_flags(mut self, f: ExceptionFlags) -> Self {
+        self.exception_flags = f;
+        self
+    }
+    pub fn uses_primitive_type_flags(mut self, f: PrimitiveTypeFlags) -> Self {
+        self.uses_primitive_type_flags = f;
+        self
+    }
 
     pub(crate) fn to_raw(&self) -> optix_sys::OptixPipelineCompileOptions {
         optix_sys::OptixPipelineCompileOptions {
@@ -95,7 +114,8 @@ impl Pipeline {
             maxTraceDepth: link_options.max_trace_depth,
         };
 
-        let raw_pgs: Vec<optix_sys::OptixProgramGroup> = program_groups.iter().map(|pg| pg.raw).collect();
+        let raw_pgs: Vec<optix_sys::OptixProgramGroup> =
+            program_groups.iter().map(|pg| pg.raw).collect();
 
         let mut raw: optix_sys::OptixPipeline = ptr::null_mut();
         let mut log = [0u8; 2048];

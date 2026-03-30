@@ -198,22 +198,35 @@ impl Denoiser {
         };
 
         let raw_guide = optix_sys::OptixDenoiserGuideLayer {
-            albedo: guide_layer.albedo.as_ref().map_or(Image2D::empty_raw(), |i| i.to_raw()),
-            normal: guide_layer.normal.as_ref().map_or(Image2D::empty_raw(), |i| i.to_raw()),
-            flow: guide_layer.flow.as_ref().map_or(Image2D::empty_raw(), |i| i.to_raw()),
+            albedo: guide_layer
+                .albedo
+                .as_ref()
+                .map_or(Image2D::empty_raw(), |i| i.to_raw()),
+            normal: guide_layer
+                .normal
+                .as_ref()
+                .map_or(Image2D::empty_raw(), |i| i.to_raw()),
+            flow: guide_layer
+                .flow
+                .as_ref()
+                .map_or(Image2D::empty_raw(), |i| i.to_raw()),
             previousOutputInternalGuideLayer: Image2D::empty_raw(),
             outputInternalGuideLayer: Image2D::empty_raw(),
             flowTrustworthiness: Image2D::empty_raw(),
         };
 
-        let raw_layers: Vec<optix_sys::OptixDenoiserLayer> = layers.iter().map(|l| {
-            optix_sys::OptixDenoiserLayer {
+        let raw_layers: Vec<optix_sys::OptixDenoiserLayer> = layers
+            .iter()
+            .map(|l| optix_sys::OptixDenoiserLayer {
                 input: l.input.to_raw(),
-                previousOutput: l.previous_output.as_ref().map_or(Image2D::empty_raw(), |i| i.to_raw()),
+                previousOutput: l
+                    .previous_output
+                    .as_ref()
+                    .map_or(Image2D::empty_raw(), |i| i.to_raw()),
                 output: l.output.to_raw(),
                 type_: optix_sys::OptixDenoiserAOVType::OPTIX_DENOISER_AOV_TYPE_NONE,
-            }
-        }).collect();
+            })
+            .collect();
 
         let result = unsafe {
             (self.table.raw.optixDenoiserInvoke.unwrap())(

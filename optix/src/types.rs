@@ -145,13 +145,19 @@ impl DeviceProperty {
         use optix_sys::OptixDeviceProperty as R;
         match self {
             Self::LimitMaxTraceDepth => R::OPTIX_DEVICE_PROPERTY_LIMIT_MAX_TRACE_DEPTH,
-            Self::LimitMaxTraversableGraphDepth => R::OPTIX_DEVICE_PROPERTY_LIMIT_MAX_TRAVERSABLE_GRAPH_DEPTH,
+            Self::LimitMaxTraversableGraphDepth => {
+                R::OPTIX_DEVICE_PROPERTY_LIMIT_MAX_TRAVERSABLE_GRAPH_DEPTH
+            }
             Self::LimitMaxPrimitivesPerGas => R::OPTIX_DEVICE_PROPERTY_LIMIT_MAX_PRIMITIVES_PER_GAS,
             Self::LimitMaxInstancesPerIas => R::OPTIX_DEVICE_PROPERTY_LIMIT_MAX_INSTANCES_PER_IAS,
             Self::RtcoreVersion => R::OPTIX_DEVICE_PROPERTY_RTCORE_VERSION,
             Self::LimitMaxInstanceId => R::OPTIX_DEVICE_PROPERTY_LIMIT_MAX_INSTANCE_ID,
-            Self::LimitNumBitsInstanceVisibilityMask => R::OPTIX_DEVICE_PROPERTY_LIMIT_NUM_BITS_INSTANCE_VISIBILITY_MASK,
-            Self::LimitMaxSbtRecordsPerGas => R::OPTIX_DEVICE_PROPERTY_LIMIT_MAX_SBT_RECORDS_PER_GAS,
+            Self::LimitNumBitsInstanceVisibilityMask => {
+                R::OPTIX_DEVICE_PROPERTY_LIMIT_NUM_BITS_INSTANCE_VISIBILITY_MASK
+            }
+            Self::LimitMaxSbtRecordsPerGas => {
+                R::OPTIX_DEVICE_PROPERTY_LIMIT_MAX_SBT_RECORDS_PER_GAS
+            }
             Self::LimitMaxSbtOffset => R::OPTIX_DEVICE_PROPERTY_LIMIT_MAX_SBT_OFFSET,
             Self::ShaderExecutionReordering => R::OPTIX_DEVICE_PROPERTY_SHADER_EXECUTION_REORDERING,
         }

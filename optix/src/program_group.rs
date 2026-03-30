@@ -23,7 +23,8 @@ impl ProgramGroup {
         module: &Module,
         entry_function: &str,
     ) -> Result<WithLog<Self>> {
-        let entry = CString::new(entry_function).map_err(|_| crate::error::OptixError::InvalidValue)?;
+        let entry =
+            CString::new(entry_function).map_err(|_| crate::error::OptixError::InvalidValue)?;
         let desc = optix_sys::OptixProgramGroupDesc {
             kind: optix_sys::OptixProgramGroupKind::OPTIX_PROGRAM_GROUP_KIND_RAYGEN,
             __bindgen_anon_1: optix_sys::OptixProgramGroupDesc__bindgen_ty_1 {
@@ -43,7 +44,8 @@ impl ProgramGroup {
         module: &Module,
         entry_function: &str,
     ) -> Result<WithLog<Self>> {
-        let entry = CString::new(entry_function).map_err(|_| crate::error::OptixError::InvalidValue)?;
+        let entry =
+            CString::new(entry_function).map_err(|_| crate::error::OptixError::InvalidValue)?;
         let desc = optix_sys::OptixProgramGroupDesc {
             kind: optix_sys::OptixProgramGroupKind::OPTIX_PROGRAM_GROUP_KIND_MISS,
             __bindgen_anon_1: optix_sys::OptixProgramGroupDesc__bindgen_ty_1 {
@@ -63,7 +65,8 @@ impl ProgramGroup {
         module: &Module,
         entry_function: &str,
     ) -> Result<WithLog<Self>> {
-        let entry = CString::new(entry_function).map_err(|_| crate::error::OptixError::InvalidValue)?;
+        let entry =
+            CString::new(entry_function).map_err(|_| crate::error::OptixError::InvalidValue)?;
         let desc = optix_sys::OptixProgramGroupDesc {
             kind: optix_sys::OptixProgramGroupKind::OPTIX_PROGRAM_GROUP_KIND_EXCEPTION,
             __bindgen_anon_1: optix_sys::OptixProgramGroupDesc__bindgen_ty_1 {
@@ -109,7 +112,10 @@ impl ProgramGroup {
         Ok(header)
     }
 
-    fn create_single(ctx: &DeviceContext, desc: &optix_sys::OptixProgramGroupDesc) -> Result<WithLog<Self>> {
+    fn create_single(
+        ctx: &DeviceContext,
+        desc: &optix_sys::OptixProgramGroupDesc,
+    ) -> Result<WithLog<Self>> {
         let options = optix_sys::OptixProgramGroupOptions {
             payloadType: ptr::null(),
         };
@@ -174,16 +180,34 @@ impl<'a> HitgroupBuilder<'a> {
     }
 
     pub fn build(self) -> Result<WithLog<ProgramGroup>> {
-        let ch_entry = self.closest_hit.as_ref().map(|(_, e)| CString::new(e.as_str()).unwrap());
-        let ah_entry = self.any_hit.as_ref().map(|(_, e)| CString::new(e.as_str()).unwrap());
-        let is_entry = self.intersection.as_ref().map(|(_, e)| CString::new(e.as_str()).unwrap());
+        let ch_entry = self
+            .closest_hit
+            .as_ref()
+            .map(|(_, e)| CString::new(e.as_str()).unwrap());
+        let ah_entry = self
+            .any_hit
+            .as_ref()
+            .map(|(_, e)| CString::new(e.as_str()).unwrap());
+        let is_entry = self
+            .intersection
+            .as_ref()
+            .map(|(_, e)| CString::new(e.as_str()).unwrap());
 
         let hitgroup = optix_sys::OptixProgramGroupHitgroup {
-            moduleCH: self.closest_hit.as_ref().map_or(ptr::null_mut(), |(m, _)| m.raw),
+            moduleCH: self
+                .closest_hit
+                .as_ref()
+                .map_or(ptr::null_mut(), |(m, _)| m.raw),
             entryFunctionNameCH: ch_entry.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-            moduleAH: self.any_hit.as_ref().map_or(ptr::null_mut(), |(m, _)| m.raw),
+            moduleAH: self
+                .any_hit
+                .as_ref()
+                .map_or(ptr::null_mut(), |(m, _)| m.raw),
             entryFunctionNameAH: ah_entry.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-            moduleIS: self.intersection.as_ref().map_or(ptr::null_mut(), |(m, _)| m.raw),
+            moduleIS: self
+                .intersection
+                .as_ref()
+                .map_or(ptr::null_mut(), |(m, _)| m.raw),
             entryFunctionNameIS: is_entry.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
         };
 
@@ -216,13 +240,25 @@ impl<'a> CallablesBuilder<'a> {
     }
 
     pub fn build(self) -> Result<WithLog<ProgramGroup>> {
-        let dc_entry = self.direct_callable.as_ref().map(|(_, e)| CString::new(e.as_str()).unwrap());
-        let cc_entry = self.continuation_callable.as_ref().map(|(_, e)| CString::new(e.as_str()).unwrap());
+        let dc_entry = self
+            .direct_callable
+            .as_ref()
+            .map(|(_, e)| CString::new(e.as_str()).unwrap());
+        let cc_entry = self
+            .continuation_callable
+            .as_ref()
+            .map(|(_, e)| CString::new(e.as_str()).unwrap());
 
         let callables = optix_sys::OptixProgramGroupCallables {
-            moduleDC: self.direct_callable.as_ref().map_or(ptr::null_mut(), |(m, _)| m.raw),
+            moduleDC: self
+                .direct_callable
+                .as_ref()
+                .map_or(ptr::null_mut(), |(m, _)| m.raw),
             entryFunctionNameDC: dc_entry.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-            moduleCC: self.continuation_callable.as_ref().map_or(ptr::null_mut(), |(m, _)| m.raw),
+            moduleCC: self
+                .continuation_callable
+                .as_ref()
+                .map_or(ptr::null_mut(), |(m, _)| m.raw),
             entryFunctionNameCC: cc_entry.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
         };
 

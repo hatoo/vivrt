@@ -1,13 +1,13 @@
+pub mod accel;
+pub mod context;
+pub mod denoiser;
 pub mod error;
+pub mod module;
+pub mod pipeline;
+pub mod program_group;
+pub mod sbt;
 mod sys;
 pub mod types;
-pub mod context;
-pub mod module;
-pub mod program_group;
-pub mod pipeline;
-pub mod accel;
-pub mod sbt;
-pub mod denoiser;
 
 use crate::error::{OptixError, Result};
 use crate::sys::FunctionTable;
@@ -23,8 +23,8 @@ pub use sbt::{SbtRecord, SbtRecordHeader, ShaderBindingTableBuilder};
 pub use types::*;
 
 // Re-export optix-sys types that appear in the public API
-pub use optix_sys::{CUcontext, CUdeviceptr, CUstream, OptixTraversableHandle};
 pub use optix_sys::OPTIX_SBT_RECORD_HEADER_SIZE;
+pub use optix_sys::{CUcontext, CUdeviceptr, CUstream, OptixTraversableHandle};
 
 /// Handle to an initialized OptiX instance.
 ///

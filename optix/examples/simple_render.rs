@@ -1,6 +1,6 @@
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
-use optix::*;
 use optix::accel::{self, AccelBuildOptions, BuildInput, TriangleArrayInput};
+use optix::*;
 use std::mem;
 use std::sync::Arc;
 
@@ -116,11 +116,7 @@ fn main() {
     pipeline.set_stack_size(2048, 2048, 2048, 1).unwrap();
 
     // --- Acceleration structure ---
-    let vertices: [f32; 9] = [
-        -0.5, -0.5, 0.0,
-        0.5, -0.5, 0.0,
-        0.0, 0.5, 0.0,
-    ];
+    let vertices: [f32; 9] = [-0.5, -0.5, 0.0, 0.5, -0.5, 0.0, 0.0, 0.5, 0.0];
     let d_vertices = stream.clone_htod(&vertices).unwrap();
     let d_vertices_ptr = dptr(&d_vertices, &stream);
     let vertex_buffers = [d_vertices_ptr];
@@ -133,13 +129,18 @@ fn main() {
 
     let make_tri_input = || {
         TriangleArrayInput::new(
-            &vertex_buffers, 3, VertexFormat::Float3,
-            3 * mem::size_of::<f32>() as u32, &geo_flags,
+            &vertex_buffers,
+            3,
+            VertexFormat::Float3,
+            3 * mem::size_of::<f32>() as u32,
+            &geo_flags,
         )
     };
 
     let sizes = accel::accel_compute_memory_usage(
-        &ctx, &build_options, &[BuildInput::Triangles(make_tri_input())],
+        &ctx,
+        &build_options,
+        &[BuildInput::Triangles(make_tri_input())],
     )
     .expect("accel memory");
 
@@ -147,10 +148,14 @@ fn main() {
     let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
 
     let gas_handle = accel::accel_build(
-        &ctx, cu_stream, &build_options,
+        &ctx,
+        cu_stream,
+        &build_options,
         &[BuildInput::Triangles(make_tri_input())],
-        dptr(&d_temp, &stream), sizes.temp_size,
-        dptr(&d_output, &stream), sizes.output_size,
+        dptr(&d_temp, &stream),
+        sizes.temp_size,
+        dptr(&d_output, &stream),
+        sizes.output_size,
     )
     .expect("accel build");
 
@@ -159,7 +164,13 @@ fn main() {
 
     // --- SBT ---
     let raygen_record = SbtRecord::new(&raygen_pg, RayGenData {}).unwrap();
-    let miss_record = SbtRecord::new(&miss_pg, MissData { bg_color: [0.1, 0.1, 0.3] }).unwrap();
+    let miss_record = SbtRecord::new(
+        &miss_pg,
+        MissData {
+            bg_color: [0.1, 0.1, 0.3],
+        },
+    )
+    .unwrap();
     let hitgroup_record = SbtRecord::new(&hitgroup_pg, HitGroupData {}).unwrap();
 
     let d_rg = alloc_and_copy(&stream, &raygen_record);
@@ -191,7 +202,15 @@ fn main() {
     // --- Launch ---
     println!("Launching OptiX render ({WIDTH} x {HEIGHT})...");
     pipeline
-        .launch(cu_stream, d_params, mem::size_of::<Params>(), &sbt, WIDTH, HEIGHT, 1)
+        .launch(
+            cu_stream,
+            d_params,
+            mem::size_of::<Params>(),
+            &sbt,
+            WIDTH,
+            HEIGHT,
+            1,
+        )
         .expect("launch");
     stream.synchronize().unwrap();
 
@@ -210,10 +229,7 @@ fn compile_cu(dir: &std::path::Path, filename: &str) -> String {
     let optix_include = find_optix_include();
 
     let opts = cudarc::nvrtc::CompileOptions {
-        include_paths: vec![
-            optix_include,
-            dir.to_string_lossy().into_owned(),
-        ],
+        include_paths: vec![optix_include, dir.to_string_lossy().into_owned()],
         use_fast_math: Some(true),
         ..Default::default()
     };

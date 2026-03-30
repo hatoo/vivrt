@@ -115,10 +115,7 @@ pub struct InstanceArrayInput {
 }
 
 /// Convert safe BuildInput to raw, storing temporary data in the provided buffers.
-fn build_input_to_raw(
-    input: &BuildInput,
-    raw_flags: &mut Vec<u32>,
-) -> optix_sys::OptixBuildInput {
+fn build_input_to_raw(input: &BuildInput, raw_flags: &mut Vec<u32>) -> optix_sys::OptixBuildInput {
     let mut raw: optix_sys::OptixBuildInput = unsafe { MaybeUninit::zeroed().assume_init() };
 
     match input {
@@ -157,7 +154,9 @@ fn build_input_to_raw(
                 primitiveIndexOffset: cp.primitive_index_offset,
                 ..Default::default()
             };
-            raw.__bindgen_anon_1 = optix_sys::OptixBuildInput__bindgen_ty_1 { customPrimitiveArray: cpa };
+            raw.__bindgen_anon_1 = optix_sys::OptixBuildInput__bindgen_ty_1 {
+                customPrimitiveArray: cpa,
+            };
         }
         BuildInput::Instances(inst) => {
             raw.type_ = optix_sys::OptixBuildInputType::OPTIX_BUILD_INPUT_TYPE_INSTANCES;
@@ -186,7 +185,8 @@ pub fn accel_compute_memory_usage(
     };
 
     let mut raw_flags = Vec::new();
-    let raw_inputs: Vec<_> = build_inputs.iter()
+    let raw_inputs: Vec<_> = build_inputs
+        .iter()
         .map(|bi| build_input_to_raw(bi, &mut raw_flags))
         .collect();
 
@@ -227,7 +227,8 @@ pub fn accel_build(
     };
 
     let mut raw_flags = Vec::new();
-    let raw_inputs: Vec<_> = build_inputs.iter()
+    let raw_inputs: Vec<_> = build_inputs
+        .iter()
         .map(|bi| build_input_to_raw(bi, &mut raw_flags))
         .collect();
 
