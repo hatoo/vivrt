@@ -1,0 +1,6 @@
+[package]
+name = "pbrt-parser"
+version = "0.1.0"
+edition = "2021"
+description = "Parser for PBRT v4 scene file format"
+license = "MIT"
