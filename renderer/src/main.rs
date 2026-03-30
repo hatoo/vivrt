@@ -15,7 +15,7 @@ struct Args {
     /// Input .pbrt scene file
     input: String,
 
-    /// Output image file (.ppm)
+    /// Output image file (.png)
     #[arg(short, long)]
     output: Option<String>,
 
@@ -296,7 +296,7 @@ fn parse_scene(input: &str) -> ParsedScene {
         ambient_light: [0.0; 3],
         distant_lights: Vec::new(),
         objects: Vec::new(),
-        filename: "output.ppm".to_string(),
+        filename: "output.png".to_string(),
     };
 
     // Texture storage (name -> checkerboard params)
@@ -890,11 +890,11 @@ fn main() {
     // --- Download and save ---
     let pixels = stream.clone_dtoh(&d_image).unwrap();
 
-    let output_file = scene
-        .filename
-        .replace(".png", ".ppm")
-        .replace(".exr", ".ppm");
-    save_ppm(&output_file, scene.width, scene.height, &pixels);
+    let mut output_file = scene.filename.replace(".exr", ".png");
+    if !output_file.ends_with(".png") && !output_file.ends_with(".ppm") {
+        output_file = format!("{output_file}.png");
+    }
+    save_image(&output_file, scene.width, scene.height, &pixels);
     println!("Saved {output_file}");
 }
 
@@ -1035,17 +1035,30 @@ fn find_optix_include() -> String {
     panic!("OptiX SDK not found. Set OPTIX_ROOT.");
 }
 
-fn save_ppm(path: &str, width: u32, height: u32, pixels: &[u32]) {
-    use std::io::Write;
-    let mut file = std::fs::File::create(path).expect("Failed to create output file");
-    write!(file, "P6\n{width} {height}\n255\n").unwrap();
+fn save_image(path: &str, width: u32, height: u32, pixels: &[u32]) {
+    // Convert ABGR packed pixels to RGB bytes (flipped vertically)
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
     for y in (0..height).rev() {
         for x in 0..width {
             let pixel = pixels[(y * width + x) as usize];
-            let r = (pixel & 0xFF) as u8;
-            let g = ((pixel >> 8) & 0xFF) as u8;
-            let b = ((pixel >> 16) & 0xFF) as u8;
-            file.write_all(&[r, g, b]).unwrap();
+            rgb.push((pixel & 0xFF) as u8);
+            rgb.push(((pixel >> 8) & 0xFF) as u8);
+            rgb.push(((pixel >> 16) & 0xFF) as u8);
         }
+    }
+
+    if path.ends_with(".ppm") {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path).expect("Failed to create output file");
+        write!(file, "P6\n{width} {height}\n255\n").unwrap();
+        file.write_all(&rgb).unwrap();
+    } else {
+        let file = std::fs::File::create(path).expect("Failed to create output file");
+        let w = std::io::BufWriter::new(file);
+        let mut encoder = png::Encoder::new(w, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("Failed to write PNG header");
+        writer.write_image_data(&rgb).expect("Failed to write PNG data");
     }
 }
