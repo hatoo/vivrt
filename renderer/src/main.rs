@@ -87,6 +87,7 @@ struct HitGroupData {
     checker_color1: [f32; 3],
     checker_color2: [f32; 3],
     texcoords: optix_sys::CUdeviceptr,
+    normals: optix_sys::CUdeviceptr,
     indices: optix_sys::CUdeviceptr,
     vertices: optix_sys::CUdeviceptr,
     num_vertices: i32,
@@ -661,16 +662,18 @@ fn main() {
             SceneShape::Sphere { radius } => {
                 // Create sphere as a set of triangles approximating it, OR use built-in sphere
                 // For simplicity, approximate sphere with an icosphere
-                let (verts, indices) = make_sphere_mesh(*radius, 4);
+                let (verts, normals, indices) = make_sphere_mesh(*radius, 4);
 
                 // Apply transform
                 let transformed_verts = transform_vertices(&verts, &obj.transform);
+                // Transform normals (rotation only, no translation)
+                let transformed_normals = transform_normals(&normals, &obj.transform);
 
                 let d_verts = stream.clone_htod(&transformed_verts).unwrap();
+                let d_normals = stream.clone_htod(&transformed_normals).unwrap();
                 let d_indices = stream.clone_htod(&indices).unwrap();
                 let vbuf = vec![dptr(&d_verts, &stream)];
 
-                let _num_triangles = indices.len() / 3;
                 let flags = vec![GeometryFlags::NONE];
 
                 let hg_data = HitGroupData {
@@ -683,10 +686,13 @@ fn main() {
                     checker_color1: [0.0; 3],
                     checker_color2: [0.0; 3],
                     texcoords: 0,
+                    normals: dptr(&d_normals, &stream),
                     indices: dptr(&d_indices, &stream),
                     vertices: dptr(&d_verts, &stream),
                     num_vertices: transformed_verts.len() as i32 / 3,
                 };
+                let nb: CudaSlice<u8> = unsafe { std::mem::transmute(d_normals) };
+                _device_buffers.push(nb);
 
                 _vertex_ptrs.push(vbuf);
                 _flags.push(flags);
@@ -730,6 +736,7 @@ fn main() {
                     checker_color1: obj.material.checker_color1,
                     checker_color2: obj.material.checker_color2,
                     texcoords: d_tc,
+                    normals: 0,
                     indices: dptr(&d_indices, &stream),
                     vertices: dptr(&d_verts, &stream),
                     num_vertices: transformed.len() as i32 / 3,
@@ -754,7 +761,7 @@ fn main() {
             // Read from stored data - we know it from the scene objects
             match &scene.objects[i].shape {
                 SceneShape::Sphere { radius } => {
-                    let (_, indices) = make_sphere_mesh(*radius, 4);
+                    let (_, _, indices) = make_sphere_mesh(*radius, 4);
                     indices.len() as u32 / 3
                 }
                 SceneShape::TriangleMesh { indices, .. } => indices.len() as u32 / 3,
@@ -946,7 +953,25 @@ fn transform_vertices(verts: &[f32], t: &[f32; 12]) -> Vec<f32> {
     result
 }
 
-fn make_sphere_mesh(radius: f32, subdivisions: u32) -> (Vec<f32>, Vec<i32>) {
+fn transform_normals(normals: &[f32], t: &[f32; 12]) -> Vec<f32> {
+    // Apply rotation only (no translation) and re-normalize
+    let mut result = Vec::with_capacity(normals.len());
+    for i in (0..normals.len()).step_by(3) {
+        let x = normals[i];
+        let y = normals[i + 1];
+        let z = normals[i + 2];
+        let nx = t[0] * x + t[1] * y + t[2] * z;
+        let ny = t[4] * x + t[5] * y + t[6] * z;
+        let nz = t[8] * x + t[9] * y + t[10] * z;
+        let len = (nx * nx + ny * ny + nz * nz).sqrt();
+        result.push(nx / len);
+        result.push(ny / len);
+        result.push(nz / len);
+    }
+    result
+}
+
+fn make_sphere_mesh(radius: f32, subdivisions: u32) -> (Vec<f32>, Vec<f32>, Vec<i32>) {
     // Generate an icosphere
     let t = (1.0 + 5.0_f32.sqrt()) / 2.0;
 
@@ -1006,12 +1031,15 @@ fn make_sphere_mesh(radius: f32, subdivisions: u32) -> (Vec<f32>, Vec<i32>) {
         indices = new_indices;
     }
 
+    // Normals = normalized positions (before scaling by radius)
+    let normals = verts.clone();
+
     // Scale by radius
     for v in &mut verts {
         *v *= radius;
     }
 
-    (verts, indices)
+    (verts, normals, indices)
 }
 
 fn find_optix_include() -> String {

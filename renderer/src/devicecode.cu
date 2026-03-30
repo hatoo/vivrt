@@ -288,16 +288,34 @@ extern "C" __global__ void __closesthit__ch()
         v2 = make_float3(data->vertices[prim_idx*9+6], data->vertices[prim_idx*9+7], data->vertices[prim_idx*9+8]);
     }
 
-    float3 edge1 = v1 - v0;
-    float3 edge2 = v2 - v0;
-    float3 geo_normal = normalize3(cross3(edge1, edge2));
+    float3 shading_normal;
+    if (data->normals) {
+        // Smooth shading: interpolate per-vertex normals
+        int i0, i1, i2;
+        if (data->indices) {
+            i0 = data->indices[prim_idx * 3 + 0];
+            i1 = data->indices[prim_idx * 3 + 1];
+            i2 = data->indices[prim_idx * 3 + 2];
+        } else {
+            i0 = prim_idx * 3 + 0;
+            i1 = prim_idx * 3 + 1;
+            i2 = prim_idx * 3 + 2;
+        }
+        float3 n0 = make_float3(data->normals[i0*3], data->normals[i0*3+1], data->normals[i0*3+2]);
+        float3 n1 = make_float3(data->normals[i1*3], data->normals[i1*3+1], data->normals[i1*3+2]);
+        float3 n2 = make_float3(data->normals[i2*3], data->normals[i2*3+1], data->normals[i2*3+2]);
+        float w = 1.0f - bary.x - bary.y;
+        shading_normal = normalize3(n0 * w + n1 * bary.x + n2 * bary.y);
+    } else {
+        // Flat shading: face normal from triangle edges
+        float3 edge1 = v1 - v0;
+        float3 edge2 = v2 - v0;
+        shading_normal = normalize3(cross3(edge1, edge2));
+    }
 
     // Ensure normal faces the ray
-    if (dot3(geo_normal, ray_dir) > 0.0f)
-        geo_normal = geo_normal * (-1.0f);
-
-    // Apply object-to-world transform to normal
-    // (optixGetWorldRayOrigin/Direction already in world space, and we use world-space positions)
+    if (dot3(shading_normal, ray_dir) > 0.0f)
+        shading_normal = shading_normal * (-1.0f);
 
     float3 albedo = make_f3(data->albedo);
 
@@ -341,9 +359,9 @@ extern "C" __global__ void __closesthit__ch()
     optixSetPayload_3(__float_as_uint(hit_pos.x));
     optixSetPayload_4(__float_as_uint(hit_pos.y));
     optixSetPayload_5(__float_as_uint(hit_pos.z));
-    optixSetPayload_6(__float_as_uint(geo_normal.x));
-    optixSetPayload_7(__float_as_uint(geo_normal.y));
-    optixSetPayload_8(__float_as_uint(geo_normal.z));
+    optixSetPayload_6(__float_as_uint(shading_normal.x));
+    optixSetPayload_7(__float_as_uint(shading_normal.y));
+    optixSetPayload_8(__float_as_uint(shading_normal.z));
     optixSetPayload_9((unsigned int)data->material_type);
 }
 

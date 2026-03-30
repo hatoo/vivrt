@@ -45,8 +45,9 @@ struct HitGroupData {
     float         checker_scale_v;
     float         checker_color1[3];
     float         checker_color2[3];
-    // Geometry data for UV computation (triangles)
+    // Geometry data (triangles)
     float*        texcoords; // 2 floats per vertex, or NULL
+    float*        normals;   // 3 floats per vertex, or NULL (smooth shading)
     int*          indices;   // 3 ints per triangle, or NULL
     float*        vertices;  // 3 floats per vertex
     int           num_vertices;
