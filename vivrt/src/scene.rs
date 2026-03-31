@@ -723,6 +723,21 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             Err(e) => eprintln!("Failed to load texture {}: {e}", path.display()),
                         }
                     }
+                } else if class == "constant" {
+                    // Constant texture: single RGB or float value
+                    // Store as a 1x1 imagemap so it works in texture chains
+                    let color = get_param_rgb(params, "value").unwrap_or_else(|| {
+                        let v = get_param_float(params, "value").unwrap_or(1.0);
+                        [v, v, v]
+                    });
+                    textures.insert(
+                        name.clone(),
+                        SceneTexture::Image(std::sync::Arc::new(ImageTexture {
+                            data: vec![color[0], color[1], color[2]],
+                            width: 1,
+                            height: 1,
+                        })),
+                    );
                 } else if class == "scale" || class == "mix" {
                     // Resolve texture chain: "scale" and "mix" wrap other textures
                     if let Some(tex_ref) = get_param_texture_ref(params, "tex") {
