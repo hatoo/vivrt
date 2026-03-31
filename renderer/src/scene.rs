@@ -295,12 +295,14 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         cam_flip_x: false,
     };
 
+    #[derive(Clone)]
     struct CheckerTex {
         scale_u: f32,
         scale_v: f32,
         color1: [f32; 3],
         color2: [f32; 3],
     }
+    #[derive(Clone)]
     enum SceneTexture {
         Checker(CheckerTex),
         Image(std::sync::Arc<ImageTexture>),
@@ -573,6 +575,21 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         if let Some(c) = get_param_rgb(params, "reflectance") {
                             mat.albedo = c;
                         }
+                        if let Some(tex_name) = get_param_texture_ref(params, "reflectance") {
+                            match textures.get(tex_name) {
+                                Some(SceneTexture::Checker(tex)) => {
+                                    mat.has_checkerboard = true;
+                                    mat.checker_scale_u = tex.scale_u;
+                                    mat.checker_scale_v = tex.scale_v;
+                                    mat.checker_color1 = tex.color1;
+                                    mat.checker_color2 = tex.color2;
+                                }
+                                Some(SceneTexture::Image(img)) => {
+                                    mat.texture = Some(img.clone());
+                                }
+                                None => {}
+                            }
+                        }
                     }
                     "coateddiffuse" => {
                         mat.material_type = MAT_COATED_DIFFUSE;
@@ -651,6 +668,19 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 );
                             }
                             Err(e) => eprintln!("Failed to load texture {}: {e}", path.display()),
+                        }
+                    }
+                } else if class == "scale" || class == "mix" {
+                    // Resolve texture chain: "scale" and "mix" wrap other textures
+                    if let Some(tex_ref) = get_param_texture_ref(params, "tex") {
+                        if let Some(base) = textures.get(tex_ref) {
+                            textures.insert(name.clone(), base.clone());
+                        }
+                    }
+                    // Also check tex1/tex2 for mix
+                    if let Some(tex_ref) = get_param_texture_ref(params, "tex1") {
+                        if let Some(base) = textures.get(tex_ref) {
+                            textures.insert(name.clone(), base.clone());
                         }
                     }
                 }
