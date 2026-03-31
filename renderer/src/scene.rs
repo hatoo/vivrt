@@ -549,48 +549,32 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
             }
             Directive::WorldBegin => {
-                // Apply accumulated pre-WorldBegin transform to camera.
-                // In PBRT, CTM = LookAt * Rotate * ... (post-multiplied).
-                // Post-multiply rotations are camera-space adjustments.
-                // We reconstruct the camera frame, apply the camera-space
-                // transform, then write back the modified vectors.
+                // In PBRT, CTM = LookAt * R (post-multiplied). This means
+                // the world is further transformed by R before the camera
+                // sees it. Equivalently, eye/look/up are transformed by
+                // the inverse of R. For a rotation, inverse = transpose.
                 if current_transform != identity_transform() {
-                    let r = &current_transform; // camera-space rotation
-
-                    // Build camera frame from LookAt
-                    let e = parsed.cam_eye;
-                    let l = parsed.cam_look;
-                    let u = parsed.cam_up;
-                    let fwd = normalize3f([l[0] - e[0], l[1] - e[1], l[2] - e[2]]);
-                    let right = normalize3f(cross3f(fwd, u));
-                    let up = cross3f(right, fwd);
-
-                    // Camera-space axes in world coords: right=X, up=Y, -fwd=Z
-                    // A camera-space rotation R transforms these axes.
-                    // New world-space axis = old_right*R[col0] + old_up*R[col1] + (-old_fwd)*R[col2]
-                    // But R is the 3x3 part of the post-multiplied transform.
-                    // New forward (negated camera Z): apply R to [0,0,-1] in camera space
-                    let new_fwd = [
-                        -(right[0] * r[2] + up[0] * r[6] + (-fwd[0]) * r[10]),
-                        -(right[1] * r[2] + up[1] * r[6] + (-fwd[1]) * r[10]),
-                        -(right[2] * r[2] + up[2] * r[6] + (-fwd[2]) * r[10]),
-                    ];
-                    // New up: apply R to [0,1,0] in camera space
-                    let new_up = [
-                        right[0] * r[1] + up[0] * r[5] + (-fwd[0]) * r[9],
-                        right[1] * r[1] + up[1] * r[5] + (-fwd[1]) * r[9],
-                        right[2] * r[1] + up[2] * r[5] + (-fwd[2]) * r[9],
-                    ];
-
-                    let dist =
-                        ((l[0] - e[0]).powi(2) + (l[1] - e[1]).powi(2) + (l[2] - e[2]).powi(2))
-                            .sqrt();
-                    parsed.cam_look = [
-                        e[0] + new_fwd[0] * dist,
-                        e[1] + new_fwd[1] * dist,
-                        e[2] + new_fwd[2] * dist,
-                    ];
-                    parsed.cam_up = new_up;
+                    let t = &current_transform;
+                    // CTM = LookAt * R is camera-from-world. Camera vectors
+                    // need world-from-camera = R^-1 * LookAt^-1.
+                    // Apply R^-1 (transpose for rotations) to eye, look, up.
+                    let transform_point = |p: [f32; 3]| -> [f32; 3] {
+                        [
+                            t[0] * p[0] + t[4] * p[1] + t[8] * p[2] + t[3],
+                            t[1] * p[0] + t[5] * p[1] + t[9] * p[2] + t[7],
+                            t[2] * p[0] + t[6] * p[1] + t[10] * p[2] + t[11],
+                        ]
+                    };
+                    let transform_vec = |v: [f32; 3]| -> [f32; 3] {
+                        [
+                            t[0] * v[0] + t[4] * v[1] + t[8] * v[2],
+                            t[1] * v[0] + t[5] * v[1] + t[9] * v[2],
+                            t[2] * v[0] + t[6] * v[1] + t[10] * v[2],
+                        ]
+                    };
+                    parsed.cam_eye = transform_point(parsed.cam_eye);
+                    parsed.cam_look = transform_point(parsed.cam_look);
+                    parsed.cam_up = transform_vec(parsed.cam_up);
                 }
                 current_transform = identity_transform();
                 _in_world = true;
