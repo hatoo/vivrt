@@ -7,6 +7,18 @@ pub const MAT_COATED_DIFFUSE: i32 = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct TriangleLight {
+    pub v0: [f32; 3],
+    pub v1: [f32; 3],
+    pub v2: [f32; 3],
+    pub emission: [f32; 3],
+    pub normal: [f32; 3],
+    pub area: f32,
+    pub _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct DistantLight {
     pub direction: [f32; 3],
     pub emission: [f32; 3],
@@ -39,6 +51,8 @@ pub struct LaunchParams {
     pub distant_lights: optix_sys::CUdeviceptr,
     pub num_sphere_lights: i32,
     pub sphere_lights: optix_sys::CUdeviceptr,
+    pub num_triangle_lights: i32,
+    pub triangle_lights: optix_sys::CUdeviceptr,
 }
 
 #[repr(C)]

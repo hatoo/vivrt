@@ -212,13 +212,14 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "Scene: {}x{}, {} spp, {} objects, {} distant lights, {} sphere lights",
+        "Scene: {}x{}, {} spp, {} objects, {} distant lights, {} sphere lights, {} triangle lights",
         scene.width,
         scene.height,
         scene.spp,
         scene.objects.len(),
         scene.distant_lights.len(),
-        scene.sphere_lights.len()
+        scene.sphere_lights.len(),
+        scene.triangle_lights.len()
     );
 
     // --- CUDA / OptiX init ---
@@ -623,13 +624,16 @@ fn main() -> Result<()> {
         .context("SBT")?;
 
     // --- Camera & lights ---
-    let (cam_u, cam_v, cam_w) = compute_camera(
+    let (mut cam_u, cam_v, cam_w) = compute_camera(
         &scene.cam_eye,
         &scene.cam_look,
         &scene.cam_up,
         scene.fov,
         scene.width as f32 / scene.height as f32,
     );
+    if scene.cam_flip_x {
+        cam_u = [-cam_u[0], -cam_u[1], -cam_u[2]];
+    }
 
     let d_distant_lights = if scene.distant_lights.is_empty() {
         0
@@ -640,6 +644,11 @@ fn main() -> Result<()> {
         0
     } else {
         alloc_and_copy_slice(&stream, &scene.sphere_lights)?
+    };
+    let d_triangle_lights = if scene.triangle_lights.is_empty() {
+        0
+    } else {
+        alloc_and_copy_slice(&stream, &scene.triangle_lights)?
     };
 
     // --- Launch ---
@@ -662,6 +671,8 @@ fn main() -> Result<()> {
         distant_lights: d_distant_lights,
         num_sphere_lights: scene.sphere_lights.len() as i32,
         sphere_lights: d_sphere_lights,
+        num_triangle_lights: scene.triangle_lights.len() as i32,
+        triangle_lights: d_triangle_lights,
     };
     let d_params = alloc_and_copy(&stream, &launch_params)?;
 

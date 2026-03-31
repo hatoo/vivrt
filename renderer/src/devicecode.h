@@ -20,6 +20,16 @@ struct SphereLight {
     float _pad;
 };
 
+struct TriangleLight {
+    float v0[3];
+    float v1[3];
+    float v2[3];
+    float emission[3];
+    float normal[3];
+    float area;
+    float _pad;
+};
+
 struct LaunchParams {
     unsigned int* image;
     unsigned int  width;
@@ -37,6 +47,8 @@ struct LaunchParams {
     DistantLight* distant_lights;
     int           num_sphere_lights;
     SphereLight*  sphere_lights;
+    int           num_triangle_lights;
+    TriangleLight* triangle_lights;
 };
 
 struct RayGenData {};

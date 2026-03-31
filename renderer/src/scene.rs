@@ -2,6 +2,7 @@
 
 use crate::gpu_types::*;
 use pbrt_parser::{self, Directive, ParamType, ParamValue};
+use std::io::Read;
 use std::path::Path;
 
 pub struct SceneMaterial {
@@ -70,8 +71,10 @@ pub struct ParsedScene {
     pub ambient_light: [f32; 3],
     pub distant_lights: Vec<DistantLight>,
     pub sphere_lights: Vec<SphereLight>,
+    pub triangle_lights: Vec<TriangleLight>,
     pub objects: Vec<SceneObject>,
     pub filename: String,
+    pub cam_flip_x: bool,
 }
 
 // ---- Parameter helpers ----
@@ -414,9 +417,96 @@ fn compute_smooth_normals(verts: &[f32], indices: &[i32]) -> Vec<f32> {
     normals
 }
 
+// ---- PLY mesh loading ----
+
+fn load_ply_mesh(path: &Path) -> Option<SceneShape> {
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("Failed to open PLY file {}: {e}", path.display()));
+
+    let reader: Box<dyn Read> = if path.extension().map_or(false, |e| e == "gz")
+        || path.to_string_lossy().contains(".ply.gz")
+    {
+        Box::new(flate2::read::GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+
+    let mut buf_reader = std::io::BufReader::new(reader);
+    let parser = ply_rs::parser::Parser::<ply_rs::ply::DefaultElement>::new();
+    let ply = parser
+        .read_ply(&mut buf_reader)
+        .unwrap_or_else(|e| panic!("Failed to parse PLY file {}: {e}", path.display()));
+
+    let mut vertices = Vec::new();
+    let mut normals = Vec::new();
+    let mut indices = Vec::new();
+
+    if let Some(verts) = ply.payload.get("vertex") {
+        for v in verts {
+            let x = prop_float(v, "x");
+            let y = prop_float(v, "y");
+            let z = prop_float(v, "z");
+            vertices.push(x);
+            vertices.push(y);
+            vertices.push(z);
+
+            // Optional normals
+            if v.contains_key("nx") {
+                let nx = prop_float(v, "nx");
+                let ny = prop_float(v, "ny");
+                let nz = prop_float(v, "nz");
+                normals.push(nx);
+                normals.push(ny);
+                normals.push(nz);
+            }
+        }
+    }
+
+    if let Some(faces) = ply.payload.get("face") {
+        for f in faces {
+            if let Some(ply_rs::ply::Property::ListInt(ref idx)) = f.get("vertex_indices") {
+                // Triangulate: fan from first vertex
+                for i in 1..idx.len() - 1 {
+                    indices.push(idx[0]);
+                    indices.push(idx[i as usize] as i32);
+                    indices.push(idx[i as usize + 1] as i32);
+                }
+            } else if let Some(ply_rs::ply::Property::ListUInt(ref idx)) = f.get("vertex_indices") {
+                for i in 1..idx.len() - 1 {
+                    indices.push(idx[0] as i32);
+                    indices.push(idx[i as usize] as i32);
+                    indices.push(idx[i as usize + 1] as i32);
+                }
+            }
+        }
+    }
+
+    println!(
+        "Loaded PLY: {} vertices, {} triangles from {}",
+        vertices.len() / 3,
+        indices.len() / 3,
+        path.display()
+    );
+
+    Some(SceneShape::TriangleMesh {
+        vertices,
+        indices,
+        texcoords: Vec::new(),
+        normals,
+    })
+}
+
+fn prop_float(element: &ply_rs::ply::DefaultElement, key: &str) -> f32 {
+    match element.get(key) {
+        Some(ply_rs::ply::Property::Float(v)) => *v,
+        Some(ply_rs::ply::Property::Double(v)) => *v as f32,
+        _ => 0.0,
+    }
+}
+
 // ---- Shape parsing helper ----
 
-fn parse_shape(ty: &str, params: &[pbrt_parser::Param]) -> Option<SceneShape> {
+fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Option<SceneShape> {
     match ty {
         "sphere" => {
             let radius = get_param_float(params, "radius").unwrap_or(1.0);
@@ -475,6 +565,10 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param]) -> Option<SceneShape> {
                 normals: Vec::new(),
             })
         }
+        "plymesh" => {
+            let filename = get_param_string(params, "filename")?;
+            load_ply_mesh(&scene_dir.join(filename))
+        }
         _ => {
             eprintln!("Unsupported shape type: {ty}");
             None
@@ -499,8 +593,10 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         ambient_light: [0.0; 3],
         distant_lights: Vec::new(),
         sphere_lights: Vec::new(),
+        triangle_lights: Vec::new(),
         objects: Vec::new(),
         filename: "output.png".to_string(),
+        cam_flip_x: false,
     };
 
     struct CheckerTex {
@@ -534,9 +630,25 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
             }
             Directive::LookAt { eye, look, up } => {
-                parsed.cam_eye = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
-                parsed.cam_look = [look[0] as f32, look[1] as f32, look[2] as f32];
-                parsed.cam_up = [up[0] as f32, up[1] as f32, up[2] as f32];
+                let mut e = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
+                let mut l = [look[0] as f32, look[1] as f32, look[2] as f32];
+                let mut u = [up[0] as f32, up[1] as f32, up[2] as f32];
+
+                // Detect handedness flip from pre-LookAt Scale (e.g. Scale -1 1 1)
+                if current_transform != identity_transform() {
+                    let t = &current_transform;
+                    let det = t[0] * (t[5] * t[10] - t[6] * t[9])
+                        - t[1] * (t[4] * t[10] - t[6] * t[8])
+                        + t[2] * (t[4] * t[9] - t[5] * t[8]);
+                    if det < 0.0 {
+                        parsed.cam_flip_x = true;
+                    }
+                    current_transform = identity_transform();
+                }
+
+                parsed.cam_eye = e;
+                parsed.cam_look = l;
+                parsed.cam_up = u;
             }
             Directive::Sampler { params, .. } => {
                 if let Some(v) = get_param_ints(params, "pixelsamples") {
@@ -607,6 +719,40 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             }
             Directive::Identity => {
                 current_transform = identity_transform();
+            }
+            Directive::Transform { m } => {
+                // PBRT Transform uses column-major 4x4, convert to row-major 3x4
+                current_transform = [
+                    m[0] as f32,
+                    m[4] as f32,
+                    m[8] as f32,
+                    m[12] as f32,
+                    m[1] as f32,
+                    m[5] as f32,
+                    m[9] as f32,
+                    m[13] as f32,
+                    m[2] as f32,
+                    m[6] as f32,
+                    m[10] as f32,
+                    m[14] as f32,
+                ];
+            }
+            Directive::ConcatTransform { m } => {
+                let t = [
+                    m[0] as f32,
+                    m[4] as f32,
+                    m[8] as f32,
+                    m[12] as f32,
+                    m[1] as f32,
+                    m[5] as f32,
+                    m[9] as f32,
+                    m[13] as f32,
+                    m[2] as f32,
+                    m[6] as f32,
+                    m[10] as f32,
+                    m[14] as f32,
+                ];
+                current_transform = mul_transform(&current_transform, &t);
             }
             Directive::LightSource { ty, params } => match ty.as_str() {
                 "infinite" => {
@@ -710,7 +856,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
             }
             Directive::Shape { ty, params } => {
-                if let Some(shape) = parse_shape(ty, params) {
+                if let Some(shape) = parse_shape(ty, params, scene_dir) {
                     register_area_light(&shape, &current_material, &current_transform, &mut parsed);
                     parsed.objects.push(SceneObject {
                         shape,
@@ -735,7 +881,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         });
                         for inc_directive in &included.directives {
                             if let Directive::Shape { ty, params } = inc_directive {
-                                if let Some(shape) = parse_shape(ty, params) {
+                                if let Some(shape) = parse_shape(ty, params, scene_dir) {
                                     parsed.objects.push(SceneObject {
                                         shape,
                                         material: current_material.clone(),
@@ -770,6 +916,47 @@ fn register_area_light(
                 emission: em,
                 _pad: 0.0,
             });
+        }
+        if let SceneShape::TriangleMesh {
+            vertices, indices, ..
+        } = shape
+        {
+            // Register each triangle as an area light
+            let transformed = transform_vertices(vertices, transform);
+            for tri in indices.chunks(3) {
+                if tri.len() < 3 {
+                    continue;
+                }
+                let i0 = tri[0] as usize * 3;
+                let i1 = tri[1] as usize * 3;
+                let i2 = tri[2] as usize * 3;
+                let v0 = [transformed[i0], transformed[i0 + 1], transformed[i0 + 2]];
+                let v1 = [transformed[i1], transformed[i1 + 1], transformed[i1 + 2]];
+                let v2 = [transformed[i2], transformed[i2 + 1], transformed[i2 + 2]];
+                let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+                let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+                let n = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let area = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() * 0.5;
+                let len = area * 2.0;
+                let normal = if len > 0.0 {
+                    [n[0] / len, n[1] / len, n[2] / len]
+                } else {
+                    [0.0, 1.0, 0.0]
+                };
+                scene.triangle_lights.push(TriangleLight {
+                    v0,
+                    v1,
+                    v2,
+                    emission: em,
+                    normal,
+                    area,
+                    _pad: 0.0,
+                });
+            }
         }
     }
 }

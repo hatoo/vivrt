@@ -323,6 +323,45 @@ extern "C" __global__ void __raygen__rg()
                     }
                 }
 
+                // Direct lighting from triangle area lights (NEE)
+                for (int i = 0; i < params.num_triangle_lights; i++) {
+                    RNG light_rng(pixel_idx * 37 + i, s, depth + 200);
+                    float3 lv0 = make_f3(params.triangle_lights[i].v0);
+                    float3 lv1 = make_f3(params.triangle_lights[i].v1);
+                    float3 lv2 = make_f3(params.triangle_lights[i].v2);
+                    float3 light_em = make_f3(params.triangle_lights[i].emission);
+                    float3 light_normal = make_f3(params.triangle_lights[i].normal);
+                    float light_area = params.triangle_lights[i].area;
+
+                    // Sample random point on triangle
+                    float u1 = light_rng.next();
+                    float u2 = light_rng.next();
+                    if (u1 + u2 > 1.0f) { u1 = 1.0f - u1; u2 = 1.0f - u2; }
+                    float3 light_pos = lv0 * (1.0f - u1 - u2) + lv1 * u1 + lv2 * u2;
+
+                    float3 to_light = light_pos - hit_pos;
+                    float dist2 = dot3(to_light, to_light);
+                    float dist = sqrtf(dist2);
+                    float3 light_dir = to_light * (1.0f / dist);
+
+                    float ndotl = dot3(hit_normal, light_dir);
+                    float lndotl = -dot3(light_normal, light_dir); // light faces toward hit
+                    if (ndotl > 0.0f && lndotl > 0.0f) {
+                        unsigned int shadow_p9 = 0xFFFFFFFF;
+                        unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
+                        optixTrace(params.traversable, hit_pos, light_dir,
+                            0.001f, dist - 0.001f, 0.0f,
+                            OptixVisibilityMask(255), OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
+                            0, 1, 0,
+                            p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
+                        if (shadow_p9 == 0xFFFFFFFF) {
+                            // PDF = 1/area, geometry factor = cos_light * cos_hit / dist^2
+                            float weight = light_area * lndotl * ndotl / (dist2 * M_PIf);
+                            radiance = radiance + throughput * hit_albedo * light_em * weight;
+                        }
+                    }
+                }
+
                 // Indirect: cosine-weighted bounce
                 RNG bounce_rng(pixel_idx, s, depth + 1);
                 direction = cosine_sample_hemisphere(bounce_rng.next(), bounce_rng.next(), hit_normal);

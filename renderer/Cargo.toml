@@ -11,3 +11,5 @@ cudarc = { version = "0.19", default-features = false, features = ["driver", "dy
 clap = { version = "4", features = ["derive"] }
 png = "0.17"
 anyhow = "1"
+ply-rs = "0.1"
+flate2 = "1"

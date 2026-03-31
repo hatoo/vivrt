@@ -69,9 +69,31 @@ impl Parser {
     }
 
     fn read_n_numbers<const N: usize>(&mut self) -> Result<[f64; N]> {
+        // Support optional brackets: Transform [ 1 0 0 ... ] or Transform 1 0 0 ...
+        let bracketed = matches!(
+            self.peek(),
+            Some(Located {
+                value: Token::LBracket,
+                ..
+            })
+        );
+        if bracketed {
+            self.advance();
+        }
         let mut arr = [0.0; N];
         for v in arr.iter_mut() {
             *v = self.expect_number()?;
+        }
+        if bracketed {
+            match self.peek() {
+                Some(Located {
+                    value: Token::RBracket,
+                    ..
+                }) => {
+                    self.advance();
+                }
+                _ => return Err(self.err("expected ']'")),
+            }
         }
         Ok(arr)
     }
