@@ -7,18 +7,6 @@ pub const MAT_COATED_DIFFUSE: i32 = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct TriangleLight {
-    pub v0: [f32; 3],
-    pub v1: [f32; 3],
-    pub v2: [f32; 3],
-    pub emission: [f32; 3],
-    pub normal: [f32; 3],
-    pub area: f32,
-    pub _pad: f32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
 pub struct DistantLight {
     pub direction: [f32; 3],
     pub emission: [f32; 3],
@@ -31,6 +19,64 @@ pub struct SphereLight {
     pub radius: f32,
     pub emission: [f32; 3],
     pub _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TriangleLight {
+    pub v0: [f32; 3],
+    pub v1: [f32; 3],
+    pub v2: [f32; 3],
+    pub emission: [f32; 3],
+    pub normal: [f32; 3],
+    pub area: f32,
+    pub _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DiffuseParams {
+    pub has_checkerboard: i32,
+    pub checker_scale_u: f32,
+    pub checker_scale_v: f32,
+    pub checker_color1: [f32; 3],
+    pub checker_color2: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DielectricParams {
+    pub eta: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CoatedDiffuseParams {
+    pub roughness: f32,
+}
+
+/// Union of material-specific parameters.
+/// Size = max(DiffuseParams, DielectricParams, CoatedDiffuseParams).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union MaterialParams {
+    pub diffuse: DiffuseParams,
+    pub dielectric: DielectricParams,
+    pub coated: CoatedDiffuseParams,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct HitGroupData {
+    pub material_type: i32,
+    pub albedo: [f32; 3],
+    pub emission: [f32; 3],
+    pub params: MaterialParams,
+    pub texcoords: optix_sys::CUdeviceptr,
+    pub normals: optix_sys::CUdeviceptr,
+    pub indices: optix_sys::CUdeviceptr,
+    pub vertices: optix_sys::CUdeviceptr,
+    pub num_vertices: i32,
 }
 
 #[repr(C)]
@@ -63,24 +109,4 @@ pub struct RayGenData {}
 #[derive(Copy, Clone)]
 pub struct MissData {
     pub bg_color: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct HitGroupData {
-    pub material_type: i32,
-    pub albedo: [f32; 3],
-    pub eta: f32,
-    pub roughness: f32,
-    pub emission: [f32; 3],
-    pub has_checkerboard: i32,
-    pub checker_scale_u: f32,
-    pub checker_scale_v: f32,
-    pub checker_color1: [f32; 3],
-    pub checker_color2: [f32; 3],
-    pub texcoords: optix_sys::CUdeviceptr,
-    pub normals: optix_sys::CUdeviceptr,
-    pub indices: optix_sys::CUdeviceptr,
-    pub vertices: optix_sys::CUdeviceptr,
-    pub num_vertices: i32,
 }

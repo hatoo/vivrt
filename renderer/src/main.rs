@@ -96,6 +96,46 @@ fn alloc_and_copy_slice<T>(
     }
 }
 
+fn make_hitgroup_data(
+    mat: &scene::SceneMaterial,
+    texcoords: optix_sys::CUdeviceptr,
+    normals: optix_sys::CUdeviceptr,
+    indices: optix_sys::CUdeviceptr,
+    vertices: optix_sys::CUdeviceptr,
+    num_vertices: i32,
+) -> HitGroupData {
+    let params = match mat.material_type {
+        MAT_DIELECTRIC => MaterialParams {
+            dielectric: DielectricParams { eta: mat.eta },
+        },
+        MAT_COATED_DIFFUSE => MaterialParams {
+            coated: CoatedDiffuseParams {
+                roughness: mat.roughness,
+            },
+        },
+        _ => MaterialParams {
+            diffuse: DiffuseParams {
+                has_checkerboard: if mat.has_checkerboard { 1 } else { 0 },
+                checker_scale_u: mat.checker_scale_u,
+                checker_scale_v: mat.checker_scale_v,
+                checker_color1: mat.checker_color1,
+                checker_color2: mat.checker_color2,
+            },
+        },
+    };
+    HitGroupData {
+        material_type: mat.material_type,
+        albedo: mat.albedo,
+        emission: mat.emission,
+        params,
+        texcoords,
+        normals,
+        indices,
+        vertices,
+        num_vertices,
+    }
+}
+
 fn compute_camera(
     eye: &[f32; 3],
     look: &[f32; 3],
@@ -399,23 +439,7 @@ fn main() -> Result<()> {
                 )
                 .context("sphere accel build")?;
 
-                let hg_data = HitGroupData {
-                    material_type: obj.material.material_type,
-                    albedo: obj.material.albedo,
-                    eta: obj.material.eta,
-                    roughness: obj.material.roughness,
-                    emission: obj.material.emission,
-                    has_checkerboard: 0,
-                    checker_scale_u: 0.0,
-                    checker_scale_v: 0.0,
-                    checker_color1: [0.0; 3],
-                    checker_color2: [0.0; 3],
-                    texcoords: 0,
-                    normals: 0,
-                    indices: 0,
-                    vertices: 0,
-                    num_vertices: 0,
-                };
+                let hg_data = make_hitgroup_data(&obj.material, 0, 0, 0, 0, 0);
 
                 let sbt_offset = sphere_hg_records.len() as u32;
                 sphere_hg_records.push(SbtRecord::new(
@@ -498,23 +522,14 @@ fn main() -> Result<()> {
                 )
                 .context("tri accel build")?;
 
-                let hg_data = HitGroupData {
-                    material_type: obj.material.material_type,
-                    albedo: obj.material.albedo,
-                    eta: obj.material.eta,
-                    roughness: obj.material.roughness,
-                    emission: obj.material.emission,
-                    has_checkerboard: if obj.material.has_checkerboard { 1 } else { 0 },
-                    checker_scale_u: obj.material.checker_scale_u,
-                    checker_scale_v: obj.material.checker_scale_v,
-                    checker_color1: obj.material.checker_color1,
-                    checker_color2: obj.material.checker_color2,
-                    texcoords: d_tc,
-                    normals: d_normals,
-                    indices: dptr(&d_indices, &stream),
-                    vertices: dptr(&d_verts, &stream),
-                    num_vertices: num_verts as i32,
-                };
+                let hg_data = make_hitgroup_data(
+                    &obj.material,
+                    d_tc,
+                    d_normals,
+                    dptr(&d_indices, &stream),
+                    dptr(&d_verts, &stream),
+                    num_verts as i32,
+                );
 
                 let sbt_offset = tri_hg_records.len() as u32;
                 tri_hg_records.push(SbtRecord::new(&hitgroup_tri_pg, hg_data)?);

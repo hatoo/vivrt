@@ -536,7 +536,7 @@ extern "C" __global__ void __closesthit__ch()
     float3 albedo = make_f3(data->albedo);
 
     // Checkerboard procedural texture
-    if (data->has_checkerboard) {
+    if (data->diffuse.has_checkerboard) {
         float u_coord = 0.0f, v_coord = 0.0f;
         if (data->texcoords && data->indices) {
             int i0 = data->indices[prim_idx * 3 + 0];
@@ -551,19 +551,19 @@ extern "C" __global__ void __closesthit__ch()
             u_coord = w * data->texcoords[base*2] + bary.x * data->texcoords[(base+1)*2] + bary.y * data->texcoords[(base+2)*2];
             v_coord = w * data->texcoords[base*2+1] + bary.x * data->texcoords[(base+1)*2+1] + bary.y * data->texcoords[(base+2)*2+1];
         }
-        u_coord *= data->checker_scale_u;
-        v_coord *= data->checker_scale_v;
+        u_coord *= data->diffuse.checker_scale_u;
+        v_coord *= data->diffuse.checker_scale_v;
         int cu = (int)floorf(u_coord);
         int cv = (int)floorf(v_coord);
         if (((cu ^ cv) & 1) == 0)
-            albedo = make_f3(data->checker_color1);
+            albedo = make_f3(data->diffuse.checker_color1);
         else
-            albedo = make_f3(data->checker_color2);
+            albedo = make_f3(data->diffuse.checker_color2);
     }
 
     if (data->material_type == MAT_DIELECTRIC) {
         // Store eta in p0, signal dielectric in p9
-        optixSetPayload_0(__float_as_uint(data->eta));
+        optixSetPayload_0(__float_as_uint(data->dielectric.eta));
         optixSetPayload_1(0);
         optixSetPayload_2(0);
     } else {
@@ -582,7 +582,7 @@ extern "C" __global__ void __closesthit__ch()
     optixSetPayload_10(__float_as_uint(data->emission[0]));
     optixSetPayload_11(__float_as_uint(data->emission[1]));
     optixSetPayload_12(__float_as_uint(data->emission[2]));
-    optixSetPayload_13(__float_as_uint(data->roughness));
+    optixSetPayload_13(__float_as_uint(data->coated.roughness));
 }
 
 // Closest hit for sphere (built-in intersection)
@@ -606,7 +606,7 @@ extern "C" __global__ void __closesthit__sphere()
         world_normal = world_normal * (-1.0f);
 
     if (data->material_type == MAT_DIELECTRIC) {
-        optixSetPayload_0(__float_as_uint(data->eta));
+        optixSetPayload_0(__float_as_uint(data->dielectric.eta));
         optixSetPayload_1(0);
         optixSetPayload_2(0);
     } else {
@@ -626,5 +626,5 @@ extern "C" __global__ void __closesthit__sphere()
     optixSetPayload_10(__float_as_uint(data->emission[0]));
     optixSetPayload_11(__float_as_uint(data->emission[1]));
     optixSetPayload_12(__float_as_uint(data->emission[2]));
-    optixSetPayload_13(__float_as_uint(data->roughness));
+    optixSetPayload_13(__float_as_uint(data->coated.roughness));
 }
