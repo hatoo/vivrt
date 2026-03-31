@@ -542,23 +542,23 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 // Apply the rotation part to the look direction and up vector.
                 if current_transform != identity_transform() {
                     let t = &current_transform;
-                    // Rotate look direction (look_at - eye) and up vector
+                    // CTM is world-to-camera; camera vectors are camera-to-world.
+                    // Apply the inverse (transpose of rotation part).
                     let dx = parsed.cam_look[0] - parsed.cam_eye[0];
                     let dy = parsed.cam_look[1] - parsed.cam_eye[1];
                     let dz = parsed.cam_look[2] - parsed.cam_eye[2];
-                    // Apply rotation (3x3 part of transform) to direction
                     parsed.cam_look = [
-                        parsed.cam_eye[0] + t[0] * dx + t[1] * dy + t[2] * dz,
-                        parsed.cam_eye[1] + t[4] * dx + t[5] * dy + t[6] * dz,
-                        parsed.cam_eye[2] + t[8] * dx + t[9] * dy + t[10] * dz,
+                        parsed.cam_eye[0] + t[0] * dx + t[4] * dy + t[8] * dz,
+                        parsed.cam_eye[1] + t[1] * dx + t[5] * dy + t[9] * dz,
+                        parsed.cam_eye[2] + t[2] * dx + t[6] * dy + t[10] * dz,
                     ];
                     let ux = parsed.cam_up[0];
                     let uy = parsed.cam_up[1];
                     let uz = parsed.cam_up[2];
                     parsed.cam_up = [
-                        t[0] * ux + t[1] * uy + t[2] * uz,
-                        t[4] * ux + t[5] * uy + t[6] * uz,
-                        t[8] * ux + t[9] * uy + t[10] * uz,
+                        t[0] * ux + t[4] * uy + t[8] * uz,
+                        t[1] * ux + t[5] * uy + t[9] * uz,
+                        t[2] * ux + t[6] * uy + t[10] * uz,
                     ];
                 }
                 current_transform = identity_transform();
