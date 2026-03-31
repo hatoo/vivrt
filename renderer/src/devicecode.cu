@@ -476,6 +476,37 @@ extern "C" __global__ void __raygen__rg()
                             }
                         }
                     }
+                    // Triangle area lights NEE
+                    for (int i = 0; i < params.num_triangle_lights; i++) {
+                        RNG light_rng(pixel_idx * 37 + i, s, depth + 200);
+                        float3 lv0 = make_f3(params.triangle_lights[i].v0);
+                        float3 lv1 = make_f3(params.triangle_lights[i].v1);
+                        float3 lv2 = make_f3(params.triangle_lights[i].v2);
+                        float3 light_em = make_f3(params.triangle_lights[i].emission);
+                        float3 light_normal = make_f3(params.triangle_lights[i].normal);
+                        float light_area = params.triangle_lights[i].area;
+                        float u1 = light_rng.next(), u2 = light_rng.next();
+                        if (u1 + u2 > 1.0f) { u1 = 1.0f - u1; u2 = 1.0f - u2; }
+                        float3 light_pos = lv0*(1.0f-u1-u2) + lv1*u1 + lv2*u2;
+                        float3 to_light = light_pos - hit_pos;
+                        float dist2 = dot3(to_light, to_light);
+                        float dist = sqrtf(dist2);
+                        float3 ldir = to_light * (1.0f / dist);
+                        float ndotl = dot3(hit_normal, ldir);
+                        float lndotl = -dot3(light_normal, ldir);
+                        if (ndotl > 0.0f && lndotl > 0.0f) {
+                            unsigned int shadow_p9 = 0xFFFFFFFF;
+                            unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
+                            optixTrace(params.traversable, hit_pos, ldir, 0.001f, dist-0.001f, 0.0f,
+                                OptixVisibilityMask(255), OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT, 0, 1, 0,
+                                p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
+                            if (shadow_p9 == 0xFFFFFFFF) {
+                                float weight = light_area * lndotl * ndotl / (dist2 * M_PIf);
+                                radiance = radiance + throughput * hit_albedo * light_em * weight;
+                            }
+                        }
+                    }
+
                     direction = cosine_sample_hemisphere(bounce_rng.next(), bounce_rng.next(), hit_normal);
                     origin = hit_pos;
                     throughput = throughput * hit_albedo;
@@ -532,6 +563,41 @@ extern "C" __global__ void __raygen__rg()
                             float3 brdf = eval_conductor_brdf(V, L, hit_normal, hit_albedo, alpha);
                             float geo = light_area * lndotl / dist2;
                             radiance = radiance + throughput * brdf * light_em * NdotL * geo;
+                        }
+                    }
+                }
+
+                for (int i = 0; i < params.num_sphere_lights; i++) {
+                    RNG light_rng(pixel_idx * 31 + i, s, depth + 100);
+                    float3 light_center = make_f3(params.sphere_lights[i].center);
+                    float light_radius = params.sphere_lights[i].radius;
+                    float3 light_em = make_f3(params.sphere_lights[i].emission);
+                    float3 to_light = light_center - hit_pos;
+                    float dist_to_center = sqrtf(dot3(to_light, to_light));
+                    float3 light_dir_norm = to_light * (1.0f / dist_to_center);
+                    float sin_theta_max2 = (light_radius * light_radius) / (dist_to_center * dist_to_center);
+                    float cos_theta_max = sqrtf(fmaxf(0.0f, 1.0f - sin_theta_max2));
+                    float u1l = light_rng.next(), u2l = light_rng.next();
+                    float cos_theta_l = 1.0f - u1l + u1l * cos_theta_max;
+                    float sin_theta_l = sqrtf(fmaxf(0.0f, 1.0f - cos_theta_l * cos_theta_l));
+                    float phi_l = 2.0f * M_PIf * u2l;
+                    float3 tgt;
+                    if (fabsf(light_dir_norm.x) > 0.9f) tgt = normalize3(cross3(make_float3(0,1,0), light_dir_norm));
+                    else tgt = normalize3(cross3(make_float3(1,0,0), light_dir_norm));
+                    float3 btgt = cross3(light_dir_norm, tgt);
+                    float3 L = normalize3(tgt*(cosf(phi_l)*sin_theta_l) + btgt*(sinf(phi_l)*sin_theta_l) + light_dir_norm*cos_theta_l);
+                    float NdotL = dot3(hit_normal, L);
+                    if (NdotL > 0.0f) {
+                        unsigned int shadow_p9 = 0xFFFFFFFF;
+                        unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
+                        optixTrace(params.traversable, hit_pos, L, 0.001f, dist_to_center+light_radius, 0.0f,
+                            OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1, 0,
+                            p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
+                        float3 shadow_em = make_float3(__uint_as_float(sp10),__uint_as_float(sp11),__uint_as_float(sp12));
+                        if (shadow_em.x > 0 || shadow_em.y > 0 || shadow_em.z > 0) {
+                            float3 brdf = eval_conductor_brdf(V, L, hit_normal, hit_albedo, alpha);
+                            float pdf = 1.0f / (2.0f * M_PIf * (1.0f - cos_theta_max));
+                            radiance = radiance + throughput * brdf * shadow_em * (NdotL / pdf);
                         }
                     }
                 }
