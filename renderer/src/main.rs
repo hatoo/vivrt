@@ -250,6 +250,8 @@ fn main() -> Result<()> {
     if let Some(depth) = cli.depth {
         scene.max_depth = depth;
     }
+    // Clamp max depth to OptiX limit
+    scene.max_depth = scene.max_depth.min(31);
     if let Some(w) = cli.width {
         scene.width = w;
     }

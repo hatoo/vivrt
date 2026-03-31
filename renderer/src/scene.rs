@@ -286,6 +286,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         Image(std::sync::Arc<ImageTexture>),
     }
     let mut textures = std::collections::HashMap::<String, SceneTexture>::new();
+    let mut named_materials = std::collections::HashMap::<String, SceneMaterial>::new();
     let mut current_material = SceneMaterial::default();
     let mut current_transform = transform::identity();
     let mut transform_stack: Vec<([f32; 12], SceneMaterial)> = Vec::new();
@@ -538,6 +539,56 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     _ => eprintln!("Unsupported material type: {ty}"),
                 }
             }
+            Directive::MakeNamedMaterial { name, params } => {
+                let ty = get_param_string(params, "type").unwrap_or("diffuse");
+                let mut mat = SceneMaterial::default();
+                match ty {
+                    "diffuse" => {
+                        mat.material_type = MAT_DIFFUSE;
+                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                            mat.albedo = c;
+                        }
+                    }
+                    "coateddiffuse" => {
+                        mat.material_type = MAT_COATED_DIFFUSE;
+                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                            mat.albedo = c;
+                        }
+                        mat.roughness = get_param_float(params, "roughness")
+                            .or(get_param_float(params, "uroughness"))
+                            .unwrap_or(0.0);
+                        if let Some(tex_name) = get_param_texture_ref(params, "reflectance") {
+                            if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
+                                mat.texture = Some(img.clone());
+                            }
+                        }
+                    }
+                    "coatedconductor" | "conductor" => {
+                        mat.material_type = MAT_COATED_DIFFUSE;
+                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                            mat.albedo = c;
+                        } else {
+                            mat.albedo = [0.8, 0.7, 0.3]; // default gold-ish for conductor
+                        }
+                        mat.roughness = get_param_float(params, "roughness")
+                            .or(get_param_float(params, "uroughness"))
+                            .unwrap_or(0.0);
+                    }
+                    "dielectric" | "thindielectric" => {
+                        mat.material_type = MAT_DIELECTRIC;
+                        mat.eta = get_param_float(params, "eta").unwrap_or(1.5);
+                    }
+                    _ => {}
+                }
+                named_materials.insert(name.clone(), mat);
+            }
+            Directive::NamedMaterial(name) => {
+                if let Some(mat) = named_materials.get(name.as_str()) {
+                    current_material = mat.clone();
+                } else {
+                    eprintln!("Unknown named material: {name}");
+                }
+            }
             Directive::Texture {
                 name,
                 class,
@@ -589,9 +640,23 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             }
             Directive::AreaLightSource { ty, params } => {
                 if ty == "diffuse" {
-                    if let Some(c) = get_param_rgb(params, "L") {
-                        current_material.emission = c;
+                    let mut emission = get_param_rgb(params, "L").unwrap_or([1.0, 1.0, 1.0]);
+                    // Handle blackbody L
+                    if let Some(p) = params
+                        .iter()
+                        .find(|p| p.name == "L" && p.ty == ParamType::Blackbody)
+                    {
+                        if let ParamValue::Floats(v) = &p.value {
+                            if let Some(&k) = v.first() {
+                                emission = blackbody_to_rgb(k as f32);
+                            }
+                        }
                     }
+                    let scale = get_param_float(params, "scale").unwrap_or(1.0);
+                    emission[0] *= scale;
+                    emission[1] *= scale;
+                    emission[2] *= scale;
+                    current_material.emission = emission;
                 }
             }
             Directive::Include(path) => {
