@@ -440,6 +440,28 @@ extern "C" __global__ void __raygen__rg()
                     throughput = throughput * hit_albedo;
                 }
             }
+            else if (mat_type == MAT_CONDUCTOR) {
+                // Metallic reflection: F0 = albedo color (metals reflect with their color)
+                float hit_roughness = __uint_as_float(p13);
+                float alpha = fmaxf(hit_roughness * hit_roughness, 0.001f);
+                RNG bounce_rng(pixel_idx, s, depth + 1);
+
+                // Metallic Fresnel: F0 = albedo (e.g. gold = [0.8, 0.7, 0.3])
+                float cos_i = fmaxf(fabsf(dot3(direction * (-1.0f), hit_normal)), 0.001f);
+                float3 F;
+                float x = 1.0f - cos_i;
+                float x5 = x * x * x * x * x;
+                F.x = hit_albedo.x + (1.0f - hit_albedo.x) * x5;
+                F.y = hit_albedo.y + (1.0f - hit_albedo.y) * x5;
+                F.z = hit_albedo.z + (1.0f - hit_albedo.z) * x5;
+
+                // Sample GGX for specular reflection
+                float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), alpha, hit_normal);
+                direction = reflect3(direction, H);
+                if (dot3(direction, hit_normal) <= 0.0f) break;
+                origin = hit_pos;
+                throughput = throughput * F;
+            }
             else if (mat_type == MAT_DIELECTRIC) {
                 float eta_val = __uint_as_float(p0); // eta stored in p0 for dielectric
                 RNG bounce_rng(pixel_idx, s, depth + 1);

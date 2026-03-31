@@ -144,6 +144,26 @@ fn get_param_texture_ref<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Op
         })
 }
 
+/// Approximate reflectance color for named metal spectra.
+fn metal_color_from_params(params: &[pbrt_parser::Param]) -> Option<[f32; 3]> {
+    // Check for "spectrum eta" with a named metal
+    let eta_str = params
+        .iter()
+        .find(|p| p.name == "eta")
+        .and_then(|p| match &p.value {
+            ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
+            _ => None,
+        });
+    match eta_str {
+        Some(s) if s.contains("Au") => Some([1.0, 0.78, 0.34]), // gold
+        Some(s) if s.contains("Ag") => Some([0.97, 0.96, 0.91]), // silver
+        Some(s) if s.contains("Cu") && !s.contains("CuZn") => Some([0.96, 0.64, 0.54]), // copper
+        Some(s) if s.contains("Al") => Some([0.91, 0.92, 0.93]), // aluminum
+        Some(s) if s.contains("CuZn") => Some([0.94, 0.83, 0.49]), // brass
+        _ => None,
+    }
+}
+
 fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
     let temp = kelvin / 100.0;
     let r = if temp <= 66.0 {
@@ -524,13 +544,18 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         current_material.roughness =
                             get_param_float(params, "roughness").unwrap_or(0.0);
                     }
-                    "coatedconductor" | "conductor" => {
-                        current_material.material_type = MAT_COATED_DIFFUSE;
+                    "conductor" | "coatedconductor" => {
+                        current_material.material_type = MAT_CONDUCTOR;
                         if let Some(c) = get_param_rgb(params, "reflectance") {
                             current_material.albedo = c;
+                        } else if let Some(c) = metal_color_from_params(params) {
+                            current_material.albedo = c;
+                        } else {
+                            current_material.albedo = [0.8, 0.7, 0.3];
                         }
-                        current_material.roughness =
-                            get_param_float(params, "roughness").unwrap_or(0.0);
+                        current_material.roughness = get_param_float(params, "roughness")
+                            .or(get_param_float(params, "uroughness"))
+                            .unwrap_or(0.01);
                     }
                     "dielectric" | "thindielectric" => {
                         current_material.material_type = MAT_DIELECTRIC;
@@ -563,16 +588,18 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             }
                         }
                     }
-                    "coatedconductor" | "conductor" => {
-                        mat.material_type = MAT_COATED_DIFFUSE;
+                    "conductor" | "coatedconductor" => {
+                        mat.material_type = MAT_CONDUCTOR;
                         if let Some(c) = get_param_rgb(params, "reflectance") {
                             mat.albedo = c;
+                        } else if let Some(c) = metal_color_from_params(params) {
+                            mat.albedo = c;
                         } else {
-                            mat.albedo = [0.8, 0.7, 0.3]; // default gold-ish for conductor
+                            mat.albedo = [0.8, 0.7, 0.3];
                         }
                         mat.roughness = get_param_float(params, "roughness")
                             .or(get_param_float(params, "uroughness"))
-                            .unwrap_or(0.0);
+                            .unwrap_or(0.01);
                     }
                     "dielectric" | "thindielectric" => {
                         mat.material_type = MAT_DIELECTRIC;

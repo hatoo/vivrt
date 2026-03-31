@@ -4,6 +4,7 @@
 pub const MAT_DIFFUSE: i32 = 0;
 pub const MAT_DIELECTRIC: i32 = 1;
 pub const MAT_COATED_DIFFUSE: i32 = 2;
+pub const MAT_CONDUCTOR: i32 = 3;
 
 #[repr(C)]
 #[derive(Copy, Clone)]

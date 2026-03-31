@@ -6,6 +6,7 @@ enum MaterialType {
     MAT_DIFFUSE = 0,
     MAT_DIELECTRIC = 1,
     MAT_COATED_DIFFUSE = 2,
+    MAT_CONDUCTOR = 3,
 };
 
 struct DistantLight {
