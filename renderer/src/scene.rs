@@ -46,6 +46,7 @@ pub enum SceneShape {
         vertices: Vec<f32>,
         indices: Vec<i32>,
         texcoords: Vec<f32>,
+        normals: Vec<f32>, // per-vertex normals (3 per vertex), empty = flat shading
     },
 }
 
@@ -352,6 +353,52 @@ fn loop_subdivide(verts: &[f32], indices: &[i32], levels: u32) -> (Vec<f32>, Vec
     (flat_verts, flat_indices)
 }
 
+/// Compute area-weighted per-vertex normals from triangle mesh.
+fn compute_smooth_normals(verts: &[f32], indices: &[i32]) -> Vec<f32> {
+    let num_verts = verts.len() / 3;
+    let mut normals = vec![0.0f32; num_verts * 3];
+
+    for tri in indices.chunks(3) {
+        let i0 = tri[0] as usize;
+        let i1 = tri[1] as usize;
+        let i2 = tri[2] as usize;
+
+        let v0 = [verts[i0 * 3], verts[i0 * 3 + 1], verts[i0 * 3 + 2]];
+        let v1 = [verts[i1 * 3], verts[i1 * 3 + 1], verts[i1 * 3 + 2]];
+        let v2 = [verts[i2 * 3], verts[i2 * 3 + 1], verts[i2 * 3 + 2]];
+
+        // Cross product (unnormalized = area-weighted)
+        let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+        let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+        let n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+
+        for &vi in &[i0, i1, i2] {
+            normals[vi * 3] += n[0];
+            normals[vi * 3 + 1] += n[1];
+            normals[vi * 3 + 2] += n[2];
+        }
+    }
+
+    // Normalize
+    for i in 0..num_verts {
+        let nx = normals[i * 3];
+        let ny = normals[i * 3 + 1];
+        let nz = normals[i * 3 + 2];
+        let len = (nx * nx + ny * ny + nz * nz).sqrt();
+        if len > 0.0 {
+            normals[i * 3] /= len;
+            normals[i * 3 + 1] /= len;
+            normals[i * 3 + 2] /= len;
+        }
+    }
+
+    normals
+}
+
 // ---- Shape parsing helper ----
 
 fn parse_shape(ty: &str, params: &[pbrt_parser::Param]) -> Option<SceneShape> {
@@ -371,10 +418,12 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param]) -> Option<SceneShape> {
                 .and_then(|v| v.first().map(|x| *x as u32))
                 .unwrap_or(3);
             let (subdivided_verts, subdivided_indices) = loop_subdivide(&verts, &indices, levels);
+            let normals = compute_smooth_normals(&subdivided_verts, &subdivided_indices);
             Some(SceneShape::TriangleMesh {
                 vertices: subdivided_verts,
                 indices: subdivided_indices,
                 texcoords: Vec::new(),
+                normals,
             })
         }
         "trianglemesh" => {
@@ -391,6 +440,7 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param]) -> Option<SceneShape> {
                 vertices: verts,
                 indices,
                 texcoords,
+                normals: Vec::new(),
             })
         }
         "bilinearmesh" => {
@@ -407,6 +457,7 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param]) -> Option<SceneShape> {
                 vertices: verts,
                 indices,
                 texcoords,
+                normals: Vec::new(),
             })
         }
         _ => {

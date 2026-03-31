@@ -437,12 +437,21 @@ fn main() -> Result<()> {
                 vertices,
                 indices,
                 texcoords,
+                normals,
             } => {
                 let transformed = scene::transform_vertices(vertices, &obj.transform);
                 let d_verts = stream.clone_htod(&transformed).cuda()?;
                 let d_indices: CudaSlice<i32> = stream.clone_htod(indices).cuda()?;
                 let d_tc = if !texcoords.is_empty() {
                     let s = stream.clone_htod(texcoords).cuda()?;
+                    let ptr = dptr(&s, &stream);
+                    _device_buffers.push(unsafe { std::mem::transmute(s) });
+                    ptr
+                } else {
+                    0
+                };
+                let d_normals = if !normals.is_empty() {
+                    let s = stream.clone_htod(normals).cuda()?;
                     let ptr = dptr(&s, &stream);
                     _device_buffers.push(unsafe { std::mem::transmute(s) });
                     ptr
@@ -498,7 +507,7 @@ fn main() -> Result<()> {
                     checker_color1: obj.material.checker_color1,
                     checker_color2: obj.material.checker_color2,
                     texcoords: d_tc,
-                    normals: 0,
+                    normals: d_normals,
                     indices: dptr(&d_indices, &stream),
                     vertices: dptr(&d_verts, &stream),
                     num_vertices: num_verts as i32,
