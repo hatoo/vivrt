@@ -144,6 +144,25 @@ fn get_param_texture_ref<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Op
         })
 }
 
+/// Extract average value from inline spectrum data (wavelength/value pairs).
+fn get_spectrum_avg(params: &[pbrt_parser::Param], name: &str) -> Option<f32> {
+    params
+        .iter()
+        .find(|p| p.name == name && p.ty == ParamType::Spectrum)
+        .and_then(|p| match &p.value {
+            ParamValue::Floats(v) if v.len() >= 2 => {
+                // Pairs of (wavelength, value) — average the values
+                let values: Vec<f64> = v.iter().skip(1).step_by(2).copied().collect();
+                if values.is_empty() {
+                    None
+                } else {
+                    Some((values.iter().sum::<f64>() / values.len() as f64) as f32)
+                }
+            }
+            _ => None,
+        })
+}
+
 /// Approximate reflectance color for named metal spectra.
 fn metal_color_from_params(params: &[pbrt_parser::Param]) -> Option<[f32; 3]> {
     // Check for "spectrum eta" with a named metal
@@ -561,7 +580,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                     "dielectric" | "thindielectric" => {
                         current_material.material_type = MAT_DIELECTRIC;
-                        current_material.eta = get_param_float(params, "eta").unwrap_or(1.5);
+                        current_material.eta = get_param_float(params, "eta")
+                            .or_else(|| get_spectrum_avg(params, "eta"))
+                            .unwrap_or(1.5);
                     }
                     _ => eprintln!("Unsupported material type: {ty}"),
                 }
@@ -620,7 +641,21 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                     "dielectric" | "thindielectric" => {
                         mat.material_type = MAT_DIELECTRIC;
-                        mat.eta = get_param_float(params, "eta").unwrap_or(1.5);
+                        mat.eta = get_param_float(params, "eta")
+                            .or_else(|| get_spectrum_avg(params, "eta"))
+                            .unwrap_or(1.5);
+                    }
+                    "mix" => {
+                        // Use the first referenced material as approximation
+                        if let Some(p) = params.iter().find(|p| p.name == "materials") {
+                            if let ParamValue::Strings(names) = &p.value {
+                                if let Some(first) = names.first() {
+                                    if let Some(base) = named_materials.get(first.as_str()) {
+                                        mat = base.clone();
+                                    }
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
