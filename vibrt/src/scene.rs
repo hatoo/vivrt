@@ -965,6 +965,39 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             _ => {}
         }
     }
+
+    // If no explicit ambient/infinite light, approximate from area lights.
+    // This fills the background with a dim warm color instead of pure black,
+    // approximating the indirect illumination from area lights bouncing in the scene.
+    if parsed.ambient_light == [0.0; 3]
+        && parsed.distant_lights.is_empty()
+        && (!parsed.triangle_lights.is_empty() || !parsed.sphere_lights.is_empty())
+    {
+        let mut total = [0.0f32; 3];
+        let mut total_power = 0.0f32;
+        for light in &parsed.triangle_lights {
+            let power = light.area * (light.emission[0] + light.emission[1] + light.emission[2]);
+            total[0] += light.emission[0] * light.area;
+            total[1] += light.emission[1] * light.area;
+            total[2] += light.emission[2] * light.area;
+            total_power += power;
+        }
+        for light in &parsed.sphere_lights {
+            let area = 4.0 * std::f32::consts::PI * light.radius * light.radius;
+            let power = area * (light.emission[0] + light.emission[1] + light.emission[2]);
+            total[0] += light.emission[0] * area;
+            total[1] += light.emission[1] * area;
+            total[2] += light.emission[2] * area;
+            total_power += power;
+        }
+        if total_power > 0.0 {
+            // Approximate indirect illumination from area lights
+            let n_lights = parsed.triangle_lights.len() + parsed.sphere_lights.len();
+            let scale = 0.15 * n_lights as f32 / total_power;
+            parsed.ambient_light = [total[0] * scale, total[1] * scale, total[2] * scale];
+        }
+    }
+
     parsed
 }
 
