@@ -304,9 +304,6 @@ fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
 fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Option<SceneShape> {
     let p = ParamSet::new(params, format!("Shape \"{ty}\""));
     // Known but not fully used
-    p.mark("N"); // per-vertex normals (we compute our own for subdiv)
-    p.mark("S"); // tangents
-    p.mark("alpha"); // alpha handled at material level
     match ty {
         "sphere" => {
             let radius = p.float("radius").unwrap_or(1.0);
@@ -449,25 +446,12 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     parsed.filename = s.to_string();
                 }
                 // Known but not implemented
-                p.mark("iso");
-                p.mark("sensor");
-                p.mark("diagonal");
-                p.mark("savefp16");
-                p.mark("maxcomponentvalue");
-                p.mark("cropwindow");
-                p.mark("pixelbounds");
             }
             Directive::Camera { params, .. } => {
                 let p = ParamSet::new(params, "Camera");
                 if let Some(f) = p.float("fov") {
                     parsed.fov = f;
                 }
-                p.mark("lensradius");
-                p.mark("focaldistance");
-                p.mark("frameaspectratio");
-                p.mark("screenwindow");
-                p.mark("shutteropen");
-                p.mark("shutterclose");
             }
             Directive::LookAt { eye, look, up } => {
                 let e = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
@@ -706,13 +690,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     _ => eprintln!("  warning: unsupported material type: {ty}"),
                 }
                 // Mark known-but-unhandled params so they don't trigger warnings
-                p.mark("vroughness");
-                p.mark("k");
-                p.mark("displacement");
-                p.mark("alpha");
-                p.mark("remaproughness");
-                p.mark("normalmap");
-                p.mark("type");
                 if let Some(tex_name) = p.texture_ref("displacement") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                         current_material.bump_map = Some(img.clone());
@@ -793,8 +770,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                     "mix" => {
                         // Use the first referenced material as approximation
-                        p.mark("materials");
-                        p.mark("amount");
                         if let Some(param) = params.iter().find(|param| param.name == "materials") {
                             if let ParamValue::Strings(names) = &param.value {
                                 if let Some(first) = names.first() {
@@ -810,12 +785,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                 }
                 // Mark known-but-unhandled params so they don't trigger warnings
-                p.mark("vroughness");
-                p.mark("k");
-                p.mark("displacement");
-                p.mark("alpha");
-                p.mark("remaproughness");
-                p.mark("normalmap");
                 // Bind displacement/bump map for any material type
                 if let Some(tex_name) = p.texture_ref("displacement") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
@@ -895,9 +864,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         })),
                     );
                 } else if class == "scale" || class == "mix" {
-                    p.mark("scale"); // scale factor (we approximate by ignoring it)
-                    p.mark("tex2"); // mix second texture
-                    p.mark("amount"); // mix blend factor
                     if let Some(tex_ref) = p.texture_ref("tex") {
                         if let Some(base) = textures.get(tex_ref) {
                             textures.insert(name.clone(), base.clone());
@@ -939,8 +905,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             }
             Directive::MakeNamedMedium { name, params } => {
                 let p = ParamSet::new(params, format!("MakeNamedMedium \"{name}\""));
-                p.mark("type");
-                p.mark("sigma_s");
                 if let Some(sigma_a) = p.rgb("sigma_a") {
                     let d = 3.0; // approximate gem thickness
                     let tint = [
