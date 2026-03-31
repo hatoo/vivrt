@@ -536,7 +536,7 @@ extern "C" __global__ void __closesthit__ch()
     float3 albedo = make_f3(data->albedo);
 
     // Checkerboard procedural texture
-    if (data->diffuse.has_checkerboard) {
+    if (data->material_type == MAT_DIFFUSE && data->diffuse.has_checkerboard) {
         float u_coord = 0.0f, v_coord = 0.0f;
         if (data->texcoords && data->indices) {
             int i0 = data->indices[prim_idx * 3 + 0];
