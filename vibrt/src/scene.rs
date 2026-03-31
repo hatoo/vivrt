@@ -346,11 +346,15 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
                 .floats("uv")
                 .map(|v| v.iter().map(|x| *x as f32).collect())
                 .unwrap_or_default();
+            let normals: Vec<f32> = p
+                .floats("N")
+                .map(|v| v.iter().map(|x| *x as f32).collect())
+                .unwrap_or_default();
             Some(SceneShape::TriangleMesh {
                 vertices: verts,
                 indices,
                 texcoords,
-                normals: Vec::new(),
+                normals,
             })
         }
         "bilinearmesh" => {
