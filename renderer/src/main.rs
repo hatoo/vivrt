@@ -1,5 +1,8 @@
 mod gpu_types;
+mod ply;
 mod scene;
+mod subdivision;
+mod transform;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -475,7 +478,7 @@ fn main() -> Result<()> {
                 texcoords,
                 normals,
             } => {
-                let transformed = scene::transform_vertices(vertices, &obj.transform);
+                let transformed = transform::transform_vertices(vertices, &obj.transform);
                 let d_verts = stream.clone_htod(&transformed).cuda()?;
                 let d_indices: CudaSlice<i32> = stream.clone_htod(indices).cuda()?;
                 let d_tc = if !texcoords.is_empty() {
@@ -560,7 +563,7 @@ fn main() -> Result<()> {
                 gas_entries.push(GasEntry {
                     handle,
                     sbt_offset,
-                    transform: scene::identity_transform(),
+                    transform: transform::identity(),
                     is_sphere: false,
                 });
 

@@ -1,8 +1,8 @@
 //! PBRT scene parsing and representation.
 
 use crate::gpu_types::*;
+use crate::{ply, subdivision, transform};
 use pbrt_parser::{self, Directive, ParamType, ParamValue};
-use std::io::Read;
 use std::path::Path;
 
 pub struct ImageTexture {
@@ -172,508 +172,6 @@ fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
     [r, g, b]
 }
 
-// ---- Transform helpers ----
-
-pub fn identity_transform() -> [f32; 12] {
-    [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
-}
-
-fn mul_transform(a: &[f32; 12], b: &[f32; 12]) -> [f32; 12] {
-    let mut r = [0.0f32; 12];
-    for i in 0..3 {
-        for j in 0..4 {
-            let mut sum = 0.0;
-            for k in 0..3 {
-                sum += a[i * 4 + k] * b[k * 4 + j];
-            }
-            if j == 3 {
-                sum += a[i * 4 + 3];
-            }
-            r[i * 4 + j] = sum;
-        }
-    }
-    r
-}
-
-fn translate_matrix(tx: f32, ty: f32, tz: f32) -> [f32; 12] {
-    [1.0, 0.0, 0.0, tx, 0.0, 1.0, 0.0, ty, 0.0, 0.0, 1.0, tz]
-}
-
-fn scale_matrix(sx: f32, sy: f32, sz: f32) -> [f32; 12] {
-    [sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, sz, 0.0]
-}
-
-fn rotate_matrix(angle_deg: f32, ax: f32, ay: f32, az: f32) -> [f32; 12] {
-    let angle = angle_deg.to_radians();
-    let c = angle.cos();
-    let s = angle.sin();
-    let len = (ax * ax + ay * ay + az * az).sqrt();
-    let (x, y, z) = (ax / len, ay / len, az / len);
-    let t = 1.0 - c;
-    [
-        t * x * x + c,
-        t * x * y - s * z,
-        t * x * z + s * y,
-        0.0,
-        t * x * y + s * z,
-        t * y * y + c,
-        t * y * z - s * x,
-        0.0,
-        t * x * z - s * y,
-        t * y * z + s * x,
-        t * z * z + c,
-        0.0,
-    ]
-}
-
-fn cross3f(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn normalize3f(v: [f32; 3]) -> [f32; 3] {
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    [v[0] / len, v[1] / len, v[2] / len]
-}
-
-pub fn transform_vertices(verts: &[f32], t: &[f32; 12]) -> Vec<f32> {
-    let mut result = Vec::with_capacity(verts.len());
-    for i in (0..verts.len()).step_by(3) {
-        let x = verts[i];
-        let y = verts[i + 1];
-        let z = verts[i + 2];
-        result.push(t[0] * x + t[1] * y + t[2] * z + t[3]);
-        result.push(t[4] * x + t[5] * y + t[6] * z + t[7]);
-        result.push(t[8] * x + t[9] * y + t[10] * z + t[11]);
-    }
-    result
-}
-
-// ---- Loop subdivision ----
-
-fn loop_subdivide(verts: &[f32], indices: &[i32], levels: u32) -> (Vec<f32>, Vec<i32>) {
-    use std::collections::HashMap;
-
-    let mut positions: Vec<[f32; 3]> = verts.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
-    let mut tris: Vec<[i32; 3]> = indices.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
-
-    for _ in 0..levels {
-        let num_verts = positions.len();
-
-        // Build adjacency: for each edge, find the two opposite vertices
-        // edge_key = (min_vertex, max_vertex) -> (opposite_vertex_1, opposite_vertex_2)
-        let mut edge_faces: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-        for (fi, tri) in tris.iter().enumerate() {
-            for e in 0..3 {
-                let a = tri[e];
-                let b = tri[(e + 1) % 3];
-                let key = if a < b { (a, b) } else { (b, a) };
-                edge_faces.entry(key).or_default().push(fi);
-            }
-        }
-
-        // Build vertex neighbors
-        let mut neighbors: Vec<Vec<i32>> = vec![Vec::new(); num_verts];
-        for &(a, b) in edge_faces.keys() {
-            if !neighbors[a as usize].contains(&b) {
-                neighbors[a as usize].push(b);
-            }
-            if !neighbors[b as usize].contains(&a) {
-                neighbors[b as usize].push(a);
-            }
-        }
-
-        // Create edge vertices
-        let mut edge_vertex_map: HashMap<(i32, i32), i32> = HashMap::new();
-        let mut new_positions = positions.clone();
-
-        for (&(a, b), faces) in &edge_faces {
-            let pa = positions[a as usize];
-            let pb = positions[b as usize];
-
-            let new_pos = if faces.len() == 2 {
-                // Interior edge: find opposite vertices
-                let tri0 = &tris[faces[0]];
-                let tri1 = &tris[faces[1]];
-                let c = tri0.iter().find(|&&v| v != a && v != b).unwrap();
-                let d = tri1.iter().find(|&&v| v != a && v != b).unwrap();
-                let pc = positions[*c as usize];
-                let pd = positions[*d as usize];
-                // Loop rule: 3/8 * (A + B) + 1/8 * (C + D)
-                [
-                    3.0 / 8.0 * (pa[0] + pb[0]) + 1.0 / 8.0 * (pc[0] + pd[0]),
-                    3.0 / 8.0 * (pa[1] + pb[1]) + 1.0 / 8.0 * (pc[1] + pd[1]),
-                    3.0 / 8.0 * (pa[2] + pb[2]) + 1.0 / 8.0 * (pc[2] + pd[2]),
-                ]
-            } else {
-                // Boundary edge: midpoint
-                [
-                    0.5 * (pa[0] + pb[0]),
-                    0.5 * (pa[1] + pb[1]),
-                    0.5 * (pa[2] + pb[2]),
-                ]
-            };
-
-            let idx = new_positions.len() as i32;
-            new_positions.push(new_pos);
-            edge_vertex_map.insert((a, b), idx);
-        }
-
-        // Update existing vertex positions
-        for i in 0..num_verts {
-            let n = neighbors[i].len();
-            if n < 2 {
-                continue;
-            }
-
-            let beta = if n == 3 {
-                3.0 / 16.0
-            } else {
-                3.0 / (8.0 * n as f32)
-            };
-
-            let p = positions[i];
-            let mut sum = [0.0f32; 3];
-            for &nb in &neighbors[i] {
-                let pn = positions[nb as usize];
-                sum[0] += pn[0];
-                sum[1] += pn[1];
-                sum[2] += pn[2];
-            }
-
-            new_positions[i] = [
-                (1.0 - n as f32 * beta) * p[0] + beta * sum[0],
-                (1.0 - n as f32 * beta) * p[1] + beta * sum[1],
-                (1.0 - n as f32 * beta) * p[2] + beta * sum[2],
-            ];
-        }
-
-        // Create new triangles: each old triangle splits into 4
-        let mut new_tris = Vec::with_capacity(tris.len() * 4);
-        for tri in &tris {
-            let v0 = tri[0];
-            let v1 = tri[1];
-            let v2 = tri[2];
-
-            let edge_vert = |a: i32, b: i32| -> i32 {
-                let key = if a < b { (a, b) } else { (b, a) };
-                edge_vertex_map[&key]
-            };
-
-            let m01 = edge_vert(v0, v1);
-            let m12 = edge_vert(v1, v2);
-            let m20 = edge_vert(v2, v0);
-
-            new_tris.push([v0, m01, m20]);
-            new_tris.push([v1, m12, m01]);
-            new_tris.push([v2, m20, m12]);
-            new_tris.push([m01, m12, m20]);
-        }
-
-        positions = new_positions;
-        tris = new_tris;
-    }
-
-    let flat_verts: Vec<f32> = positions.iter().flat_map(|p| p.iter().copied()).collect();
-    let flat_indices: Vec<i32> = tris.iter().flat_map(|t| t.iter().copied()).collect();
-    (flat_verts, flat_indices)
-}
-
-/// Compute area-weighted per-vertex normals from triangle mesh.
-fn compute_smooth_normals(verts: &[f32], indices: &[i32]) -> Vec<f32> {
-    let num_verts = verts.len() / 3;
-    let mut normals = vec![0.0f32; num_verts * 3];
-
-    for tri in indices.chunks(3) {
-        let i0 = tri[0] as usize;
-        let i1 = tri[1] as usize;
-        let i2 = tri[2] as usize;
-
-        let v0 = [verts[i0 * 3], verts[i0 * 3 + 1], verts[i0 * 3 + 2]];
-        let v1 = [verts[i1 * 3], verts[i1 * 3 + 1], verts[i1 * 3 + 2]];
-        let v2 = [verts[i2 * 3], verts[i2 * 3 + 1], verts[i2 * 3 + 2]];
-
-        // Cross product (unnormalized = area-weighted)
-        let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
-        let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
-        let n = [
-            e1[1] * e2[2] - e1[2] * e2[1],
-            e1[2] * e2[0] - e1[0] * e2[2],
-            e1[0] * e2[1] - e1[1] * e2[0],
-        ];
-
-        for &vi in &[i0, i1, i2] {
-            normals[vi * 3] += n[0];
-            normals[vi * 3 + 1] += n[1];
-            normals[vi * 3 + 2] += n[2];
-        }
-    }
-
-    // Normalize
-    for i in 0..num_verts {
-        let nx = normals[i * 3];
-        let ny = normals[i * 3 + 1];
-        let nz = normals[i * 3 + 2];
-        let len = (nx * nx + ny * ny + nz * nz).sqrt();
-        if len > 0.0 {
-            normals[i * 3] /= len;
-            normals[i * 3 + 1] /= len;
-            normals[i * 3 + 2] /= len;
-        }
-    }
-
-    normals
-}
-
-// ---- PLY mesh loading ----
-
-fn load_ply_mesh(path: &Path) -> Option<SceneShape> {
-    use std::io::BufRead;
-
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| panic!("Failed to open PLY file {}: {e}", path.display()));
-
-    let buf_file = std::io::BufReader::new(file);
-    let reader: Box<dyn Read> = if path.extension().map_or(false, |e| e == "gz")
-        || path.to_string_lossy().contains(".ply.gz")
-    {
-        Box::new(flate2::read::GzDecoder::new(buf_file))
-    } else {
-        Box::new(buf_file)
-    };
-    let mut reader = std::io::BufReader::new(reader);
-
-    // Parse header
-    let mut num_vertices = 0usize;
-    let mut num_faces = 0usize;
-    let mut is_binary_le = false;
-    // Track vertex properties in order
-    #[derive(Clone, Copy)]
-    enum PropType {
-        Float,
-        Double,
-        Uchar,
-        Int,
-        UInt,
-        Short,
-        UShort,
-        Skip(usize),
-    }
-    #[derive(Clone, Copy, PartialEq)]
-    enum PropRole {
-        X,
-        Y,
-        Z,
-        Nx,
-        Ny,
-        Nz,
-        U,
-        V,
-        Other,
-    }
-    let mut vertex_props: Vec<(PropType, PropRole)> = Vec::new();
-    let mut face_index_type = PropType::Int;
-    let mut face_count_type = PropType::Uchar;
-    let mut in_vertex_element = false;
-    let mut in_face_element = false;
-
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .expect("Failed to read PLY header");
-        let line = line.trim();
-        if line == "end_header" {
-            break;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        match parts[0] {
-            "format" => {
-                is_binary_le = parts.get(1) == Some(&"binary_little_endian");
-            }
-            "element" => {
-                in_vertex_element = false;
-                in_face_element = false;
-                if parts.get(1) == Some(&"vertex") {
-                    num_vertices = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-                    in_vertex_element = true;
-                } else if parts.get(1) == Some(&"face") {
-                    num_faces = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-                    in_face_element = true;
-                }
-            }
-            "property" if in_vertex_element && parts.len() >= 3 => {
-                let ptype = match parts[1] {
-                    "float" | "float32" => PropType::Float,
-                    "double" | "float64" => PropType::Double,
-                    "uchar" | "uint8" => PropType::Uchar,
-                    "int" | "int32" => PropType::Int,
-                    "uint" | "uint32" => PropType::UInt,
-                    "short" | "int16" => PropType::Short,
-                    "ushort" | "uint16" => PropType::UShort,
-                    _ => PropType::Float,
-                };
-                let role = match parts[2] {
-                    "x" => PropRole::X,
-                    "y" => PropRole::Y,
-                    "z" => PropRole::Z,
-                    "nx" => PropRole::Nx,
-                    "ny" => PropRole::Ny,
-                    "nz" => PropRole::Nz,
-                    "u" | "s" | "texture_u" => PropRole::U,
-                    "v" | "t" | "texture_v" => PropRole::V,
-                    _ => PropRole::Other,
-                };
-                vertex_props.push((ptype, role));
-            }
-            "property" if in_face_element && parts.get(1) == Some(&"list") && parts.len() >= 5 => {
-                face_count_type = match parts[2] {
-                    "uchar" | "uint8" => PropType::Uchar,
-                    "int" | "int32" => PropType::Int,
-                    _ => PropType::Uchar,
-                };
-                face_index_type = match parts[3] {
-                    "int" | "int32" => PropType::Int,
-                    "uint" | "uint32" => PropType::UInt,
-                    "short" | "int16" => PropType::Short,
-                    "ushort" | "uint16" => PropType::UShort,
-                    _ => PropType::Int,
-                };
-            }
-            _ => {}
-        }
-    }
-
-    if !is_binary_le {
-        eprintln!(
-            "Only binary_little_endian PLY is supported: {}",
-            path.display()
-        );
-        return None;
-    }
-
-    let has_normals = vertex_props.iter().any(|(_, r)| *r == PropRole::Nx);
-    let has_uvs = vertex_props.iter().any(|(_, r)| *r == PropRole::U);
-
-    // Read vertex data
-    let mut vertices = Vec::with_capacity(num_vertices * 3);
-    let mut normals = if has_normals {
-        Vec::with_capacity(num_vertices * 3)
-    } else {
-        Vec::new()
-    };
-    let mut texcoords = if has_uvs {
-        Vec::with_capacity(num_vertices * 2)
-    } else {
-        Vec::new()
-    };
-
-    fn read_prop_f32(r: &mut impl Read, ptype: PropType) -> f32 {
-        match ptype {
-            PropType::Float => {
-                let mut b = [0u8; 4];
-                r.read_exact(&mut b).unwrap();
-                f32::from_le_bytes(b)
-            }
-            PropType::Double => {
-                let mut b = [0u8; 8];
-                r.read_exact(&mut b).unwrap();
-                f64::from_le_bytes(b) as f32
-            }
-            PropType::Uchar => {
-                let mut b = [0u8; 1];
-                r.read_exact(&mut b).unwrap();
-                b[0] as f32
-            }
-            PropType::Int => {
-                let mut b = [0u8; 4];
-                r.read_exact(&mut b).unwrap();
-                i32::from_le_bytes(b) as f32
-            }
-            PropType::UInt => {
-                let mut b = [0u8; 4];
-                r.read_exact(&mut b).unwrap();
-                u32::from_le_bytes(b) as f32
-            }
-            PropType::Short => {
-                let mut b = [0u8; 2];
-                r.read_exact(&mut b).unwrap();
-                i16::from_le_bytes(b) as f32
-            }
-            PropType::UShort => {
-                let mut b = [0u8; 2];
-                r.read_exact(&mut b).unwrap();
-                u16::from_le_bytes(b) as f32
-            }
-            PropType::Skip(n) => {
-                let mut b = vec![0u8; n];
-                r.read_exact(&mut b).unwrap();
-                0.0
-            }
-        }
-    }
-
-    fn prop_size(ptype: PropType) -> usize {
-        match ptype {
-            PropType::Float | PropType::Int | PropType::UInt => 4,
-            PropType::Double => 8,
-            PropType::Uchar => 1,
-            PropType::Short | PropType::UShort => 2,
-            PropType::Skip(n) => n,
-        }
-    }
-
-    for _ in 0..num_vertices {
-        for &(ptype, role) in &vertex_props {
-            let val = read_prop_f32(&mut reader, ptype);
-            match role {
-                PropRole::X | PropRole::Y | PropRole::Z => vertices.push(val),
-                PropRole::Nx | PropRole::Ny | PropRole::Nz => normals.push(val),
-                PropRole::U | PropRole::V => texcoords.push(val),
-                PropRole::Other => {} // skip
-            }
-        }
-    }
-
-    // Read face data
-    let mut indices = Vec::with_capacity(num_faces * 3);
-    for _ in 0..num_faces {
-        let count = read_prop_f32(&mut reader, face_count_type) as usize;
-        let mut face_indices = Vec::with_capacity(count);
-        for _ in 0..count {
-            let idx = read_prop_f32(&mut reader, face_index_type) as i32;
-            face_indices.push(idx);
-        }
-        // Triangulate (fan)
-        for i in 1..count - 1 {
-            indices.push(face_indices[0]);
-            indices.push(face_indices[i]);
-            indices.push(face_indices[i + 1]);
-        }
-    }
-
-    println!(
-        "Loaded PLY: {} vertices, {} triangles from {}",
-        vertices.len() / 3,
-        indices.len() / 3,
-        path.display()
-    );
-
-    Some(SceneShape::TriangleMesh {
-        vertices,
-        indices,
-        texcoords,
-        normals,
-    })
-}
-
 // ---- Shape parsing helper ----
 
 fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Option<SceneShape> {
@@ -692,8 +190,10 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
             let levels = get_param_ints(params, "levels")
                 .and_then(|v| v.first().map(|x| *x as u32))
                 .unwrap_or(3);
-            let (subdivided_verts, subdivided_indices) = loop_subdivide(&verts, &indices, levels);
-            let normals = compute_smooth_normals(&subdivided_verts, &subdivided_indices);
+            let (subdivided_verts, subdivided_indices) =
+                subdivision::loop_subdivide(&verts, &indices, levels);
+            let normals =
+                subdivision::compute_smooth_normals(&subdivided_verts, &subdivided_indices);
             Some(SceneShape::TriangleMesh {
                 vertices: subdivided_verts,
                 indices: subdivided_indices,
@@ -737,7 +237,13 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
         }
         "plymesh" => {
             let filename = get_param_string(params, "filename")?;
-            load_ply_mesh(&scene_dir.join(filename))
+            let mesh = ply::load(&scene_dir.join(filename))?;
+            Some(SceneShape::TriangleMesh {
+                vertices: mesh.vertices,
+                indices: mesh.indices,
+                texcoords: mesh.texcoords,
+                normals: mesh.normals,
+            })
         }
         _ => {
             eprintln!("Unsupported shape type: {ty}");
@@ -781,7 +287,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
     }
     let mut textures = std::collections::HashMap::<String, SceneTexture>::new();
     let mut current_material = SceneMaterial::default();
-    let mut current_transform = identity_transform();
+    let mut current_transform = transform::identity();
     let mut transform_stack: Vec<([f32; 12], SceneMaterial)> = Vec::new();
     let mut _in_world = false;
 
@@ -804,12 +310,12 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
             }
             Directive::LookAt { eye, look, up } => {
-                let mut e = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
-                let mut l = [look[0] as f32, look[1] as f32, look[2] as f32];
-                let mut u = [up[0] as f32, up[1] as f32, up[2] as f32];
+                let e = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
+                let l = [look[0] as f32, look[1] as f32, look[2] as f32];
+                let u = [up[0] as f32, up[1] as f32, up[2] as f32];
 
                 // Detect handedness flip from pre-LookAt Scale (e.g. Scale -1 1 1)
-                if current_transform != identity_transform() {
+                if current_transform != transform::identity() {
                     let t = &current_transform;
                     let det = t[0] * (t[5] * t[10] - t[6] * t[9])
                         - t[1] * (t[4] * t[10] - t[6] * t[8])
@@ -817,7 +323,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     if det < 0.0 {
                         parsed.cam_flip_x = true;
                     }
-                    current_transform = identity_transform();
+                    current_transform = transform::identity();
                 }
 
                 parsed.cam_eye = e;
@@ -839,7 +345,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 // the world is further transformed by R before the camera
                 // sees it. Equivalently, eye/look/up are transformed by
                 // the inverse of R. For a rotation, inverse = transpose.
-                if current_transform != identity_transform() {
+                if current_transform != transform::identity() {
                     let t = &current_transform;
                     // CTM = LookAt * R is camera-from-world. Camera vectors
                     // need world-from-camera = R^-1 * LookAt^-1.
@@ -862,7 +368,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     parsed.cam_look = transform_point(parsed.cam_look);
                     parsed.cam_up = transform_vec(parsed.cam_up);
                 }
-                current_transform = identity_transform();
+                current_transform = transform::identity();
                 _in_world = true;
             }
             Directive::AttributeBegin => {
@@ -875,24 +381,24 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
             }
             Directive::Translate { v } => {
-                let t = translate_matrix(v[0] as f32, v[1] as f32, v[2] as f32);
-                current_transform = mul_transform(&current_transform, &t);
+                let t = transform::translate(v[0] as f32, v[1] as f32, v[2] as f32);
+                current_transform = transform::mul(&current_transform, &t);
             }
             Directive::Scale { v } => {
-                let s = scale_matrix(v[0] as f32, v[1] as f32, v[2] as f32);
-                current_transform = mul_transform(&current_transform, &s);
+                let s = transform::scale(v[0] as f32, v[1] as f32, v[2] as f32);
+                current_transform = transform::mul(&current_transform, &s);
             }
             Directive::Rotate { angle, axis } => {
-                let r = rotate_matrix(
+                let r = transform::rotate(
                     *angle as f32,
                     axis[0] as f32,
                     axis[1] as f32,
                     axis[2] as f32,
                 );
-                current_transform = mul_transform(&current_transform, &r);
+                current_transform = transform::mul(&current_transform, &r);
             }
             Directive::Identity => {
-                current_transform = identity_transform();
+                current_transform = transform::identity();
             }
             Directive::Transform { m } => {
                 // PBRT Transform uses column-major 4x4, convert to row-major 3x4
@@ -926,7 +432,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     m[10] as f32,
                     m[14] as f32,
                 ];
-                current_transform = mul_transform(&current_transform, &t);
+                current_transform = transform::mul(&current_transform, &t);
             }
             Directive::LightSource { ty, params } => match ty.as_str() {
                 "infinite" => {
@@ -1119,13 +625,13 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
 fn register_area_light(
     shape: &SceneShape,
     mat: &SceneMaterial,
-    transform: &[f32; 12],
+    xform: &[f32; 12],
     scene: &mut ParsedScene,
 ) {
     let em = mat.emission;
     if em[0] > 0.0 || em[1] > 0.0 || em[2] > 0.0 {
         if let SceneShape::Sphere { radius } = shape {
-            let center = [transform[3], transform[7], transform[11]];
+            let center = [xform[3], xform[7], xform[11]];
             scene.sphere_lights.push(SphereLight {
                 center,
                 radius: *radius,
@@ -1138,7 +644,7 @@ fn register_area_light(
         } = shape
         {
             // Register each triangle as an area light
-            let transformed = transform_vertices(vertices, transform);
+            let transformed = transform::transform_vertices(vertices, xform);
             for tri in indices.chunks(3) {
                 if tri.len() < 3 {
                     continue;
