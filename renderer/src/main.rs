@@ -170,8 +170,16 @@ fn compute_camera(
         w[0] * u[1] - w[1] * u[0],
     ];
 
-    let half_h = (fov.to_radians() * 0.5).tan();
-    let half_w = aspect * half_h;
+    // PBRT applies FOV to the narrower image dimension
+    let (half_w, half_h) = if aspect >= 1.0 {
+        // Landscape: FOV is vertical
+        let hh = (fov.to_radians() * 0.5).tan();
+        (aspect * hh, hh)
+    } else {
+        // Portrait: FOV is horizontal
+        let hw = (fov.to_radians() * 0.5).tan();
+        (hw, hw / aspect)
+    };
 
     (
         [u[0] * half_w, u[1] * half_w, u[2] * half_w],
