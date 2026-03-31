@@ -3,6 +3,7 @@
 
 pub const MAT_DIFFUSE: i32 = 0;
 pub const MAT_DIELECTRIC: i32 = 1;
+pub const MAT_COATED_DIFFUSE: i32 = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -56,6 +57,7 @@ pub struct HitGroupData {
     pub material_type: i32,
     pub albedo: [f32; 3],
     pub eta: f32,
+    pub roughness: f32,
     pub emission: [f32; 3],
     pub has_checkerboard: i32,
     pub checker_scale_u: f32,

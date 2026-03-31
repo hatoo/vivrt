@@ -5,6 +5,7 @@
 enum MaterialType {
     MAT_DIFFUSE = 0,
     MAT_DIELECTRIC = 1,
+    MAT_COATED_DIFFUSE = 2,
 };
 
 struct DistantLight {
@@ -48,6 +49,7 @@ struct HitGroupData {
     int           material_type;
     float         albedo[3];
     float         eta;
+    float         roughness;
     float         emission[3];
     // Procedural checkerboard
     int           has_checkerboard;

@@ -8,6 +8,7 @@ pub struct SceneMaterial {
     pub material_type: i32,
     pub albedo: [f32; 3],
     pub eta: f32,
+    pub roughness: f32,
     pub emission: [f32; 3],
     pub has_checkerboard: bool,
     pub checker_scale_u: f32,
@@ -22,6 +23,7 @@ impl Default for SceneMaterial {
             material_type: MAT_DIFFUSE,
             albedo: [0.5, 0.5, 0.5],
             eta: 1.5,
+            roughness: 1.0,
             emission: [0.0, 0.0, 0.0],
             has_checkerboard: false,
             checker_scale_u: 1.0,
@@ -624,11 +626,21 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             }
                         }
                     }
-                    "coateddiffuse" | "coatedconductor" | "conductor" => {
-                        current_material.material_type = MAT_DIFFUSE;
+                    "coateddiffuse" => {
+                        current_material.material_type = MAT_COATED_DIFFUSE;
                         if let Some(c) = get_param_rgb(params, "reflectance") {
                             current_material.albedo = c;
                         }
+                        current_material.roughness =
+                            get_param_float(params, "roughness").unwrap_or(0.0);
+                    }
+                    "coatedconductor" | "conductor" => {
+                        current_material.material_type = MAT_COATED_DIFFUSE;
+                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                            current_material.albedo = c;
+                        }
+                        current_material.roughness =
+                            get_param_float(params, "roughness").unwrap_or(0.0);
                     }
                     "dielectric" | "thindielectric" => {
                         current_material.material_type = MAT_DIELECTRIC;

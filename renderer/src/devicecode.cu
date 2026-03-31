@@ -92,6 +92,35 @@ static __forceinline__ __device__ float3 cosine_sample_hemisphere(float u1, floa
     );
 }
 
+// GGX microfacet sampling (for glossy materials)
+static __forceinline__ __device__ float3 ggx_sample(float u1, float u2, float alpha, float3 N) {
+    // Sample GGX distribution of normals
+    float phi = 2.0f * M_PIf * u1;
+    float cos_theta = sqrtf((1.0f - u2) / (1.0f + (alpha * alpha - 1.0f) * u2));
+    float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+
+    // Build local frame
+    float3 tangent;
+    if (fabsf(N.x) > 0.9f)
+        tangent = normalize3(cross3(make_float3(0,1,0), N));
+    else
+        tangent = normalize3(cross3(make_float3(1,0,0), N));
+    float3 bitangent = cross3(N, tangent);
+
+    // Half vector in world space
+    return normalize3(
+        tangent * (cosf(phi) * sin_theta) +
+        bitangent * (sinf(phi) * sin_theta) +
+        N * cos_theta
+    );
+}
+
+// Schlick Fresnel approximation (for coated surfaces, uses F0 = 0.04 for dielectric coat)
+static __forceinline__ __device__ float fresnel_schlick_f0(float cos_i, float f0) {
+    float x = 1.0f - cos_i;
+    return f0 + (1.0f - f0) * x * x * x * x * x;
+}
+
 // Schlick Fresnel approximation
 static __forceinline__ __device__ float fresnel_schlick(float cos_i, float eta) {
     float r0 = (1.0f - eta) / (1.0f + eta);
@@ -169,9 +198,9 @@ extern "C" __global__ void __raygen__rg()
         float3 radiance = make_float3(0, 0, 0);
 
         for (unsigned int depth = 0; depth < params.max_depth; depth++) {
-            unsigned int p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12;
+            unsigned int p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13;
             p9 = 0xFFFFFFFF; // miss sentinel
-            p10 = p11 = p12 = 0;
+            p10 = p11 = p12 = p13 = 0;
 
             optixTrace(
                 params.traversable,
@@ -180,7 +209,7 @@ extern "C" __global__ void __raygen__rg()
                 OptixVisibilityMask(255),
                 OPTIX_RAY_FLAG_NONE,
                 0, 1, 0,
-                p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12
+                p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13
             );
 
             if (p9 == 0xFFFFFFFF) {
@@ -210,7 +239,7 @@ extern "C" __global__ void __raygen__rg()
                     if (ndotl > 0.0f) {
                         // Shadow ray
                         unsigned int shadow_p9 = 0xFFFFFFFF;
-                        unsigned int sp10 = 0, sp11 = 0, sp12 = 0;
+                        unsigned int sp10 = 0, sp11 = 0, sp12 = 0, sp13 = 0;
                         optixTrace(
                             params.traversable,
                             hit_pos, light_dir,
@@ -218,7 +247,7 @@ extern "C" __global__ void __raygen__rg()
                             OptixVisibilityMask(255),
                             OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
                             0, 1, 0,
-                            p0, p1, p2, p3, p4, p5, p6, p7, p8, shadow_p9, sp10, sp11, sp12
+                            p0, p1, p2, p3, p4, p5, p6, p7, p8, shadow_p9, sp10, sp11, sp12, sp13
                         );
                         if (shadow_p9 == 0xFFFFFFFF) {
                             radiance = radiance + throughput * hit_albedo * light_em * ndotl * (1.0f / M_PIf);
@@ -270,7 +299,7 @@ extern "C" __global__ void __raygen__rg()
 
                         // Shadow ray
                         unsigned int shadow_p9 = 0xFFFFFFFF;
-                        unsigned int sp10 = 0, sp11 = 0, sp12 = 0;
+                        unsigned int sp10 = 0, sp11 = 0, sp12 = 0, sp13 = 0;
                         optixTrace(
                             params.traversable,
                             hit_pos, sample_dir,
@@ -278,7 +307,7 @@ extern "C" __global__ void __raygen__rg()
                             OptixVisibilityMask(255),
                             OPTIX_RAY_FLAG_NONE,
                             0, 1, 0,
-                            p0, p1, p2, p3, p4, p5, p6, p7, p8, shadow_p9, sp10, sp11, sp12
+                            p0, p1, p2, p3, p4, p5, p6, p7, p8, shadow_p9, sp10, sp11, sp12, sp13
                         );
 
                         // Check if we hit the light (emission > 0)
@@ -298,6 +327,78 @@ extern "C" __global__ void __raygen__rg()
                 direction = cosine_sample_hemisphere(bounce_rng.next(), bounce_rng.next(), hit_normal);
                 origin = hit_pos;
                 throughput = throughput * hit_albedo;
+            }
+            else if (mat_type == MAT_COATED_DIFFUSE) {
+                float hit_roughness = __uint_as_float(p13);
+                float alpha = fmaxf(hit_roughness * hit_roughness, 0.001f);
+                RNG bounce_rng(pixel_idx, s, depth + 1);
+
+                // Fresnel determines specular vs diffuse probability
+                float cos_i = fmaxf(fabsf(dot3(direction * (-1.0f), hit_normal)), 0.001f);
+                float F = fresnel_schlick_f0(cos_i, 0.04f); // dielectric coat F0 ≈ 0.04
+
+                if (bounce_rng.next() < F) {
+                    // Specular reflection: sample GGX
+                    float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), alpha, hit_normal);
+                    direction = reflect3(direction, H);
+                    if (dot3(direction, hit_normal) <= 0.0f) break; // below surface
+                    origin = hit_pos;
+                    // Specular doesn't tint by albedo (dielectric coat)
+                } else {
+                    // Diffuse: same as MAT_DIFFUSE with NEE
+                    for (int i = 0; i < params.num_distant_lights; i++) {
+                        float3 light_dir = make_f3(params.distant_lights[i].direction);
+                        float3 light_em = make_f3(params.distant_lights[i].emission);
+                        float ndotl = dot3(hit_normal, light_dir);
+                        if (ndotl > 0.0f) {
+                            unsigned int shadow_p9 = 0xFFFFFFFF;
+                            unsigned int sp10 = 0, sp11 = 0, sp12 = 0, sp13 = 0;
+                            optixTrace(params.traversable, hit_pos, light_dir,
+                                0.001f, 1e16f, 0.0f, OptixVisibilityMask(255),
+                                OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT, 0, 1, 0,
+                                p0, p1, p2, p3, p4, p5, p6, p7, p8, shadow_p9, sp10, sp11, sp12, sp13);
+                            if (shadow_p9 == 0xFFFFFFFF)
+                                radiance = radiance + throughput * hit_albedo * light_em * ndotl * (1.0f / M_PIf);
+                        }
+                    }
+                    // NEE for sphere lights
+                    for (int i = 0; i < params.num_sphere_lights; i++) {
+                        RNG light_rng(pixel_idx * 31 + i, s, depth + 100);
+                        float3 light_center = make_f3(params.sphere_lights[i].center);
+                        float light_radius = params.sphere_lights[i].radius;
+                        float3 light_em = make_f3(params.sphere_lights[i].emission);
+                        float3 to_light = light_center - hit_pos;
+                        float dist_to_center = sqrtf(dot3(to_light, to_light));
+                        float3 light_dir_norm = to_light * (1.0f / dist_to_center);
+                        float sin_theta_max2 = (light_radius * light_radius) / (dist_to_center * dist_to_center);
+                        float cos_theta_max = sqrtf(fmaxf(0.0f, 1.0f - sin_theta_max2));
+                        float u1l = light_rng.next(), u2l = light_rng.next();
+                        float cos_theta_l = 1.0f - u1l + u1l * cos_theta_max;
+                        float sin_theta_l = sqrtf(fmaxf(0.0f, 1.0f - cos_theta_l * cos_theta_l));
+                        float phi_l = 2.0f * M_PIf * u2l;
+                        float3 tgt;
+                        if (fabsf(light_dir_norm.x) > 0.9f) tgt = normalize3(cross3(make_float3(0,1,0), light_dir_norm));
+                        else tgt = normalize3(cross3(make_float3(1,0,0), light_dir_norm));
+                        float3 btgt = cross3(light_dir_norm, tgt);
+                        float3 sample_dir = normalize3(tgt*(cosf(phi_l)*sin_theta_l) + btgt*(sinf(phi_l)*sin_theta_l) + light_dir_norm*cos_theta_l);
+                        float ndotl = dot3(hit_normal, sample_dir);
+                        if (ndotl > 0.0f) {
+                            unsigned int shadow_p9 = 0xFFFFFFFF;
+                            unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
+                            optixTrace(params.traversable, hit_pos, sample_dir, 0.001f, dist_to_center+light_radius, 0.0f,
+                                OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1, 0,
+                                p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
+                            float3 shadow_em = make_float3(__uint_as_float(sp10),__uint_as_float(sp11),__uint_as_float(sp12));
+                            if (shadow_em.x > 0 || shadow_em.y > 0 || shadow_em.z > 0) {
+                                float pdf = 1.0f / (2.0f * M_PIf * (1.0f - cos_theta_max));
+                                radiance = radiance + throughput * hit_albedo * shadow_em * ndotl * (1.0f / (M_PIf * pdf));
+                            }
+                        }
+                    }
+                    direction = cosine_sample_hemisphere(bounce_rng.next(), bounce_rng.next(), hit_normal);
+                    origin = hit_pos;
+                    throughput = throughput * hit_albedo;
+                }
             }
             else if (mat_type == MAT_DIELECTRIC) {
                 float eta_val = __uint_as_float(p0); // eta stored in p0 for dielectric
@@ -441,6 +542,7 @@ extern "C" __global__ void __closesthit__ch()
     optixSetPayload_10(__float_as_uint(data->emission[0]));
     optixSetPayload_11(__float_as_uint(data->emission[1]));
     optixSetPayload_12(__float_as_uint(data->emission[2]));
+    optixSetPayload_13(__float_as_uint(data->roughness));
 }
 
 // Closest hit for sphere (built-in intersection)
@@ -484,4 +586,5 @@ extern "C" __global__ void __closesthit__sphere()
     optixSetPayload_10(__float_as_uint(data->emission[0]));
     optixSetPayload_11(__float_as_uint(data->emission[1]));
     optixSetPayload_12(__float_as_uint(data->emission[2]));
+    optixSetPayload_13(__float_as_uint(data->roughness));
 }

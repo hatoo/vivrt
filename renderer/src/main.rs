@@ -277,7 +277,7 @@ fn main() -> Result<()> {
         } else {
             TraversableGraphFlags::ALLOW_SINGLE_GAS
         })
-        .num_payload_values(13)
+        .num_payload_values(14)
         .num_attribute_values(2)
         .uses_primitive_type_flags(prim_flags);
 
@@ -402,6 +402,7 @@ fn main() -> Result<()> {
                     material_type: obj.material.material_type,
                     albedo: obj.material.albedo,
                     eta: obj.material.eta,
+                    roughness: obj.material.roughness,
                     emission: obj.material.emission,
                     has_checkerboard: 0,
                     checker_scale_u: 0.0,
@@ -500,6 +501,7 @@ fn main() -> Result<()> {
                     material_type: obj.material.material_type,
                     albedo: obj.material.albedo,
                     eta: obj.material.eta,
+                    roughness: obj.material.roughness,
                     emission: obj.material.emission,
                     has_checkerboard: if obj.material.has_checkerboard { 1 } else { 0 },
                     checker_scale_u: obj.material.checker_scale_u,
