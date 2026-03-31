@@ -62,6 +62,10 @@ struct HitGroupData {
     float*        texture_data;  // RGB float, width*height*3
     int           texture_width;
     int           texture_height;
+    // Bump map (NULL if no bump)
+    float*        bump_data;     // single channel float, width*height
+    int           bump_width;
+    int           bump_height;
     // Geometry data
     float*        texcoords;
     float*        normals;

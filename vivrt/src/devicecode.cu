@@ -715,6 +715,58 @@ extern "C" __global__ void __closesthit__ch()
     if (dot3(shading_normal, ray_dir) > 0.0f)
         shading_normal = shading_normal * (-1.0f);
 
+    // Bump mapping: perturb normal using height map gradient
+    if (data->bump_data && data->texcoords) {
+        float u_coord = 0.0f, v_coord = 0.0f;
+        int bi0, bi1, bi2;
+        if (data->indices) {
+            bi0 = data->indices[prim_idx * 3 + 0];
+            bi1 = data->indices[prim_idx * 3 + 1];
+            bi2 = data->indices[prim_idx * 3 + 2];
+        } else {
+            bi0 = prim_idx * 3; bi1 = bi0 + 1; bi2 = bi0 + 2;
+        }
+        float bw = 1.0f - bary.x - bary.y;
+        u_coord = bw * data->texcoords[bi0*2] + bary.x * data->texcoords[bi1*2] + bary.y * data->texcoords[bi2*2];
+        v_coord = bw * data->texcoords[bi0*2+1] + bary.x * data->texcoords[bi1*2+1] + bary.y * data->texcoords[bi2*2+1];
+
+        // Wrap UVs
+        u_coord = u_coord - floorf(u_coord);
+        v_coord = v_coord - floorf(v_coord);
+
+        // Sample height map with finite differences
+        float eps = 1.0f / fmaxf((float)data->bump_width, 1.0f);
+        int bw_ = data->bump_width;
+        int bh_ = data->bump_height;
+        auto sample_bump = [&](float su, float sv) -> float {
+            su = su - floorf(su);
+            sv = sv - floorf(sv);
+            int ix = (int)(su * (bw_ - 1));
+            int iy = (int)((1.0f - sv) * (bh_ - 1));
+            ix = max(0, min(ix, bw_ - 1));
+            iy = max(0, min(iy, bh_ - 1));
+            return data->bump_data[iy * bw_ + ix];
+        };
+
+        float h0 = sample_bump(u_coord, v_coord);
+        float du = sample_bump(u_coord + eps, v_coord) - h0;
+        float dv = sample_bump(u_coord, v_coord + eps) - h0;
+
+        // Build tangent frame and perturb normal
+        float3 tangent;
+        if (fabsf(shading_normal.x) > 0.9f)
+            tangent = normalize3(cross3(make_float3(0,1,0), shading_normal));
+        else
+            tangent = normalize3(cross3(make_float3(1,0,0), shading_normal));
+        float3 bitangent = cross3(shading_normal, tangent);
+
+        float bump_scale = 2.0f;
+        shading_normal = normalize3(shading_normal - tangent * (du * bump_scale) - bitangent * (dv * bump_scale));
+
+        if (dot3(shading_normal, ray_dir) > 0.0f)
+            shading_normal = shading_normal * (-1.0f);
+    }
+
     float3 albedo = make_f3(data->albedo);
 
     // Checkerboard procedural texture
