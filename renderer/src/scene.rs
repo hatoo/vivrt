@@ -434,12 +434,13 @@ fn load_ply_mesh(path: &Path) -> Option<SceneShape> {
     let file = std::fs::File::open(path)
         .unwrap_or_else(|e| panic!("Failed to open PLY file {}: {e}", path.display()));
 
+    let buf_file = std::io::BufReader::new(file);
     let reader: Box<dyn Read> = if path.extension().map_or(false, |e| e == "gz")
         || path.to_string_lossy().contains(".ply.gz")
     {
-        Box::new(flate2::read::GzDecoder::new(file))
+        Box::new(flate2::read::GzDecoder::new(buf_file))
     } else {
-        Box::new(file)
+        Box::new(buf_file)
     };
 
     let mut buf_reader = std::io::BufReader::new(reader);
