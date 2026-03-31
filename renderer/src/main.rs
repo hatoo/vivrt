@@ -1,9 +1,13 @@
+mod gpu_types;
+mod scene;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
+use gpu_types::*;
 use optix::accel::{self, AccelBuildOptions, BuildInput, TriangleArrayInput};
 use optix::*;
-use pbrt_parser::{self, Directive, ParamType, ParamValue};
+use scene::{parse_scene, SceneShape};
 use std::mem;
 use std::sync::Arc;
 
@@ -37,77 +41,7 @@ struct Args {
     height: Option<u32>,
 }
 
-// Must match devicecode.h
-const MAT_DIFFUSE: i32 = 0;
-const MAT_DIELECTRIC: i32 = 1;
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct DistantLight {
-    direction: [f32; 3],
-    emission: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct SphereLight {
-    center: [f32; 3],
-    radius: f32,
-    emission: [f32; 3],
-    _pad: f32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct LaunchParams {
-    image: optix_sys::CUdeviceptr,
-    width: u32,
-    height: u32,
-    samples_per_pixel: u32,
-    max_depth: u32,
-    cam_eye: [f32; 3],
-    cam_u: [f32; 3],
-    cam_v: [f32; 3],
-    cam_w: [f32; 3],
-    traversable: optix_sys::OptixTraversableHandle,
-    ambient_light: [f32; 3],
-    num_distant_lights: i32,
-    distant_lights: optix_sys::CUdeviceptr,
-    num_sphere_lights: i32,
-    sphere_lights: optix_sys::CUdeviceptr,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct RayGenData {}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct MissData {
-    bg_color: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-struct HitGroupData {
-    material_type: i32,
-    albedo: [f32; 3],
-    eta: f32,
-    emission: [f32; 3],
-    has_checkerboard: i32,
-    checker_scale_u: f32,
-    checker_scale_v: f32,
-    checker_color1: [f32; 3],
-    checker_color2: [f32; 3],
-    texcoords: optix_sys::CUdeviceptr,
-    normals: optix_sys::CUdeviceptr,
-    indices: optix_sys::CUdeviceptr,
-    vertices: optix_sys::CUdeviceptr,
-    num_vertices: i32,
-}
-
 /// Extension trait to convert cudarc's DriverError to anyhow::Error.
-/// cudarc's DriverError doesn't implement std::error::Error.
 trait CudaResultExt<T> {
     fn cuda(self) -> Result<T>;
 }
@@ -162,538 +96,88 @@ fn alloc_and_copy_slice<T>(
     }
 }
 
-// ---- Scene representation ----
-
-struct SceneMaterial {
-    material_type: i32,
-    albedo: [f32; 3],
-    eta: f32,
-    emission: [f32; 3],
-    has_checkerboard: bool,
-    checker_scale_u: f32,
-    checker_scale_v: f32,
-    checker_color1: [f32; 3],
-    checker_color2: [f32; 3],
-}
-
-impl Default for SceneMaterial {
-    fn default() -> Self {
-        Self {
-            material_type: MAT_DIFFUSE,
-            albedo: [0.5, 0.5, 0.5],
-            eta: 1.5,
-            emission: [0.0, 0.0, 0.0],
-            has_checkerboard: false,
-            checker_scale_u: 1.0,
-            checker_scale_v: 1.0,
-            checker_color1: [1.0, 1.0, 1.0],
-            checker_color2: [0.0, 0.0, 0.0],
-        }
-    }
-}
-
-enum SceneShape {
-    Sphere {
-        radius: f32,
-    },
-    TriangleMesh {
-        vertices: Vec<f32>,  // 3 per vertex
-        indices: Vec<i32>,   // 3 per triangle
-        texcoords: Vec<f32>, // 2 per vertex, may be empty
-    },
-}
-
-struct SceneObject {
-    shape: SceneShape,
-    material: SceneMaterial,
-    transform: [f32; 12], // 3x4 row-major (identity by default)
-}
-
-struct ParsedScene {
-    width: u32,
-    height: u32,
+fn compute_camera(
+    eye: &[f32; 3],
+    look: &[f32; 3],
+    up: &[f32; 3],
     fov: f32,
-    cam_eye: [f32; 3],
-    cam_look: [f32; 3],
-    cam_up: [f32; 3],
-    spp: u32,
-    max_depth: u32,
-    ambient_light: [f32; 3],
-    distant_lights: Vec<DistantLight>,
-    sphere_lights: Vec<SphereLight>,
-    objects: Vec<SceneObject>,
-    filename: String,
+    aspect: f32,
+) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let w = [look[0] - eye[0], look[1] - eye[1], look[2] - eye[2]];
+    let wlen = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+    let w = [w[0] / wlen, w[1] / wlen, w[2] / wlen];
+
+    let u = [
+        up[1] * w[2] - up[2] * w[1],
+        up[2] * w[0] - up[0] * w[2],
+        up[0] * w[1] - up[1] * w[0],
+    ];
+    let ulen = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+    let u = [u[0] / ulen, u[1] / ulen, u[2] / ulen];
+
+    let v = [
+        w[1] * u[2] - w[2] * u[1],
+        w[2] * u[0] - w[0] * u[2],
+        w[0] * u[1] - w[1] * u[0],
+    ];
+
+    let half_h = (fov.to_radians() * 0.5).tan();
+    let half_w = aspect * half_h;
+
+    (
+        [u[0] * half_w, u[1] * half_w, u[2] * half_w],
+        [v[0] * half_h, v[1] * half_h, v[2] * half_h],
+        w,
+    )
 }
 
-fn get_param_floats<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a [f64]> {
-    params
-        .iter()
-        .find(|p| p.name == name)
-        .and_then(|p| match &p.value {
-            ParamValue::Floats(v) => Some(v.as_slice()),
-            _ => None,
-        })
-}
-
-fn get_param_float(params: &[pbrt_parser::Param], name: &str) -> Option<f32> {
-    get_param_floats(params, name).and_then(|v| v.first().map(|x| *x as f32))
-}
-
-fn get_param_string<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a str> {
-    params
-        .iter()
-        .find(|p| p.name == name)
-        .and_then(|p| match &p.value {
-            ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
-            _ => None,
-        })
-}
-
-fn get_param_ints<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a [i64]> {
-    params
-        .iter()
-        .find(|p| p.name == name)
-        .and_then(|p| match &p.value {
-            ParamValue::Ints(v) => Some(v.as_slice()),
-            _ => None,
-        })
-}
-
-fn get_param_rgb(params: &[pbrt_parser::Param], name: &str) -> Option<[f32; 3]> {
-    // Check for "rgb" typed param or "spectrum" with floats
-    params
-        .iter()
-        .find(|p| p.name == name)
-        .and_then(|p| match &p.value {
-            ParamValue::Floats(v) if v.len() >= 3 => Some([v[0] as f32, v[1] as f32, v[2] as f32]),
-            _ => None,
-        })
-}
-
-fn get_param_texture_ref<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a str> {
-    params
-        .iter()
-        .find(|p| p.name == name && p.ty == ParamType::Texture)
-        .and_then(|p| match &p.value {
-            ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
-            _ => None,
-        })
-}
-
-fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
-    // Approximate blackbody color (Tanner Helland approximation)
-    let temp = kelvin / 100.0;
-    let r = if temp <= 66.0 {
-        1.0
-    } else {
-        let x = temp - 60.0;
-        (329.699_f32 * x.powf(-0.13320_f32) / 255.0).clamp(0.0, 1.0)
-    };
-    let g = if temp <= 66.0 {
-        let x = temp;
-        (99.4708_f32 * x.ln() - 161.1196_f32) / 255.0
-    } else {
-        let x = temp - 60.0;
-        288.1222_f32 * x.powf(-0.07551_f32) / 255.0
+fn find_optix_include() -> String {
+    if let Ok(root) = std::env::var("OPTIX_ROOT") {
+        return format!("{root}/include");
     }
-    .clamp(0.0, 1.0);
-    let b = if temp >= 66.0 {
-        1.0
-    } else if temp <= 19.0 {
-        0.0
-    } else {
-        let x = temp - 10.0;
-        (138.5177_f32 * x.ln() - 305.0448_f32) / 255.0
-    }
-    .clamp(0.0, 1.0);
-    [r, g, b]
-}
-
-fn identity_transform() -> [f32; 12] {
-    [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
-}
-
-/// Multiply two 3x4 row-major transforms: result = a * b
-fn mul_transform(a: &[f32; 12], b: &[f32; 12]) -> [f32; 12] {
-    let mut r = [0.0f32; 12];
-    for i in 0..3 {
-        for j in 0..4 {
-            let mut sum = 0.0;
-            for k in 0..3 {
-                sum += a[i * 4 + k] * b[k * 4 + j];
-            }
-            if j == 3 {
-                sum += a[i * 4 + 3];
-            }
-            r[i * 4 + j] = sum;
+    #[cfg(target_os = "windows")]
+    {
+        let default = r"C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.0.0\include";
+        if std::path::Path::new(default).exists() {
+            return default.to_string();
         }
     }
-    r
-}
-
-fn translate_matrix(tx: f32, ty: f32, tz: f32) -> [f32; 12] {
-    [1.0, 0.0, 0.0, tx, 0.0, 1.0, 0.0, ty, 0.0, 0.0, 1.0, tz]
-}
-
-fn scale_matrix(sx: f32, sy: f32, sz: f32) -> [f32; 12] {
-    [sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, sz, 0.0]
-}
-
-fn rotate_matrix(angle_deg: f32, ax: f32, ay: f32, az: f32) -> [f32; 12] {
-    let angle = angle_deg.to_radians();
-    let c = angle.cos();
-    let s = angle.sin();
-    let len = (ax * ax + ay * ay + az * az).sqrt();
-    let (x, y, z) = (ax / len, ay / len, az / len);
-    let t = 1.0 - c;
-    [
-        t * x * x + c,     t * x * y - s * z, t * x * z + s * y, 0.0,
-        t * x * y + s * z, t * y * y + c,     t * y * z - s * x, 0.0,
-        t * x * z - s * y, t * y * z + s * x, t * z * z + c,     0.0,
-    ]
-}
-
-fn parse_scene(input: &str, scene_dir: &std::path::Path) -> ParsedScene {
-    let scene = pbrt_parser::parse(input).expect("Failed to parse PBRT scene");
-
-    let mut parsed = ParsedScene {
-        width: 400,
-        height: 400,
-        fov: 90.0,
-        cam_eye: [0.0, 0.0, 0.0],
-        cam_look: [0.0, 0.0, -1.0],
-        cam_up: [0.0, 1.0, 0.0],
-        spp: 16,
-        max_depth: 5,
-        ambient_light: [0.0; 3],
-        distant_lights: Vec::new(),
-        sphere_lights: Vec::new(),
-        objects: Vec::new(),
-        filename: "output.png".to_string(),
-    };
-
-    // Texture storage (name -> checkerboard params)
-    struct CheckerTex {
-        scale_u: f32,
-        scale_v: f32,
-        color1: [f32; 3],
-        color2: [f32; 3],
+    #[cfg(target_os = "linux")]
+    {
+        let default = "/usr/local/NVIDIA-OptiX-SDK-9.0.0/include";
+        if std::path::Path::new(default).exists() {
+            return default.to_string();
+        }
     }
-    let mut textures = std::collections::HashMap::<String, CheckerTex>::new();
+    panic!("OptiX SDK not found. Set OPTIX_ROOT.");
+}
 
-    let mut current_material = SceneMaterial::default();
-    let mut current_transform = identity_transform();
-    let mut transform_stack: Vec<([f32; 12], SceneMaterial)> = Vec::new();
-
-    for directive in &scene.directives {
-        match directive {
-            Directive::Film { params, .. } => {
-                if let Some(v) = get_param_ints(params, "xresolution") {
-                    parsed.width = v[0] as u32;
-                }
-                if let Some(v) = get_param_ints(params, "yresolution") {
-                    parsed.height = v[0] as u32;
-                }
-                if let Some(s) = get_param_string(params, "filename") {
-                    parsed.filename = s.to_string();
-                }
-            }
-            Directive::Camera { params, .. } => {
-                if let Some(f) = get_param_float(params, "fov") {
-                    parsed.fov = f;
-                }
-            }
-            Directive::LookAt { eye, look, up } => {
-                parsed.cam_eye = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
-                parsed.cam_look = [look[0] as f32, look[1] as f32, look[2] as f32];
-                parsed.cam_up = [up[0] as f32, up[1] as f32, up[2] as f32];
-            }
-            Directive::Sampler { params, .. } => {
-                if let Some(v) = get_param_ints(params, "pixelsamples") {
-                    parsed.spp = v[0] as u32;
-                }
-            }
-            Directive::Integrator { params, .. } => {
-                if let Some(v) = get_param_ints(params, "maxdepth") {
-                    parsed.max_depth = v[0] as u32;
-                }
-            }
-            Directive::WorldBegin => {
-                current_transform = identity_transform();
-            }
-            Directive::AttributeBegin => {
-                transform_stack.push((current_transform, current_material.clone()));
-            }
-            Directive::AttributeEnd => {
-                if let Some((t, m)) = transform_stack.pop() {
-                    current_transform = t;
-                    current_material = m;
-                }
-            }
-            Directive::Translate { v } => {
-                let t = translate_matrix(v[0] as f32, v[1] as f32, v[2] as f32);
-                current_transform = mul_transform(&current_transform, &t);
-            }
-            Directive::Scale { v } => {
-                let s = scale_matrix(v[0] as f32, v[1] as f32, v[2] as f32);
-                current_transform = mul_transform(&current_transform, &s);
-            }
-            Directive::Rotate { angle, axis } => {
-                let r = rotate_matrix(*angle as f32, axis[0] as f32, axis[1] as f32, axis[2] as f32);
-                current_transform = mul_transform(&current_transform, &r);
-            }
-            Directive::Identity => {
-                current_transform = identity_transform();
-            }
-            Directive::LightSource { ty, params } => {
-                match ty.as_str() {
-                    "infinite" => {
-                        if let Some(c) = get_param_rgb(params, "L") {
-                            parsed.ambient_light = c;
-                        }
-                    }
-                    "distant" => {
-                        let from = get_param_floats(params, "from")
-                            .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
-                            .unwrap_or([0.0, 0.0, 1.0]);
-                        let to = get_param_floats(params, "to")
-                            .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
-                            .unwrap_or([0.0, 0.0, 0.0]);
-                        let dir = {
-                            let dx = from[0] - to[0];
-                            let dy = from[1] - to[1];
-                            let dz = from[2] - to[2];
-                            let len = (dx * dx + dy * dy + dz * dz).sqrt();
-                            [dx / len, dy / len, dz / len]
-                        };
-                        // Check for blackbody or RGB emission
-                        let mut emission = get_param_rgb(params, "L").unwrap_or([1.0, 1.0, 1.0]);
-                        // Check for blackbody L
-                        if let Some(p) = params
-                            .iter()
-                            .find(|p| p.name == "L" && p.ty == ParamType::Blackbody)
-                        {
-                            if let ParamValue::Floats(v) = &p.value {
-                                if let Some(&k) = v.first() {
-                                    emission = blackbody_to_rgb(k as f32);
-                                }
-                            }
-                        }
-                        let scale = get_param_float(params, "scale").unwrap_or(1.0);
-                        emission[0] *= scale;
-                        emission[1] *= scale;
-                        emission[2] *= scale;
-                        parsed.distant_lights.push(DistantLight {
-                            direction: dir,
-                            emission,
-                        });
-                    }
-                    _ => eprintln!("Unsupported light type: {ty}"),
-                }
-            }
-            Directive::Material { ty, params } => {
-                current_material = SceneMaterial::default();
-                match ty.as_str() {
-                    "diffuse" => {
-                        current_material.material_type = MAT_DIFFUSE;
-                        if let Some(c) = get_param_rgb(params, "reflectance") {
-                            current_material.albedo = c;
-                        }
-                        // Check for texture reference
-                        if let Some(tex_name) = get_param_texture_ref(params, "reflectance") {
-                            if let Some(tex) = textures.get(tex_name) {
-                                current_material.has_checkerboard = true;
-                                current_material.checker_scale_u = tex.scale_u;
-                                current_material.checker_scale_v = tex.scale_v;
-                                current_material.checker_color1 = tex.color1;
-                                current_material.checker_color2 = tex.color2;
-                            }
-                        }
-                    }
-                    "coateddiffuse" | "coatedconductor" => {
-                        current_material.material_type = MAT_DIFFUSE;
-                        if let Some(c) = get_param_rgb(params, "reflectance") {
-                            current_material.albedo = c;
-                        }
-                    }
-                    "conductor" => {
-                        // Approximate as slightly reflective diffuse
-                        current_material.material_type = MAT_DIFFUSE;
-                        if let Some(c) = get_param_rgb(params, "reflectance") {
-                            current_material.albedo = c;
-                        }
-                    }
-                    "dielectric" | "thindielectric" => {
-                        current_material.material_type = MAT_DIELECTRIC;
-                        current_material.eta = get_param_float(params, "eta").unwrap_or(1.5);
-                    }
-                    _ => eprintln!("Unsupported material type: {ty}"),
-                }
-            }
-            Directive::Texture {
-                name,
-                class,
-                params,
-                ..
-            } => {
-                if class == "checkerboard" {
-                    let scale_u = get_param_float(params, "uscale").unwrap_or(1.0);
-                    let scale_v = get_param_float(params, "vscale").unwrap_or(1.0);
-                    let color1 = get_param_rgb(params, "tex1").unwrap_or([1.0, 1.0, 1.0]);
-                    let color2 = get_param_rgb(params, "tex2").unwrap_or([0.0, 0.0, 0.0]);
-                    textures.insert(
-                        name.clone(),
-                        CheckerTex {
-                            scale_u,
-                            scale_v,
-                            color1,
-                            color2,
-                        },
-                    );
-                }
-            }
-            Directive::Shape { ty, params } => {
-                let shape = match ty.as_str() {
-                    "sphere" => {
-                        let radius = get_param_float(params, "radius").unwrap_or(1.0);
-                        SceneShape::Sphere { radius }
-                    }
-                    "trianglemesh" => {
-                        let verts: Vec<f32> = get_param_floats(params, "P")
-                            .map(|v| v.iter().map(|x| *x as f32).collect())
-                            .unwrap_or_default();
-                        let indices: Vec<i32> = get_param_ints(params, "indices")
-                            .map(|v| v.iter().map(|x| *x as i32).collect())
-                            .unwrap_or_default();
-                        let texcoords: Vec<f32> = get_param_floats(params, "uv")
-                            .map(|v| v.iter().map(|x| *x as f32).collect())
-                            .unwrap_or_default();
-                        SceneShape::TriangleMesh {
-                            vertices: verts,
-                            indices,
-                            texcoords,
-                        }
-                    }
-                    "bilinearmesh" => {
-                        // Convert bilinear patch (4 vertices) to 2 triangles.
-                        // PBRT vertex order: P0=bottom-left, P1=bottom-right,
-                        // P2=top-left, P3=top-right with parametric (s,t):
-                        // P0=(0,0), P1=(1,0), P2=(0,1), P3=(1,1).
-                        // Use parametric coords as UVs for correct linear
-                        // interpolation on the triangulated patch.
-                        let verts: Vec<f32> = get_param_floats(params, "P")
-                            .map(|v| v.iter().map(|x| *x as f32).collect())
-                            .unwrap_or_default();
-                        let texcoords: Vec<f32> = if get_param_floats(params, "uv").is_some() {
-                            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]
-                        } else {
-                            Vec::new()
-                        };
-                        let indices = vec![0, 1, 3, 0, 3, 2];
-                        SceneShape::TriangleMesh {
-                            vertices: verts,
-                            indices,
-                            texcoords,
-                        }
-                    }
-                    "loopsubdiv" | "plymesh" => {
-                        // Treat as triangle mesh (skip subdivision)
-                        let verts: Vec<f32> = get_param_floats(params, "P")
-                            .map(|v| v.iter().map(|x| *x as f32).collect())
-                            .unwrap_or_default();
-                        let indices: Vec<i32> = get_param_ints(params, "indices")
-                            .map(|v| v.iter().map(|x| *x as i32).collect())
-                            .unwrap_or_default();
-                        SceneShape::TriangleMesh {
-                            vertices: verts,
-                            indices,
-                            texcoords: Vec::new(),
-                        }
-                    }
-                    _ => {
-                        eprintln!("Unsupported shape type: {ty}");
-                        continue;
-                    }
-                };
-                // Register sphere area lights for NEE
-                let em = current_material.emission;
-                if em[0] > 0.0 || em[1] > 0.0 || em[2] > 0.0 {
-                    if let SceneShape::Sphere { radius } = &shape {
-                        // Compute world-space center from transform
-                        let t = &current_transform;
-                        let center = [t[3], t[7], t[11]];
-                        parsed.sphere_lights.push(SphereLight {
-                            center,
-                            radius: *radius,
-                            emission: em,
-                            _pad: 0.0,
-                        });
-                    }
-                }
-                parsed.objects.push(SceneObject {
-                    shape,
-                    material: current_material.clone(),
-                    transform: current_transform,
-                });
-            }
-            Directive::AreaLightSource { ty, params } => {
-                // Store area light emission for the next shape
-                if ty == "diffuse" {
-                    if let Some(c) = get_param_rgb(params, "L") {
-                        current_material.emission = c;
-                    }
-                }
-            }
-            Directive::Include(path) => {
-                let include_path = scene_dir.join(path);
-                match std::fs::read_to_string(&include_path) {
-                    Ok(content) => {
-                        let included = pbrt_parser::parse(&content)
-                            .expect(&format!("Failed to parse included file: {}", include_path.display()));
-                        // Process included directives with current state
-                        for inc_directive in &included.directives {
-                            // Only handle Shape directives from includes
-                            if let Directive::Shape { ty, params } = inc_directive {
-                                let shape = match ty.as_str() {
-                                    "trianglemesh" | "loopsubdiv" => {
-                                        let verts: Vec<f32> = get_param_floats(params, "P")
-                                            .map(|v| v.iter().map(|x| *x as f32).collect())
-                                            .unwrap_or_default();
-                                        let indices: Vec<i32> = get_param_ints(params, "indices")
-                                            .map(|v| v.iter().map(|x| *x as i32).collect())
-                                            .unwrap_or_default();
-                                        let texcoords: Vec<f32> = get_param_floats(params, "uv")
-                                            .map(|v| v.iter().map(|x| *x as f32).collect())
-                                            .unwrap_or_default();
-                                        SceneShape::TriangleMesh { vertices: verts, indices, texcoords }
-                                    }
-                                    "sphere" => {
-                                        SceneShape::Sphere { radius: get_param_float(params, "radius").unwrap_or(1.0) }
-                                    }
-                                    _ => continue,
-                                };
-                                parsed.objects.push(SceneObject {
-                                    shape,
-                                    material: current_material.clone(),
-                                    transform: current_transform,
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("Failed to include {}: {e}", include_path.display()),
-                }
-            }
-            _ => {}
+fn save_image(path: &str, width: u32, height: u32, pixels: &[u32]) -> Result<()> {
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for y in (0..height).rev() {
+        for x in 0..width {
+            let pixel = pixels[(y * width + x) as usize];
+            rgb.push((pixel & 0xFF) as u8);
+            rgb.push(((pixel >> 8) & 0xFF) as u8);
+            rgb.push(((pixel >> 16) & 0xFF) as u8);
         }
     }
 
-    parsed
-}
-
-impl Clone for SceneMaterial {
-    fn clone(&self) -> Self {
-        Self { ..*self }
+    if path.ends_with(".ppm") {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path).context("Failed to create output file")?;
+        write!(file, "P6\n{width} {height}\n255\n")?;
+        file.write_all(&rgb)?;
+    } else {
+        let file = std::fs::File::create(path).context("Failed to create output file")?;
+        let w = std::io::BufWriter::new(file);
+        let mut encoder = png::Encoder::new(w, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().context("Failed to write PNG header")?;
+        writer.write_image_data(&rgb).context("Failed to write PNG data")?;
     }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -707,31 +191,16 @@ fn main() -> Result<()> {
         .unwrap_or(std::path::Path::new("."));
     let mut scene = parse_scene(&input, scene_dir);
 
-    // Apply CLI overrides
-    if let Some(spp) = cli.spp {
-        scene.spp = spp;
-    }
-    if let Some(depth) = cli.depth {
-        scene.max_depth = depth;
-    }
-    if let Some(w) = cli.width {
-        scene.width = w;
-    }
-    if let Some(h) = cli.height {
-        scene.height = h;
-    }
-    if let Some(ref o) = cli.output {
-        scene.filename = o.clone();
-    }
+    if let Some(spp) = cli.spp { scene.spp = spp; }
+    if let Some(depth) = cli.depth { scene.max_depth = depth; }
+    if let Some(w) = cli.width { scene.width = w; }
+    if let Some(h) = cli.height { scene.height = h; }
+    if let Some(ref o) = cli.output { scene.filename = o.clone(); }
 
     println!(
         "Scene: {}x{}, {} spp, {} objects, {} distant lights, {} sphere lights",
-        scene.width,
-        scene.height,
-        scene.spp,
-        scene.objects.len(),
-        scene.distant_lights.len(),
-        scene.sphere_lights.len()
+        scene.width, scene.height, scene.spp,
+        scene.objects.len(), scene.distant_lights.len(), scene.sphere_lights.len()
     );
 
     // --- CUDA / OptiX init ---
@@ -762,7 +231,6 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    // NVRTC doesn't support #include for local files easily, so inline the header
     let full_src = format!(
         "// Inlined devicecode.h\n{}\n// devicecode.cu\n{}",
         header_src,
@@ -775,10 +243,7 @@ fn main() -> Result<()> {
     let ptx_src = ptx.to_src();
 
     // --- OptiX pipeline ---
-    let has_spheres = scene
-        .objects
-        .iter()
-        .any(|o| matches!(o.shape, SceneShape::Sphere { .. }));
+    let has_spheres = scene.objects.iter().any(|o| matches!(o.shape, SceneShape::Sphere { .. }));
 
     let mut prim_flags = PrimitiveTypeFlags::TRIANGLE;
     if has_spheres {
@@ -800,7 +265,6 @@ fn main() -> Result<()> {
         .context("module")?
         .value;
 
-    // Get built-in sphere intersection module if needed
     let sphere_is_module = if has_spheres {
         Some(
             Module::builtin_is(&ctx, &module_opts, &pipeline_options, PrimitiveType::Sphere)
@@ -810,12 +274,8 @@ fn main() -> Result<()> {
         None
     };
 
-    let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg")
-        .context("raygen")?
-        .value;
-    let miss_pg = ProgramGroup::miss(&ctx, &module, "__miss__ms")
-        .context("miss")?
-        .value;
+    let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg").context("raygen")?.value;
+    let miss_pg = ProgramGroup::miss(&ctx, &module, "__miss__ms").context("miss")?.value;
 
     let hitgroup_tri_pg = ProgramGroup::hitgroup(&ctx)
         .closest_hit(&module, "__closesthit__ch")
@@ -844,9 +304,7 @@ fn main() -> Result<()> {
     let pipeline = Pipeline::new(
         &ctx,
         &pipeline_options,
-        &PipelineLinkOptions {
-            max_trace_depth: scene.max_depth,
-        },
+        &PipelineLinkOptions { max_trace_depth: scene.max_depth },
         &all_pgs,
     )
     .context("pipeline")?
@@ -855,7 +313,6 @@ fn main() -> Result<()> {
     pipeline.set_stack_size(2048, 2048, 2048, max_graph_depth)?;
 
     // --- Build geometry ---
-    // Separate GASes for triangles and spheres (OptiX requires same prim type per GAS)
     let mut _device_buffers: Vec<CudaSlice<u8>> = Vec::new();
 
     struct GasEntry {
@@ -876,7 +333,6 @@ fn main() -> Result<()> {
     for obj in &scene.objects {
         match &obj.shape {
             SceneShape::Sphere { radius } => {
-                // Single sphere: center at origin (transform applied via IAS instance)
                 let center = [0.0f32, 0.0, 0.0];
                 let radius_val = [*radius];
 
@@ -904,14 +360,9 @@ fn main() -> Result<()> {
                 let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
                 let handle = accel::accel_build(
-                    &ctx,
-                    cu_stream,
-                    &build_options,
-                    &bi,
-                    dptr(&d_temp, &stream),
-                    sizes.temp_size,
-                    dptr(&d_output, &stream),
-                    sizes.output_size,
+                    &ctx, cu_stream, &build_options, &bi,
+                    dptr(&d_temp, &stream), sizes.temp_size,
+                    dptr(&d_output, &stream), sizes.output_size,
                 )
                 .context("sphere accel build")?;
 
@@ -921,28 +372,18 @@ fn main() -> Result<()> {
                     eta: obj.material.eta,
                     emission: obj.material.emission,
                     has_checkerboard: 0,
-                    checker_scale_u: 0.0,
-                    checker_scale_v: 0.0,
-                    checker_color1: [0.0; 3],
-                    checker_color2: [0.0; 3],
-                    texcoords: 0,
-                    normals: 0,
-                    indices: 0,
-                    vertices: 0,
-                    num_vertices: 0,
+                    checker_scale_u: 0.0, checker_scale_v: 0.0,
+                    checker_color1: [0.0; 3], checker_color2: [0.0; 3],
+                    texcoords: 0, normals: 0, indices: 0, vertices: 0, num_vertices: 0,
                 };
 
                 let sbt_offset = sphere_hg_records.len() as u32;
-                sphere_hg_records.push(SbtRecord::new(
-                    hitgroup_sphere_pg.as_ref().context("no sphere hitgroup")?,
-                    hg_data,
-                )?);
+                sphere_hg_records.push(
+                    SbtRecord::new(hitgroup_sphere_pg.as_ref().context("no sphere hitgroup")?, hg_data)?,
+                );
 
                 gas_entries.push(GasEntry {
-                    handle,
-                    sbt_offset,
-                    transform: obj.transform,
-                    is_sphere: true,
+                    handle, sbt_offset, transform: obj.transform, is_sphere: true,
                 });
 
                 _device_buffers.push(unsafe { std::mem::transmute(d_center) });
@@ -950,12 +391,8 @@ fn main() -> Result<()> {
                 _device_buffers.push(d_temp);
                 _device_buffers.push(d_output);
             }
-            SceneShape::TriangleMesh {
-                vertices,
-                indices,
-                texcoords,
-            } => {
-                let transformed = transform_vertices(vertices, &obj.transform);
+            SceneShape::TriangleMesh { vertices, indices, texcoords } => {
+                let transformed = scene::transform_vertices(vertices, &obj.transform);
                 let d_verts = stream.clone_htod(&transformed).cuda()?;
                 let d_indices: CudaSlice<i32> = stream.clone_htod(indices).cuda()?;
                 let d_tc = if !texcoords.is_empty() {
@@ -973,17 +410,12 @@ fn main() -> Result<()> {
                 let num_tris = indices.len() as u32 / 3;
 
                 let tri_input = TriangleArrayInput::new(
-                    &vert_ptrs,
-                    num_verts,
-                    VertexFormat::Float3,
-                    3 * mem::size_of::<f32>() as u32,
-                    &flags,
+                    &vert_ptrs, num_verts, VertexFormat::Float3,
+                    3 * mem::size_of::<f32>() as u32, &flags,
                 )
                 .with_indices(
-                    dptr(&d_indices, &stream),
-                    num_tris,
-                    IndicesFormat::UnsignedInt3,
-                    3 * mem::size_of::<i32>() as u32,
+                    dptr(&d_indices, &stream), num_tris,
+                    IndicesFormat::UnsignedInt3, 3 * mem::size_of::<i32>() as u32,
                 );
 
                 let bi = [BuildInput::Triangles(tri_input)];
@@ -993,14 +425,9 @@ fn main() -> Result<()> {
                 let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
                 let handle = accel::accel_build(
-                    &ctx,
-                    cu_stream,
-                    &build_options,
-                    &bi,
-                    dptr(&d_temp, &stream),
-                    sizes.temp_size,
-                    dptr(&d_output, &stream),
-                    sizes.output_size,
+                    &ctx, cu_stream, &build_options, &bi,
+                    dptr(&d_temp, &stream), sizes.temp_size,
+                    dptr(&d_output, &stream), sizes.output_size,
                 )
                 .context("tri accel build")?;
 
@@ -1025,9 +452,8 @@ fn main() -> Result<()> {
                 tri_hg_records.push(SbtRecord::new(&hitgroup_tri_pg, hg_data)?);
 
                 gas_entries.push(GasEntry {
-                    handle,
-                    sbt_offset,
-                    transform: identity_transform(), // vertices already pre-transformed
+                    handle, sbt_offset,
+                    transform: scene::identity_transform(),
                     is_sphere: false,
                 });
 
@@ -1041,11 +467,9 @@ fn main() -> Result<()> {
 
     stream.synchronize().cuda()?;
 
-    // --- Build IAS (or use single GAS if no spheres) ---
+    // --- Build IAS or use single GAS ---
     let traversable = if has_spheres {
-        // SBT layout: [tri_hg_records..., sphere_hg_records...]
         let sphere_sbt_base = tri_hg_records.len() as u32;
-
         let instances: Vec<optix_sys::OptixInstance> = gas_entries
             .iter()
             .enumerate()
@@ -1055,7 +479,7 @@ fn main() -> Result<()> {
                 } else {
                     entry.sbt_offset
                 };
-                let inst = optix_sys::OptixInstance {
+                optix_sys::OptixInstance {
                     transform: entry.transform,
                     instanceId: i as u32,
                     sbtOffset: sbt_offset,
@@ -1063,13 +487,11 @@ fn main() -> Result<()> {
                     flags: optix_sys::OptixInstanceFlags::OPTIX_INSTANCE_FLAG_NONE.0 as u32,
                     traversableHandle: entry.handle,
                     pad: [0; 2],
-                };
-                inst
+                }
             })
             .collect();
 
         let d_instances = alloc_and_copy_slice(&stream, &instances)?;
-
         let ias_input = [BuildInput::Instances(accel::InstanceArrayInput {
             instances: d_instances,
             num_instances: instances.len() as u32,
@@ -1081,41 +503,30 @@ fn main() -> Result<()> {
         let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
         let ias_handle = accel::accel_build(
-            &ctx,
-            cu_stream,
-            &build_options,
-            &ias_input,
-            dptr(&d_temp, &stream),
-            sizes.temp_size,
-            dptr(&d_output, &stream),
-            sizes.output_size,
+            &ctx, cu_stream, &build_options, &ias_input,
+            dptr(&d_temp, &stream), sizes.temp_size,
+            dptr(&d_output, &stream), sizes.output_size,
         )
         .context("IAS build")?;
         stream.synchronize().cuda()?;
-
         _device_buffers.push(d_temp);
         _device_buffers.push(d_output);
-
         ias_handle
-    } else {
+    } else if !gas_entries.is_empty() {
         gas_entries[0].handle
+    } else {
+        anyhow::bail!("No geometry in scene");
     };
 
     // --- SBT ---
     let raygen_record = SbtRecord::new(&raygen_pg, RayGenData {})?;
-    let miss_record = SbtRecord::new(
-        &miss_pg,
-        MissData {
-            bg_color: [0.0, 0.0, 0.0],
-        },
-    )?;
+    let miss_record = SbtRecord::new(&miss_pg, MissData { bg_color: [0.0, 0.0, 0.0] })?;
 
     let d_rg = alloc_and_copy(&stream, &raygen_record)?;
     let d_ms = alloc_and_copy(&stream, &miss_record)?;
 
-    // Hitgroup records: triangles first, then spheres
-    let mut all_hg_records: Vec<u8> = Vec::new();
     let hg_stride = mem::size_of::<SbtRecord<HitGroupData>>();
+    let mut all_hg_records: Vec<u8> = Vec::new();
     for rec in &tri_hg_records {
         let bytes = unsafe { std::slice::from_raw_parts(rec as *const _ as *const u8, hg_stride) };
         all_hg_records.extend_from_slice(bytes);
@@ -1133,41 +544,26 @@ fn main() -> Result<()> {
         .build()
         .context("SBT")?;
 
-    // --- Camera ---
+    // --- Camera & lights ---
     let (cam_u, cam_v, cam_w) = compute_camera(
-        &scene.cam_eye,
-        &scene.cam_look,
-        &scene.cam_up,
-        scene.fov,
-        scene.width as f32 / scene.height as f32,
+        &scene.cam_eye, &scene.cam_look, &scene.cam_up,
+        scene.fov, scene.width as f32 / scene.height as f32,
     );
 
-    // --- Lights on device ---
-    let d_distant_lights = if scene.distant_lights.is_empty() {
-        0
-    } else {
-        alloc_and_copy_slice(&stream, &scene.distant_lights)?
-    };
-    let d_sphere_lights = if scene.sphere_lights.is_empty() {
-        0
-    } else {
-        alloc_and_copy_slice(&stream, &scene.sphere_lights)?
-    };
+    let d_distant_lights = if scene.distant_lights.is_empty() { 0 }
+        else { alloc_and_copy_slice(&stream, &scene.distant_lights)? };
+    let d_sphere_lights = if scene.sphere_lights.is_empty() { 0 }
+        else { alloc_and_copy_slice(&stream, &scene.sphere_lights)? };
 
-    // --- Output image ---
+    // --- Launch ---
     let pixel_count = (scene.width * scene.height) as usize;
     let d_image: CudaSlice<u32> = stream.alloc_zeros(pixel_count).cuda()?;
 
     let launch_params = LaunchParams {
         image: dptr(&d_image, &stream),
-        width: scene.width,
-        height: scene.height,
-        samples_per_pixel: scene.spp,
-        max_depth: scene.max_depth,
-        cam_eye: scene.cam_eye,
-        cam_u,
-        cam_v,
-        cam_w,
+        width: scene.width, height: scene.height,
+        samples_per_pixel: scene.spp, max_depth: scene.max_depth,
+        cam_eye: scene.cam_eye, cam_u, cam_v, cam_w,
         traversable,
         ambient_light: scene.ambient_light,
         num_distant_lights: scene.distant_lights.len() as i32,
@@ -1177,25 +573,13 @@ fn main() -> Result<()> {
     };
     let d_params = alloc_and_copy(&stream, &launch_params)?;
 
-    // --- Launch ---
-    println!(
-        "Rendering {}x{} @ {} spp...",
-        scene.width, scene.height, scene.spp
-    );
+    println!("Rendering {}x{} @ {} spp...", scene.width, scene.height, scene.spp);
     pipeline
-        .launch(
-            cu_stream,
-            d_params,
-            mem::size_of::<LaunchParams>(),
-            &sbt,
-            scene.width,
-            scene.height,
-            1,
-        )
+        .launch(cu_stream, d_params, mem::size_of::<LaunchParams>(), &sbt,
+            scene.width, scene.height, 1)
         .context("launch")?;
     stream.synchronize().cuda()?;
 
-    // --- Download and save ---
     let pixels = stream.clone_dtoh(&d_image).cuda()?;
 
     let mut output_file = scene.filename.replace(".exr", ".png");
@@ -1204,111 +588,6 @@ fn main() -> Result<()> {
     }
     save_image(&output_file, scene.width, scene.height, &pixels)?;
     println!("Saved {output_file}");
-
-    Ok(())
-}
-
-fn compute_camera(
-    eye: &[f32; 3],
-    look: &[f32; 3],
-    up: &[f32; 3],
-    fov: f32,
-    aspect: f32,
-) -> ([f32; 3], [f32; 3], [f32; 3]) {
-    let w = [look[0] - eye[0], look[1] - eye[1], look[2] - eye[2]];
-    let wlen = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
-    let w = [w[0] / wlen, w[1] / wlen, w[2] / wlen];
-
-    // u = normalize(cross(up, w)) = camera right
-    let u = [
-        up[1] * w[2] - up[2] * w[1],
-        up[2] * w[0] - up[0] * w[2],
-        up[0] * w[1] - up[1] * w[0],
-    ];
-    let ulen = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
-    let u = [u[0] / ulen, u[1] / ulen, u[2] / ulen];
-
-    // v = cross(w, u) = camera up
-    let v = [
-        w[1] * u[2] - w[2] * u[1],
-        w[2] * u[0] - w[0] * u[2],
-        w[0] * u[1] - w[1] * u[0],
-    ];
-
-    let half_h = (fov.to_radians() * 0.5).tan();
-    let half_w = aspect * half_h;
-
-    let cam_u = [u[0] * half_w, u[1] * half_w, u[2] * half_w];
-    let cam_v = [v[0] * half_h, v[1] * half_h, v[2] * half_h];
-    let cam_w = w;
-
-    (cam_u, cam_v, cam_w)
-}
-
-fn transform_vertices(verts: &[f32], t: &[f32; 12]) -> Vec<f32> {
-    let mut result = Vec::with_capacity(verts.len());
-    for i in (0..verts.len()).step_by(3) {
-        let x = verts[i];
-        let y = verts[i + 1];
-        let z = verts[i + 2];
-        result.push(t[0] * x + t[1] * y + t[2] * z + t[3]);
-        result.push(t[4] * x + t[5] * y + t[6] * z + t[7]);
-        result.push(t[8] * x + t[9] * y + t[10] * z + t[11]);
-    }
-    result
-}
-
-fn find_optix_include() -> String {
-    if let Ok(root) = std::env::var("OPTIX_ROOT") {
-        return format!("{root}/include");
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let default = r"C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.0.0\include";
-        if std::path::Path::new(default).exists() {
-            return default.to_string();
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let default = "/usr/local/NVIDIA-OptiX-SDK-9.0.0/include";
-        if std::path::Path::new(default).exists() {
-            return default.to_string();
-        }
-    }
-    panic!("OptiX SDK not found. Set OPTIX_ROOT.");
-}
-
-fn save_image(path: &str, width: u32, height: u32, pixels: &[u32]) -> Result<()> {
-    // Convert ABGR packed pixels to RGB bytes (flipped vertically)
-    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    for y in (0..height).rev() {
-        for x in 0..width {
-            let pixel = pixels[(y * width + x) as usize];
-            rgb.push((pixel & 0xFF) as u8);
-            rgb.push(((pixel >> 8) & 0xFF) as u8);
-            rgb.push(((pixel >> 16) & 0xFF) as u8);
-        }
-    }
-
-    if path.ends_with(".ppm") {
-        use std::io::Write;
-        let mut file = std::fs::File::create(path).context("Failed to create output file")?;
-        write!(file, "P6\n{width} {height}\n255\n")?;
-        file.write_all(&rgb)?;
-    } else {
-        let file = std::fs::File::create(path).context("Failed to create output file")?;
-        let w = std::io::BufWriter::new(file);
-        let mut encoder = png::Encoder::new(w, width, height);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .context("Failed to write PNG header")?;
-        writer
-            .write_image_data(&rgb)
-            .context("Failed to write PNG data")?;
-    }
 
     Ok(())
 }

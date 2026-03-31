@@ -1,0 +1,70 @@
+//! GPU struct types shared between host and device code.
+//! Must match `devicecode.h` layout exactly.
+
+pub const MAT_DIFFUSE: i32 = 0;
+pub const MAT_DIELECTRIC: i32 = 1;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DistantLight {
+    pub direction: [f32; 3],
+    pub emission: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SphereLight {
+    pub center: [f32; 3],
+    pub radius: f32,
+    pub emission: [f32; 3],
+    pub _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct LaunchParams {
+    pub image: optix_sys::CUdeviceptr,
+    pub width: u32,
+    pub height: u32,
+    pub samples_per_pixel: u32,
+    pub max_depth: u32,
+    pub cam_eye: [f32; 3],
+    pub cam_u: [f32; 3],
+    pub cam_v: [f32; 3],
+    pub cam_w: [f32; 3],
+    pub traversable: optix_sys::OptixTraversableHandle,
+    pub ambient_light: [f32; 3],
+    pub num_distant_lights: i32,
+    pub distant_lights: optix_sys::CUdeviceptr,
+    pub num_sphere_lights: i32,
+    pub sphere_lights: optix_sys::CUdeviceptr,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RayGenData {}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct MissData {
+    pub bg_color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct HitGroupData {
+    pub material_type: i32,
+    pub albedo: [f32; 3],
+    pub eta: f32,
+    pub emission: [f32; 3],
+    pub has_checkerboard: i32,
+    pub checker_scale_u: f32,
+    pub checker_scale_v: f32,
+    pub checker_color1: [f32; 3],
+    pub checker_color2: [f32; 3],
+    pub texcoords: optix_sys::CUdeviceptr,
+    pub normals: optix_sys::CUdeviceptr,
+    pub indices: optix_sys::CUdeviceptr,
+    pub vertices: optix_sys::CUdeviceptr,
+    pub num_vertices: i32,
+}
