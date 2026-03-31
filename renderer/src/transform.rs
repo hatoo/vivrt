@@ -65,9 +65,3 @@ pub fn transform_vertices(verts: &[f32], t: &[f32; 12]) -> Vec<f32> {
     }
     result
 }
-
-/// Determinant of the 3x3 rotation part.
-pub fn det3x3(t: &[f32; 12]) -> f32 {
-    t[0] * (t[5] * t[10] - t[6] * t[9]) - t[1] * (t[4] * t[10] - t[6] * t[8])
-        + t[2] * (t[4] * t[9] - t[5] * t[8])
-}

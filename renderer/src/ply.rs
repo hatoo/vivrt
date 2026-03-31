@@ -17,7 +17,7 @@ pub fn load(path: &Path) -> Option<PlyMesh> {
         .unwrap_or_else(|e| panic!("Failed to open PLY file {}: {e}", path.display()));
 
     let buf_file = std::io::BufReader::new(file);
-    let reader: Box<dyn Read> = if path.extension().map_or(false, |e| e == "gz")
+    let reader: Box<dyn Read> = if path.extension().is_some_and(|e| e == "gz")
         || path.to_string_lossy().contains(".ply.gz")
     {
         Box::new(flate2::read::GzDecoder::new(buf_file))

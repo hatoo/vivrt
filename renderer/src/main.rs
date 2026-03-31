@@ -1,3 +1,5 @@
+#![allow(clippy::missing_transmute_annotations)]
+
 mod gpu_types;
 mod ply;
 mod scene;
@@ -99,6 +101,7 @@ fn alloc_and_copy_slice<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_hitgroup_data(
     mat: &scene::SceneMaterial,
     texture_data: optix_sys::CUdeviceptr,
