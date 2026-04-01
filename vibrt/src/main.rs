@@ -449,6 +449,100 @@ fn main() -> Result<()> {
     for obj in &scene.objects {
         match &obj.shape {
             SceneShape::Sphere { radius } => {
+                // Check if camera is inside the sphere — built-in sphere
+                // intersection doesn't handle inside-out rays, so fall back
+                // to triangle mesh for enclosing spheres (e.g. env_sphere).
+                let world_center = [obj.transform[3], obj.transform[7], obj.transform[11]];
+                let dx = scene.cam_eye[0] - world_center[0];
+                let dy = scene.cam_eye[1] - world_center[1];
+                let dz = scene.cam_eye[2] - world_center[2];
+                let dist_sq = dx * dx + dy * dy + dz * dz;
+
+                if dist_sq < radius * radius {
+                    // Camera is inside sphere — tessellate and add as triangle mesh
+                    let (verts, normals, indices) = subdivision::make_icosphere(*radius, 4);
+                    let transformed = transform::transform_vertices(&verts, &obj.transform);
+
+                    let d_verts = stream.clone_htod(&transformed).cuda()?;
+                    let d_normals = stream.clone_htod(&normals).cuda()?;
+                    let d_indices: CudaSlice<i32> = stream.clone_htod(&indices).cuda()?;
+                    let vert_ptrs = [dptr(&d_verts, &stream)];
+                    let flags = [GeometryFlags::NONE];
+                    let num_verts = transformed.len() as u32 / 3;
+                    let num_tris = indices.len() as u32 / 3;
+
+                    let tri_input = TriangleArrayInput::new(
+                        &vert_ptrs,
+                        num_verts,
+                        VertexFormat::Float3,
+                        3 * mem::size_of::<f32>() as u32,
+                        &flags,
+                    )
+                    .with_indices(
+                        dptr(&d_indices, &stream),
+                        num_tris,
+                        IndicesFormat::UnsignedInt3,
+                        3 * mem::size_of::<i32>() as u32,
+                    );
+
+                    let bi = [BuildInput::Triangles(tri_input)];
+                    let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &bi)
+                        .context("sphere-as-tri accel memory")?;
+                    let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
+                    let d_output: CudaSlice<u8> =
+                        unsafe { stream.alloc(sizes.output_size) }.cuda()?;
+
+                    let handle = accel::accel_build(
+                        &ctx,
+                        cu_stream,
+                        &build_options,
+                        &bi,
+                        dptr(&d_temp, &stream),
+                        sizes.temp_size,
+                        dptr(&d_output, &stream),
+                        sizes.output_size,
+                    )
+                    .context("sphere-as-tri accel build")?;
+
+                    let hg_data = make_hitgroup_data(
+                        &obj.material,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0, // texcoords
+                        dptr(&d_normals, &stream),
+                        dptr(&d_indices, &stream),
+                        dptr(&d_verts, &stream),
+                        num_verts as i32,
+                    );
+
+                    let sbt_offset = tri_hg_records.len() as u32;
+                    tri_hg_records.push(SbtRecord::new(&hitgroup_tri_pg, hg_data)?);
+
+                    gas_entries.push(GasEntry {
+                        handle,
+                        sbt_offset,
+                        transform: transform::identity(),
+                        is_sphere: false,
+                    });
+
+                    _device_buffers.push(unsafe { std::mem::transmute(d_verts) });
+                    _device_buffers.push(unsafe { std::mem::transmute(d_normals) });
+                    _device_buffers.push(unsafe { std::mem::transmute(d_indices) });
+                    _device_buffers.push(d_temp);
+                    _device_buffers.push(d_output);
+                    continue;
+                }
+
                 let center = [0.0f32, 0.0, 0.0];
                 let radius_val = [*radius];
 

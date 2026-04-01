@@ -163,3 +163,75 @@ pub fn compute_smooth_normals(verts: &[f32], indices: &[i32]) -> Vec<f32> {
 
     normals
 }
+
+/// Generate an icosphere with the given radius and subdivision level.
+/// Returns (vertices, normals, indices).
+pub fn make_icosphere(radius: f32, subdivisions: u32) -> (Vec<f32>, Vec<f32>, Vec<i32>) {
+    let t = (1.0 + 5.0_f32.sqrt()) / 2.0;
+
+    let mut verts = vec![
+        -1.0, t, 0.0, 1.0, t, 0.0, -1.0, -t, 0.0, 1.0, -t, 0.0, 0.0, -1.0, t, 0.0, 1.0, t, 0.0,
+        -1.0, -t, 0.0, 1.0, -t, t, 0.0, -1.0, t, 0.0, 1.0, -t, 0.0, -1.0, -t, 0.0, 1.0,
+    ];
+
+    let mut indices: Vec<i32> = vec![
+        0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11, 1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6, 7,
+        1, 8, 3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9, 4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9,
+        8, 1,
+    ];
+
+    // Normalize initial vertices to unit sphere
+    for i in (0..verts.len()).step_by(3) {
+        let len = (verts[i] * verts[i] + verts[i + 1] * verts[i + 1] + verts[i + 2] * verts[i + 2])
+            .sqrt();
+        verts[i] /= len;
+        verts[i + 1] /= len;
+        verts[i + 2] /= len;
+    }
+
+    // Subdivide
+    for _ in 0..subdivisions {
+        let mut new_indices = Vec::new();
+        let mut midpoint_cache = HashMap::new();
+
+        let mut get_midpoint = |a: i32, b: i32, verts: &mut Vec<f32>| -> i32 {
+            let key = if a < b { (a, b) } else { (b, a) };
+            if let Some(&idx) = midpoint_cache.get(&key) {
+                return idx;
+            }
+            let ai = a as usize * 3;
+            let bi = b as usize * 3;
+            let mx = (verts[ai] + verts[bi]) * 0.5;
+            let my = (verts[ai + 1] + verts[bi + 1]) * 0.5;
+            let mz = (verts[ai + 2] + verts[bi + 2]) * 0.5;
+            let len = (mx * mx + my * my + mz * mz).sqrt();
+            let idx = (verts.len() / 3) as i32;
+            verts.push(mx / len);
+            verts.push(my / len);
+            verts.push(mz / len);
+            midpoint_cache.insert(key, idx);
+            idx
+        };
+
+        for tri in indices.chunks(3) {
+            let a = tri[0];
+            let b = tri[1];
+            let c = tri[2];
+            let ab = get_midpoint(a, b, &mut verts);
+            let bc = get_midpoint(b, c, &mut verts);
+            let ca = get_midpoint(c, a, &mut verts);
+            new_indices.extend_from_slice(&[a, ab, ca, b, bc, ab, c, ca, bc, ab, bc, ca]);
+        }
+        indices = new_indices;
+    }
+
+    // Normals = normalized positions (unit sphere)
+    let normals = verts.clone();
+
+    // Scale by radius
+    for v in &mut verts {
+        *v *= radius;
+    }
+
+    (verts, normals, indices)
+}
