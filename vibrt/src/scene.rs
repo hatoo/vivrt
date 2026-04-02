@@ -456,7 +456,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 if let Some(s) = p.string("filename") {
                     parsed.filename = s.to_string();
                 }
-                // Known but not implemented
             }
             Directive::Camera { params, .. } => {
                 let p = ParamSet::new(params, "Camera");
@@ -953,19 +952,55 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     Err(e) => eprintln!("Failed to include {}: {e}", include_path.display()),
                 }
             }
-            Directive::ReverseOrientation
-            | Directive::ObjectBegin(_)
-            | Directive::ObjectEnd
-            | Directive::ObjectInstance(_)
-            | Directive::Attribute { .. }
-            | Directive::Option { .. }
-            | Directive::ColorSpace(_) => {
-                // Known but not implemented
+            other => {
+                eprintln!("Warning: unhandled directive: {}", directive_name(other));
             }
-            _ => {}
         }
     }
     parsed
+}
+
+fn directive_name(d: &Directive) -> &'static str {
+    match d {
+        Directive::Camera { .. } => "Camera",
+        Directive::Film { .. } => "Film",
+        Directive::Sampler { .. } => "Sampler",
+        Directive::Integrator { .. } => "Integrator",
+        Directive::PixelFilter { .. } => "PixelFilter",
+        Directive::Accelerator { .. } => "Accelerator",
+        Directive::ColorSpace(_) => "ColorSpace",
+        Directive::Option { .. } => "Option",
+        Directive::Identity => "Identity",
+        Directive::Translate { .. } => "Translate",
+        Directive::Scale { .. } => "Scale",
+        Directive::Rotate { .. } => "Rotate",
+        Directive::LookAt { .. } => "LookAt",
+        Directive::Transform { .. } => "Transform",
+        Directive::ConcatTransform { .. } => "ConcatTransform",
+        Directive::CoordinateSystem(_) => "CoordinateSystem",
+        Directive::CoordSysTransform(_) => "CoordSysTransform",
+        Directive::TransformTimes { .. } => "TransformTimes",
+        Directive::ActiveTransform(_) => "ActiveTransform",
+        Directive::ReverseOrientation => "ReverseOrientation",
+        Directive::WorldBegin => "WorldBegin",
+        Directive::AttributeBegin => "AttributeBegin",
+        Directive::AttributeEnd => "AttributeEnd",
+        Directive::Attribute { .. } => "Attribute",
+        Directive::Shape { .. } => "Shape",
+        Directive::Material { .. } => "Material",
+        Directive::MakeNamedMaterial { .. } => "MakeNamedMaterial",
+        Directive::NamedMaterial(_) => "NamedMaterial",
+        Directive::Texture { .. } => "Texture",
+        Directive::AreaLightSource { .. } => "AreaLightSource",
+        Directive::LightSource { .. } => "LightSource",
+        Directive::MakeNamedMedium { .. } => "MakeNamedMedium",
+        Directive::MediumInterface { .. } => "MediumInterface",
+        Directive::ObjectBegin(_) => "ObjectBegin",
+        Directive::ObjectEnd => "ObjectEnd",
+        Directive::ObjectInstance(_) => "ObjectInstance",
+        Directive::Include(_) => "Include",
+        Directive::Import(_) => "Import",
+    }
 }
 
 fn register_area_light(
