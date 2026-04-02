@@ -815,6 +815,7 @@ fn main() -> Result<()> {
         "Rendering {}x{} @ {} spp...",
         scene.width, scene.height, scene.spp
     );
+    let render_start = std::time::Instant::now();
     pipeline
         .launch(
             cu_stream,
@@ -827,6 +828,8 @@ fn main() -> Result<()> {
         )
         .context("launch")?;
     stream.synchronize().cuda()?;
+    let render_elapsed = render_start.elapsed();
+    println!("Rendering took {render_elapsed:.2?}");
 
     let pixels = stream.clone_dtoh(&d_image).cuda()?;
 
