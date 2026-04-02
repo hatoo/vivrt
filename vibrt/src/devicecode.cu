@@ -567,9 +567,8 @@ extern "C" __global__ void __closesthit__ch()
     if (dot3(shading_normal, ray_dir) > 0.0f)
         shading_normal = shading_normal * (-1.0f);
 
-    // Bump mapping: perturb normal using height map gradient
+    // Bump mapping (matches PBRT's BumpMap approach)
     if (data->bump_data && data->texcoords) {
-        float u_coord = 0.0f, v_coord = 0.0f;
         int bi0, bi1, bi2;
         if (data->indices) {
             bi0 = data->indices[prim_idx * 3 + 0];
@@ -579,15 +578,34 @@ extern "C" __global__ void __closesthit__ch()
             bi0 = prim_idx * 3; bi1 = bi0 + 1; bi2 = bi0 + 2;
         }
         float bw = 1.0f - bary.x - bary.y;
-        u_coord = bw * data->texcoords[bi0*2] + bary.x * data->texcoords[bi1*2] + bary.y * data->texcoords[bi2*2];
-        v_coord = bw * data->texcoords[bi0*2+1] + bary.x * data->texcoords[bi1*2+1] + bary.y * data->texcoords[bi2*2+1];
+        float u_coord = bw * data->texcoords[bi0*2] + bary.x * data->texcoords[bi1*2] + bary.y * data->texcoords[bi2*2];
+        float v_coord = bw * data->texcoords[bi0*2+1] + bary.x * data->texcoords[bi1*2+1] + bary.y * data->texcoords[bi2*2+1];
 
-        // Wrap UVs
-        u_coord = u_coord - floorf(u_coord);
-        v_coord = v_coord - floorf(v_coord);
+        // Compute dpdu/dpdv from triangle vertices and UVs
+        float2 uv0 = make_float2(data->texcoords[bi0*2], data->texcoords[bi0*2+1]);
+        float2 uv1 = make_float2(data->texcoords[bi1*2], data->texcoords[bi1*2+1]);
+        float2 uv2 = make_float2(data->texcoords[bi2*2], data->texcoords[bi2*2+1]);
+        float3 dp1 = v1 - v0, dp2 = v2 - v0;
+        float duv1_u = uv1.x - uv0.x, duv1_v = uv1.y - uv0.y;
+        float duv2_u = uv2.x - uv0.x, duv2_v = uv2.y - uv0.y;
+        float det = duv1_u * duv2_v - duv1_v * duv2_u;
 
-        // Sample height map with finite differences
-        float eps = 1.0f / fmaxf((float)data->bump_width, 1.0f);
+        float3 dpdu, dpdv;
+        if (fabsf(det) > 1e-8f) {
+            float inv_det = 1.0f / det;
+            dpdu = (dp1 * duv2_v - dp2 * duv1_v) * inv_det;
+            dpdv = (dp2 * duv1_u - dp1 * duv2_u) * inv_det;
+        } else {
+            // Degenerate UVs: fall back to arbitrary tangent frame
+            if (fabsf(shading_normal.x) > 0.9f)
+                dpdu = normalize3(cross3(make_float3(0,1,0), shading_normal));
+            else
+                dpdu = normalize3(cross3(make_float3(1,0,0), shading_normal));
+            dpdv = cross3(shading_normal, dpdu);
+        }
+
+        // Sample displacement with finite differences (PBRT uses du=0.0005 fallback)
+        float du = 0.0005f, dv = 0.0005f;
         int bw_ = data->bump_width;
         int bh_ = data->bump_height;
         auto sample_bump = [&](float su, float sv) -> float {
@@ -600,21 +618,16 @@ extern "C" __global__ void __closesthit__ch()
             return data->bump_data[iy * bw_ + ix];
         };
 
-        float h0 = sample_bump(u_coord, v_coord);
-        float du = sample_bump(u_coord + eps, v_coord) - h0;
-        float dv = sample_bump(u_coord, v_coord + eps) - h0;
+        float displace = sample_bump(u_coord, v_coord);
+        float u_displace = sample_bump(u_coord + du, v_coord);
+        float v_displace = sample_bump(u_coord, v_coord + dv);
 
-        // Build tangent frame and perturb normal
-        float3 tangent;
-        if (fabsf(shading_normal.x) > 0.9f)
-            tangent = normalize3(cross3(make_float3(0,1,0), shading_normal));
-        else
-            tangent = normalize3(cross3(make_float3(1,0,0), shading_normal));
-        float3 bitangent = cross3(shading_normal, tangent);
+        // PBRT formula: dpdu' = dpdu + (uDisplace - displace) / du * N
+        float3 N = shading_normal;
+        float3 dpdu_bumped = dpdu + N * ((u_displace - displace) / du);
+        float3 dpdv_bumped = dpdv + N * ((v_displace - displace) / dv);
 
-        float bump_scale = 2.0f;
-        shading_normal = normalize3(shading_normal - tangent * (du * bump_scale) - bitangent * (dv * bump_scale));
-
+        shading_normal = normalize3(cross3(dpdu_bumped, dpdv_bumped));
         if (dot3(shading_normal, ray_dir) > 0.0f)
             shading_normal = shading_normal * (-1.0f);
     }
