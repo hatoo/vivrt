@@ -350,24 +350,8 @@ fn main() -> Result<()> {
         .iter()
         .any(|o| matches!(o.shape, SceneShape::Sphere { .. }));
 
-    // Check if any sphere encloses the camera (needs custom intersection)
-    let has_inside_sphere = scene.objects.iter().any(|o| {
-        if let SceneShape::Sphere { radius } = &o.shape {
-            let wc = [o.transform[3], o.transform[7], o.transform[11]];
-            let dx = scene.cam_eye[0] - wc[0];
-            let dy = scene.cam_eye[1] - wc[1];
-            let dz = scene.cam_eye[2] - wc[2];
-            dx * dx + dy * dy + dz * dz < radius * radius
-        } else {
-            false
-        }
-    });
-
     let mut prim_flags = PrimitiveTypeFlags::TRIANGLE;
     if has_spheres {
-        prim_flags |= PrimitiveTypeFlags::SPHERE;
-    }
-    if has_inside_sphere {
         prim_flags |= PrimitiveTypeFlags::CUSTOM;
     }
 
@@ -386,15 +370,6 @@ fn main() -> Result<()> {
         .context("module")?
         .value;
 
-    let sphere_is_module = if has_spheres {
-        Some(
-            Module::builtin_is(&ctx, &module_opts, &pipeline_options, PrimitiveType::Sphere)
-                .context("sphere IS module")?,
-        )
-    } else {
-        None
-    };
-
     let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg")
         .context("raygen")?
         .value;
@@ -409,11 +384,11 @@ fn main() -> Result<()> {
         .context("hitgroup_tri")?
         .value;
 
-    let hitgroup_sphere_pg = if let Some(ref is_mod) = sphere_is_module {
+    let hitgroup_sphere_pg = if has_spheres {
         Some(
             ProgramGroup::hitgroup(&ctx)
                 .closest_hit(&module, "__closesthit__sphere")
-                .intersection(is_mod, "")
+                .intersection(&module, "__intersection__sphere")
                 .build()
                 .context("hitgroup_sphere")?
                 .value,
@@ -422,24 +397,8 @@ fn main() -> Result<()> {
         None
     };
 
-    let hitgroup_custom_sphere_pg = if has_inside_sphere {
-        Some(
-            ProgramGroup::hitgroup(&ctx)
-                .closest_hit(&module, "__closesthit__sphere")
-                .intersection(&module, "__intersection__sphere")
-                .build()
-                .context("hitgroup_custom_sphere")?
-                .value,
-        )
-    } else {
-        None
-    };
-
     let mut all_pgs: Vec<&ProgramGroup> = vec![&raygen_pg, &miss_pg, &hitgroup_tri_pg];
     if let Some(ref pg) = hitgroup_sphere_pg {
-        all_pgs.push(pg);
-    }
-    if let Some(ref pg) = hitgroup_custom_sphere_pg {
         all_pgs.push(pg);
     }
 
@@ -481,116 +440,21 @@ fn main() -> Result<()> {
     for obj in &scene.objects {
         match &obj.shape {
             SceneShape::Sphere { radius } => {
-                // Check if camera is inside the sphere — built-in sphere
-                // intersection doesn't handle inside-out rays, so fall back
-                // to triangle mesh for enclosing spheres (e.g. env_sphere).
-                let world_center = [obj.transform[3], obj.transform[7], obj.transform[11]];
-                let dx = scene.cam_eye[0] - world_center[0];
-                let dy = scene.cam_eye[1] - world_center[1];
-                let dz = scene.cam_eye[2] - world_center[2];
-                let dist_sq = dx * dx + dy * dy + dz * dz;
-
-                if dist_sq < radius * radius {
-                    // Camera is inside sphere — use custom intersection program
-                    // (built-in sphere IS doesn't handle inside-out rays)
-                    let aabb = [-*radius, -*radius, -*radius, *radius, *radius, *radius];
-                    let d_aabb = stream.clone_htod(&aabb).cuda()?;
-                    let aabb_ptrs = [dptr(&d_aabb, &stream)];
-                    let flags = [GeometryFlags::NONE];
-
-                    let custom_input = accel::CustomPrimitiveInput {
-                        aabb_buffers: &aabb_ptrs,
-                        num_primitives: 1,
-                        stride: 0,
-                        flags: &flags,
-                        num_sbt_records: 1,
-                        primitive_index_offset: 0,
-                    };
-
-                    let bi = [BuildInput::CustomPrimitives(custom_input)];
-                    let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &bi)
-                        .context("sphere-custom accel memory")?;
-                    let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
-                    let d_output: CudaSlice<u8> =
-                        unsafe { stream.alloc(sizes.output_size) }.cuda()?;
-
-                    let handle = accel::accel_build(
-                        &ctx,
-                        cu_stream,
-                        &build_options,
-                        &bi,
-                        dptr(&d_temp, &stream),
-                        sizes.temp_size,
-                        dptr(&d_output, &stream),
-                        sizes.output_size,
-                    )
-                    .context("sphere-custom accel build")?;
-
-                    // Store radius in num_vertices field (reinterpreted as float in shader)
-                    let mut hg_data = make_hitgroup_data(
-                        &obj.material,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                    );
-                    hg_data.num_vertices = radius.to_bits() as i32;
-
-                    let sbt_offset = sphere_hg_records.len() as u32;
-                    sphere_hg_records.push(SbtRecord::new(
-                        hitgroup_custom_sphere_pg
-                            .as_ref()
-                            .context("no custom sphere hitgroup")?,
-                        hg_data,
-                    )?);
-
-                    gas_entries.push(GasEntry {
-                        handle,
-                        sbt_offset,
-                        transform: obj.transform,
-                        is_sphere: true, // uses sphere SBT offset
-                    });
-
-                    _device_buffers.push(unsafe { std::mem::transmute(d_aabb) });
-                    _device_buffers.push(d_temp);
-                    _device_buffers.push(d_output);
-                    continue;
-                }
-
-                let center = [0.0f32, 0.0, 0.0];
-                let radius_val = [*radius];
-
-                let d_center = stream.clone_htod(&center).cuda()?;
-                let d_radius = stream.clone_htod(&radius_val).cuda()?;
-                let center_ptrs = [dptr(&d_center, &stream)];
-                let radius_ptrs = [dptr(&d_radius, &stream)];
+                let aabb = [-*radius, -*radius, -*radius, *radius, *radius, *radius];
+                let d_aabb = stream.clone_htod(&aabb).cuda()?;
+                let aabb_ptrs = [dptr(&d_aabb, &stream)];
                 let flags = [GeometryFlags::NONE];
 
-                let sphere_input = accel::SphereArrayInput {
-                    vertex_buffers: &center_ptrs,
-                    vertex_stride: 0,
-                    num_vertices: 1,
-                    radius_buffers: &radius_ptrs,
-                    radius_stride: 0,
-                    single_radius: true,
+                let custom_input = accel::CustomPrimitiveInput {
+                    aabb_buffers: &aabb_ptrs,
+                    num_primitives: 1,
+                    stride: 0,
                     flags: &flags,
                     num_sbt_records: 1,
+                    primitive_index_offset: 0,
                 };
 
-                let bi = [BuildInput::Spheres(sphere_input)];
+                let bi = [BuildInput::CustomPrimitives(custom_input)];
                 let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &bi)
                     .context("sphere accel memory")?;
                 let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
@@ -608,7 +472,8 @@ fn main() -> Result<()> {
                 )
                 .context("sphere accel build")?;
 
-                let hg_data = make_hitgroup_data(
+                // Store radius in num_vertices field (reinterpreted as float in shader)
+                let mut hg_data = make_hitgroup_data(
                     &obj.material,
                     0,
                     0,
@@ -628,6 +493,7 @@ fn main() -> Result<()> {
                     0,
                     0,
                 );
+                hg_data.num_vertices = radius.to_bits() as i32;
 
                 let sbt_offset = sphere_hg_records.len() as u32;
                 sphere_hg_records.push(SbtRecord::new(
@@ -642,8 +508,7 @@ fn main() -> Result<()> {
                     is_sphere: true,
                 });
 
-                _device_buffers.push(unsafe { std::mem::transmute(d_center) });
-                _device_buffers.push(unsafe { std::mem::transmute(d_radius) });
+                _device_buffers.push(unsafe { std::mem::transmute(d_aabb) });
                 _device_buffers.push(d_temp);
                 _device_buffers.push(d_output);
             }
