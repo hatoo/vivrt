@@ -711,7 +711,7 @@ extern "C" __global__ void __closesthit__ch()
     optixSetPayload_12(__float_as_uint(data->emission[2]));
 
     // Roughness: sample from texture if available, otherwise use constant
-    float roughness_val = data->coated.roughness;
+    float roughness_val = data->roughness;
     if (data->roughness_data && data->texcoords) {
         int ri0, ri1, ri2;
         if (data->indices) {
@@ -773,7 +773,7 @@ extern "C" __global__ void __closesthit__sphere()
     optixSetPayload_10(__float_as_uint(data->emission[0]));
     optixSetPayload_11(__float_as_uint(data->emission[1]));
     optixSetPayload_12(__float_as_uint(data->emission[2]));
-    optixSetPayload_13(__float_as_uint(data->coated.roughness));
+    optixSetPayload_13(__float_as_uint(data->roughness));
 }
 
 // Any-hit program for alpha cutout

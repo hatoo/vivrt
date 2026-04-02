@@ -44,19 +44,15 @@ struct DielectricParams {
     float tint[3]; // absorption tint from participating medium
 };
 
-struct CoatedDiffuseParams {
-    float roughness;
-};
-
 struct HitGroupData {
     int           material_type;
     float         albedo[3];
     float         emission[3];
+    float         roughness;
     // Material-specific params (union)
     union {
         DiffuseParams       diffuse;
         DielectricParams    dielectric;
-        CoatedDiffuseParams coated;
     };
     // Image texture (NULL if no texture)
     float*        texture_data;  // RGB float, width*height*3

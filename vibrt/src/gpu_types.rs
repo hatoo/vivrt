@@ -51,20 +51,13 @@ pub struct DielectricParams {
     pub tint: [f32; 3],
 }
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CoatedDiffuseParams {
-    pub roughness: f32,
-}
-
 /// Union of material-specific parameters.
-/// Size = max(DiffuseParams, DielectricParams, CoatedDiffuseParams).
+/// Size = max(DiffuseParams, DielectricParams).
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union MaterialParams {
     pub diffuse: DiffuseParams,
     pub dielectric: DielectricParams,
-    pub coated: CoatedDiffuseParams,
 }
 
 #[repr(C)]
@@ -73,6 +66,7 @@ pub struct HitGroupData {
     pub material_type: i32,
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
+    pub roughness: f32,
     pub params: MaterialParams,
     pub texture_data: optix_sys::CUdeviceptr,
     pub texture_width: i32,

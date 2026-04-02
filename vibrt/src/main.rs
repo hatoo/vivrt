@@ -129,11 +129,6 @@ fn make_hitgroup_data(
                 tint: mat.tint,
             },
         },
-        MAT_COATED_DIFFUSE => MaterialParams {
-            coated: CoatedDiffuseParams {
-                roughness: mat.roughness,
-            },
-        },
         _ => MaterialParams {
             diffuse: DiffuseParams {
                 has_checkerboard: if mat.has_checkerboard { 1 } else { 0 },
@@ -148,6 +143,7 @@ fn make_hitgroup_data(
         material_type: mat.material_type,
         albedo: mat.albedo,
         emission: mat.emission,
+        roughness: mat.roughness,
         params,
         texture_data,
         texture_width,

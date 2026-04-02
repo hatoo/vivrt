@@ -689,7 +689,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         current_material.roughness = p
                             .float("roughness")
                             .or(p.float("uroughness"))
-                            .unwrap_or(0.01);
+                            .unwrap_or(0.0);
                     }
                     "dielectric" | "thindielectric" => {
                         current_material.material_type = MAT_DIELECTRIC;
@@ -770,7 +770,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         mat.roughness = p
                             .float("roughness")
                             .or(p.float("uroughness"))
-                            .unwrap_or(0.01);
+                            .unwrap_or(0.0);
                     }
                     "dielectric" | "thindielectric" => {
                         mat.material_type = MAT_DIELECTRIC;
