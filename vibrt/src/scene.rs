@@ -23,6 +23,8 @@ pub struct SceneMaterial {
     pub checker_scale_v: f32,
     pub checker_color1: [f32; 3],
     pub checker_color2: [f32; 3],
+    pub conductor_eta: [f32; 3],
+    pub conductor_k: [f32; 3],
     pub texture: Option<std::sync::Arc<ImageTexture>>,
     pub bump_map: Option<std::sync::Arc<ImageTexture>>,
     pub alpha_map: Option<std::sync::Arc<ImageTexture>>,
@@ -43,6 +45,8 @@ impl Default for SceneMaterial {
             checker_scale_v: 1.0,
             checker_color1: [1.0, 1.0, 1.0],
             checker_color2: [0.0, 0.0, 0.0],
+            conductor_eta: [0.0, 0.0, 0.0],
+            conductor_k: [0.0, 0.0, 0.0],
             texture: None,
             bump_map: None,
             alpha_map: None,
@@ -258,17 +262,31 @@ impl Drop for ParamSet<'_> {
     }
 }
 
-/// Approximate reflectance color for named metal spectra.
-fn metal_color_from_params(p: &ParamSet) -> Option<[f32; 3]> {
+/// Returns (eta_rgb, k_rgb) for named metal spectra.
+/// Values are approximate RGB conversions of measured spectral data.
+fn metal_ior_from_params(p: &ParamSet) -> Option<([f32; 3], [f32; 3])> {
     let eta_str = p.spectrum_string("eta");
     match eta_str {
-        Some(s) if s.contains("Au") => Some([1.0, 0.78, 0.34]), // gold
-        Some(s) if s.contains("Ag") => Some([0.97, 0.96, 0.91]), // silver
-        Some(s) if s.contains("Cu") && !s.contains("CuZn") => Some([0.96, 0.64, 0.54]), // copper
-        Some(s) if s.contains("Al") => Some([0.91, 0.92, 0.93]), // aluminum
-        Some(s) if s.contains("CuZn") => Some([0.94, 0.83, 0.49]), // brass
+        Some(s) if s.contains("Au") => Some(([0.143, 0.374, 1.442], [3.983, 2.380, 1.603])),
+        Some(s) if s.contains("Ag") => Some(([0.050, 0.056, 0.047], [4.484, 3.390, 2.440])),
+        Some(s) if s.contains("Cu") && !s.contains("CuZn") => {
+            Some(([0.271, 0.677, 1.316], [3.610, 2.625, 2.292]))
+        }
+        Some(s) if s.contains("Al") => Some(([1.654, 0.880, 0.521], [9.224, 6.270, 4.837])),
+        Some(s) if s.contains("CuZn") => Some(([0.445, 0.582, 1.100], [3.600, 2.600, 1.900])),
         _ => None,
     }
+}
+
+/// Compute normal-incidence reflectance from conductor eta/k.
+fn conductor_f0(eta: &[f32; 3], k: &[f32; 3]) -> [f32; 3] {
+    let mut f0 = [0.0f32; 3];
+    for i in 0..3 {
+        let e = eta[i];
+        let kk = k[i];
+        f0[i] = ((e - 1.0) * (e - 1.0) + kk * kk) / ((e + 1.0) * (e + 1.0) + kk * kk);
+    }
+    f0
 }
 
 fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
@@ -680,10 +698,18 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         current_material.material_type = MAT_CONDUCTOR;
                         if let Some(c) = p.rgb("reflectance") {
                             current_material.albedo = c;
-                        } else if let Some(c) = metal_color_from_params(&p) {
-                            current_material.albedo = c;
+                        } else if let Some((eta, k)) = metal_ior_from_params(&p) {
+                            current_material.conductor_eta = eta;
+                            current_material.conductor_k = k;
+                            current_material.albedo = conductor_f0(&eta, &k);
                         } else {
-                            current_material.albedo = [0.8, 0.7, 0.3];
+                            // Default: gold-like
+                            current_material.conductor_eta = [0.143, 0.374, 1.442];
+                            current_material.conductor_k = [3.983, 2.380, 1.603];
+                            current_material.albedo = conductor_f0(
+                                &current_material.conductor_eta,
+                                &current_material.conductor_k,
+                            );
                         }
                         current_material.roughness = p
                             .float("roughness")
@@ -761,10 +787,14 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         mat.material_type = MAT_CONDUCTOR;
                         if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
-                        } else if let Some(c) = metal_color_from_params(&p) {
-                            mat.albedo = c;
+                        } else if let Some((eta, k)) = metal_ior_from_params(&p) {
+                            mat.conductor_eta = eta;
+                            mat.conductor_k = k;
+                            mat.albedo = conductor_f0(&eta, &k);
                         } else {
-                            mat.albedo = [0.8, 0.7, 0.3];
+                            mat.conductor_eta = [0.143, 0.374, 1.442];
+                            mat.conductor_k = [3.983, 2.380, 1.603];
+                            mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
                         }
                         mat.roughness = p
                             .float("roughness")

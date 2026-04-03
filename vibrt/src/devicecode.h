@@ -44,6 +44,11 @@ struct DielectricParams {
     float tint[3]; // absorption tint from participating medium
 };
 
+struct ConductorParams {
+    float eta[3];
+    float k[3];
+};
+
 struct HitGroupData {
     // Material
     int           material_type;
@@ -53,6 +58,7 @@ struct HitGroupData {
     union {
         DiffuseParams       diffuse;
         DielectricParams    dielectric;
+        ConductorParams     conductor;
     };
     // Geometry
     float*        vertices;

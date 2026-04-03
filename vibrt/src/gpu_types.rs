@@ -51,13 +51,20 @@ pub struct DielectricParams {
     pub tint: [f32; 3],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ConductorParams {
+    pub eta: [f32; 3],
+    pub k: [f32; 3],
+}
+
 /// Union of material-specific parameters.
-/// Size = max(DiffuseParams, DielectricParams).
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union MaterialParams {
     pub diffuse: DiffuseParams,
     pub dielectric: DielectricParams,
+    pub conductor: ConductorParams,
 }
 
 #[repr(C)]

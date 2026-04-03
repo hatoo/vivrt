@@ -129,6 +129,12 @@ fn make_hitgroup_data(
                 tint: mat.tint,
             },
         },
+        MAT_CONDUCTOR => MaterialParams {
+            conductor: ConductorParams {
+                eta: mat.conductor_eta,
+                k: mat.conductor_k,
+            },
+        },
         _ => MaterialParams {
             diffuse: DiffuseParams {
                 has_checkerboard: if mat.has_checkerboard { 1 } else { 0 },
@@ -357,7 +363,7 @@ fn main() -> Result<()> {
         } else {
             TraversableGraphFlags::ALLOW_SINGLE_GAS
         })
-        .num_payload_values(14)
+        .num_payload_values(20)
         .num_attribute_values(2)
         .uses_primitive_type_flags(prim_flags);
 
