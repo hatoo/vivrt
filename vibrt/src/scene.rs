@@ -73,6 +73,7 @@ impl Clone for SceneMaterial {
     }
 }
 
+#[derive(Clone)]
 pub enum SceneShape {
     Sphere {
         radius: f32,
@@ -85,6 +86,7 @@ pub enum SceneShape {
     },
 }
 
+#[derive(Clone)]
 pub struct SceneObject {
     pub shape: SceneShape,
     pub material: SceneMaterial,
@@ -671,6 +673,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         std::collections::HashMap::new();
     let mut _in_world = false;
 
+    // Object instancing: ObjectBegin/ObjectEnd/ObjectInstance
+    let mut named_objects: std::collections::HashMap<String, Vec<SceneObject>> =
+        std::collections::HashMap::new();
+    let mut current_object_name: Option<String> = None;
+
     let mut directive_queue: std::collections::VecDeque<Directive> =
         scene.directives.into_iter().collect();
 
@@ -786,6 +793,33 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     current_transform = *t;
                 } else {
                     eprintln!("Warning: unknown coordinate system: {name}");
+                }
+            }
+            Directive::ObjectBegin(name) => {
+                current_object_name = Some(name.clone());
+                named_objects.entry(name.clone()).or_default();
+            }
+            Directive::ObjectEnd => {
+                current_object_name = None;
+            }
+            Directive::ObjectInstance(name) => {
+                if let Some(obj_shapes) = named_objects.get(name) {
+                    for obj in obj_shapes.clone() {
+                        let combined_transform = transform::mul(&current_transform, &obj.transform);
+                        register_area_light(
+                            &obj.shape,
+                            &obj.material,
+                            &combined_transform,
+                            &mut parsed,
+                        );
+                        parsed.objects.push(SceneObject {
+                            shape: obj.shape,
+                            material: obj.material,
+                            transform: combined_transform,
+                        });
+                    }
+                } else {
+                    eprintln!("Warning: unknown object instance: {name}");
                 }
             }
             Directive::Translate { v } => {
@@ -1279,12 +1313,18 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             }
                         }
                     }
-                    register_area_light(&shape, &current_material, &current_transform, &mut parsed);
-                    parsed.objects.push(SceneObject {
+                    let obj = SceneObject {
                         shape,
                         material: current_material.clone(),
                         transform: current_transform,
-                    });
+                    };
+                    if let Some(ref name) = current_object_name {
+                        // Inside ObjectBegin: collect shapes into named group
+                        named_objects.get_mut(name).unwrap().push(obj);
+                    } else {
+                        register_area_light(&obj.shape, &obj.material, &obj.transform, &mut parsed);
+                        parsed.objects.push(obj);
+                    }
                 }
             }
             Directive::AreaLightSource { ty, params } => {
