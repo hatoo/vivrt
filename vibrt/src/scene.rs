@@ -663,7 +663,10 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
     let mut named_media = std::collections::HashMap::<String, [f32; 3]>::new();
     let mut current_material = SceneMaterial::default();
     let mut current_transform = transform::identity();
-    let mut transform_stack: Vec<([f32; 12], SceneMaterial)> = Vec::new();
+    let mut reverse_orientation = false;
+    let mut transform_stack: Vec<([f32; 12], SceneMaterial, bool)> = Vec::new();
+    let mut named_coord_systems: std::collections::HashMap<String, [f32; 12]> =
+        std::collections::HashMap::new();
     let mut _in_world = false;
 
     for directive in &scene.directives {
@@ -751,12 +754,30 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 _in_world = true;
             }
             Directive::AttributeBegin => {
-                transform_stack.push((current_transform, current_material.clone()));
+                transform_stack.push((
+                    current_transform,
+                    current_material.clone(),
+                    reverse_orientation,
+                ));
             }
             Directive::AttributeEnd => {
-                if let Some((t, m)) = transform_stack.pop() {
+                if let Some((t, m, ro)) = transform_stack.pop() {
                     current_transform = t;
                     current_material = m;
+                    reverse_orientation = ro;
+                }
+            }
+            Directive::ReverseOrientation => {
+                reverse_orientation = !reverse_orientation;
+            }
+            Directive::CoordinateSystem(name) => {
+                named_coord_systems.insert(name.clone(), current_transform);
+            }
+            Directive::CoordSysTransform(name) => {
+                if let Some(t) = named_coord_systems.get(name) {
+                    current_transform = *t;
+                } else {
+                    eprintln!("Warning: unknown coordinate system: {name}");
                 }
             }
             Directive::Translate { v } => {
@@ -1174,7 +1195,22 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
             }
             Directive::Shape { ty, params } => {
-                if let Some(shape) = parse_shape(ty, params, scene_dir) {
+                if let Some(mut shape) = parse_shape(ty, params, scene_dir) {
+                    if reverse_orientation {
+                        if let SceneShape::TriangleMesh {
+                            ref mut indices,
+                            ref mut normals,
+                            ..
+                        } = shape
+                        {
+                            for tri in indices.chunks_exact_mut(3) {
+                                tri.swap(1, 2);
+                            }
+                            for n in normals.iter_mut() {
+                                *n = -*n;
+                            }
+                        }
+                    }
                     register_area_light(&shape, &current_material, &current_transform, &mut parsed);
                     parsed.objects.push(SceneObject {
                         shape,
