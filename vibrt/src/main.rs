@@ -533,6 +533,52 @@ fn main() -> Result<()> {
         operation: BuildOperation::Build,
     };
 
+    // Cache GPU pointers for shared textures to avoid duplicate uploads
+    use scene::ImageTexture;
+    use std::collections::HashMap;
+    let mut tex_cache: HashMap<*const ImageTexture, (optix_sys::CUdeviceptr, i32, i32)> =
+        HashMap::new();
+    // For bump maps stored as grayscale, cache by source pointer
+    let mut bump_cache: HashMap<*const ImageTexture, (optix_sys::CUdeviceptr, i32, i32)> =
+        HashMap::new();
+
+    let mut upload_texture = |tex: &std::sync::Arc<ImageTexture>,
+                              stream: &Arc<cudarc::driver::CudaStream>,
+                              bufs: &mut Vec<CudaSlice<u8>>|
+     -> Result<(optix_sys::CUdeviceptr, i32, i32)> {
+        let key = std::sync::Arc::as_ptr(tex);
+        if let Some(&cached) = tex_cache.get(&key) {
+            return Ok(cached);
+        }
+        let s = stream.clone_htod(&tex.data).cuda()?;
+        let ptr = dptr(&s, stream);
+        bufs.push(unsafe { std::mem::transmute(s) });
+        let result = (ptr, tex.width as i32, tex.height as i32);
+        tex_cache.insert(key, result);
+        Ok(result)
+    };
+
+    let mut upload_bump = |tex: &std::sync::Arc<ImageTexture>,
+                           stream: &Arc<cudarc::driver::CudaStream>,
+                           bufs: &mut Vec<CudaSlice<u8>>|
+     -> Result<(optix_sys::CUdeviceptr, i32, i32)> {
+        let key = std::sync::Arc::as_ptr(tex);
+        if let Some(&cached) = bump_cache.get(&key) {
+            return Ok(cached);
+        }
+        let gray: Vec<f32> = tex
+            .data
+            .chunks(3)
+            .map(|c| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+            .collect();
+        let s = stream.clone_htod(&gray).cuda()?;
+        let ptr = dptr(&s, stream);
+        bufs.push(unsafe { std::mem::transmute(s) });
+        let result = (ptr, tex.width as i32, tex.height as i32);
+        bump_cache.insert(key, result);
+        Ok(result)
+    };
+
     for obj in &scene.objects {
         match &obj.shape {
             SceneShape::Sphere { radius } => {
@@ -671,56 +717,26 @@ fn main() -> Result<()> {
                 )
                 .context("tri accel build")?;
 
-                // Upload image texture if present
                 let (d_tex, tex_w, tex_h) = if let Some(ref tex) = obj.material.texture {
-                    let s = stream.clone_htod(&tex.data).cuda()?;
-                    let ptr = dptr(&s, &stream);
-                    _device_buffers.push(unsafe { std::mem::transmute(s) });
-                    (ptr, tex.width as i32, tex.height as i32)
+                    upload_texture(tex, &stream, &mut _device_buffers)?
                 } else {
                     (0, 0, 0)
                 };
 
-                // Upload bump map if present (convert RGB to grayscale)
                 let (d_bump, bump_w, bump_h) = if let Some(ref bmp) = obj.material.bump_map {
-                    let gray: Vec<f32> = bmp
-                        .data
-                        .chunks(3)
-                        .map(|c| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
-                        .collect();
-                    let s = stream.clone_htod(&gray).cuda()?;
-                    let ptr = dptr(&s, &stream);
-                    _device_buffers.push(unsafe { std::mem::transmute(s) });
-                    (ptr, bmp.width as i32, bmp.height as i32)
+                    upload_bump(bmp, &stream, &mut _device_buffers)?
                 } else {
                     (0, 0, 0)
-                };
-
-                // Upload alpha map if present
-                let mut upload_grayscale = |img: &scene::ImageTexture| -> anyhow::Result<(
-                    optix_sys::CUdeviceptr,
-                    i32,
-                    i32,
-                )> {
-                    let gray: Vec<f32> = img
-                        .data
-                        .chunks(3)
-                        .map(|c| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
-                        .collect();
-                    let s = stream.clone_htod(&gray).cuda()?;
-                    let ptr = dptr(&s, &stream);
-                    _device_buffers.push(unsafe { std::mem::transmute(s) });
-                    Ok((ptr, img.width as i32, img.height as i32))
                 };
 
                 let (d_alpha, alpha_w, alpha_h) = if let Some(ref a) = obj.material.alpha_map {
-                    upload_grayscale(a)?
+                    upload_bump(a, &stream, &mut _device_buffers)?
                 } else {
                     (0, 0, 0)
                 };
 
                 let (d_rough, rough_w, rough_h) = if let Some(ref r) = obj.material.roughness_map {
-                    upload_grayscale(r)?
+                    upload_bump(r, &stream, &mut _device_buffers)?
                 } else {
                     (0, 0, 0)
                 };
