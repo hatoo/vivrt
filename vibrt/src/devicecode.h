@@ -56,6 +56,7 @@ struct HitGroupData {
     float         albedo[3];
     float         emission[3];
     float         roughness;
+    float         roughness_v;
     float         coat_roughness;
     float         coat_eta;
     union {

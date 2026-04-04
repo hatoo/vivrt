@@ -76,6 +76,7 @@ pub struct HitGroupData {
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
     pub roughness: f32,
+    pub roughness_v: f32,
     pub coat_roughness: f32,
     pub coat_eta: f32,
     pub params: MaterialParams,

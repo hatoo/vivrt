@@ -150,6 +150,7 @@ fn make_hitgroup_data(
         albedo: mat.albedo,
         emission: mat.emission,
         roughness: mat.roughness,
+        roughness_v: mat.roughness_v,
         coat_roughness: mat.coat_roughness,
         coat_eta: mat.coat_eta,
         params,
@@ -365,7 +366,7 @@ fn main() -> Result<()> {
         } else {
             TraversableGraphFlags::ALLOW_SINGLE_GAS
         })
-        .num_payload_values(22)
+        .num_payload_values(23)
         .num_attribute_values(2)
         .uses_primitive_type_flags(prim_flags);
 

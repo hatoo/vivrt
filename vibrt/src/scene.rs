@@ -23,6 +23,7 @@ pub struct SceneMaterial {
     pub checker_scale_v: f32,
     pub checker_color1: [f32; 3],
     pub checker_color2: [f32; 3],
+    pub roughness_v: f32,
     pub conductor_eta: [f32; 3],
     pub conductor_k: [f32; 3],
     pub coat_roughness: f32,
@@ -47,6 +48,7 @@ impl Default for SceneMaterial {
             checker_scale_v: 1.0,
             checker_color1: [1.0, 1.0, 1.0],
             checker_color2: [0.0, 0.0, 0.0],
+            roughness_v: 0.0,
             conductor_eta: [0.0, 0.0, 0.0],
             conductor_k: [0.0, 0.0, 0.0],
             coat_roughness: 0.0,
@@ -402,6 +404,38 @@ fn conductor_f0(eta: &[f32; 3], k: &[f32; 3]) -> [f32; 3] {
         f0[i] = ((e - 1.0) * (e - 1.0) + kk * kk) / ((e + 1.0) * (e + 1.0) + kk * kk);
     }
     f0
+}
+
+/// Parse uroughness/vroughness into (roughness_u, roughness_v).
+/// If only "roughness" is given, both are the same (isotropic).
+fn parse_roughness(p: &ParamSet, prefix: &str) -> (f32, f32) {
+    let u_key = if prefix.is_empty() {
+        "uroughness".to_string()
+    } else {
+        format!("{prefix}.uroughness")
+    };
+    let v_key = if prefix.is_empty() {
+        "vroughness".to_string()
+    } else {
+        format!("{prefix}.vroughness")
+    };
+    let r_key = if prefix.is_empty() {
+        "roughness".to_string()
+    } else {
+        format!("{prefix}.roughness")
+    };
+
+    let u = p.float(&u_key);
+    let v = p.float(&v_key);
+    let r = p.float(&r_key);
+
+    match (u, v, r) {
+        (Some(u), Some(v), _) => (u, v),
+        (Some(u), None, _) => (u, u),
+        (None, Some(v), _) => (v, v),
+        (None, None, Some(r)) => (r, r),
+        _ => (0.0, 0.0),
+    }
 }
 
 fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
@@ -807,7 +841,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 None => {}
                             }
                         }
-                        current_material.roughness = p.float("roughness").unwrap_or(0.0);
+                        let (ru, rv) = parse_roughness(&p, "");
+                        current_material.roughness = ru;
+                        current_material.roughness_v = rv;
                     }
                     "conductor" | "coatedconductor" => {
                         let is_coated = ty == "coatedconductor";
@@ -837,20 +873,15 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             );
                         }
                         if is_coated {
-                            current_material.roughness = p
-                                .float("conductor.roughness")
-                                .or(p.float("conductor.uroughness"))
-                                .unwrap_or(0.0);
-                            current_material.coat_roughness = p
-                                .float("interface.roughness")
-                                .or(p.float("interface.uroughness"))
-                                .unwrap_or(0.0);
+                            let (ru, rv) = parse_roughness(&p, "conductor");
+                            current_material.roughness = ru;
+                            current_material.roughness_v = rv;
+                            current_material.coat_roughness = parse_roughness(&p, "interface").0;
                             current_material.coat_eta = p.float("interface.eta").unwrap_or(1.5);
                         } else {
-                            current_material.roughness = p
-                                .float("roughness")
-                                .or(p.float("uroughness"))
-                                .unwrap_or(0.0);
+                            let (ru, rv) = parse_roughness(&p, "");
+                            current_material.roughness = ru;
+                            current_material.roughness_v = rv;
                         }
                     }
                     "dielectric" | "thindielectric" => {
@@ -910,10 +941,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
                         }
-                        mat.roughness = p
-                            .float("roughness")
-                            .or(p.float("uroughness"))
-                            .unwrap_or(0.0);
+                        let (ru, rv) = parse_roughness(&p, "");
+                        mat.roughness = ru;
+                        mat.roughness_v = rv;
                         if let Some(tex_name) = p.texture_ref("reflectance") {
                             if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                                 mat.texture = Some(img.clone());
@@ -941,20 +971,15 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
                         }
                         if is_coated {
-                            mat.roughness = p
-                                .float("conductor.roughness")
-                                .or(p.float("conductor.uroughness"))
-                                .unwrap_or(0.0);
-                            mat.coat_roughness = p
-                                .float("interface.roughness")
-                                .or(p.float("interface.uroughness"))
-                                .unwrap_or(0.0);
+                            let (ru, rv) = parse_roughness(&p, "conductor");
+                            mat.roughness = ru;
+                            mat.roughness_v = rv;
+                            mat.coat_roughness = parse_roughness(&p, "interface").0;
                             mat.coat_eta = p.float("interface.eta").unwrap_or(1.5);
                         } else {
-                            mat.roughness = p
-                                .float("roughness")
-                                .or(p.float("uroughness"))
-                                .unwrap_or(0.0);
+                            let (ru, rv) = parse_roughness(&p, "");
+                            mat.roughness = ru;
+                            mat.roughness_v = rv;
                         }
                     }
                     "dielectric" | "thindielectric" => {
