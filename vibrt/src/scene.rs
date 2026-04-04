@@ -671,7 +671,10 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         std::collections::HashMap::new();
     let mut _in_world = false;
 
-    for directive in &scene.directives {
+    let mut directive_queue: std::collections::VecDeque<Directive> =
+        scene.directives.into_iter().collect();
+
+    while let Some(ref directive) = directive_queue.pop_front() {
         match directive {
             Directive::Film { params, .. } => {
                 let p = ParamSet::new(params, "Film");
@@ -1288,16 +1291,8 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         let included = pbrt_parser::parse(&content).unwrap_or_else(|e| {
                             panic!("Failed to parse {}: {e}", include_path.display())
                         });
-                        for inc_directive in &included.directives {
-                            if let Directive::Shape { ty, params } = inc_directive {
-                                if let Some(shape) = parse_shape(ty, params, scene_dir) {
-                                    parsed.objects.push(SceneObject {
-                                        shape,
-                                        material: current_material.clone(),
-                                        transform: current_transform,
-                                    });
-                                }
-                            }
+                        for (i, d) in included.directives.into_iter().enumerate() {
+                            directive_queue.insert(i, d);
                         }
                     }
                     Err(e) => eprintln!("Failed to include {}: {e}", include_path.display()),
