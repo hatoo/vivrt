@@ -121,6 +121,9 @@ pub struct LaunchParams {
     pub sphere_lights: optix_sys::CUdeviceptr,
     pub num_triangle_lights: i32,
     pub triangle_lights: optix_sys::CUdeviceptr,
+    // GGX energy compensation LUT (Kulla-Conty)
+    pub ggx_e_lut: optix_sys::CUdeviceptr, // E(cosθ, α), 32x32 float
+    pub ggx_e_avg_lut: optix_sys::CUdeviceptr, // E_avg(α), 32 float
 }
 
 #[repr(C)]

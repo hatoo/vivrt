@@ -101,6 +101,96 @@ fn alloc_and_copy_slice<T>(
     }
 }
 
+const GGX_LUT_SIZE: usize = 32;
+
+/// Precompute GGX directional albedo E(cosθ, α) via Monte Carlo integration.
+/// E(μ, α) = integral of (D*G*F)/(4*μ) * cos(θi) dωi with F=1.
+/// Also computes E_avg(α) = 2 * integral of E(μ, α) * μ dμ.
+fn generate_ggx_energy_lut() -> (Vec<f32>, Vec<f32>) {
+    let n = GGX_LUT_SIZE;
+    let num_samples = 1024u32;
+    let mut e_lut = vec![0.0f32; n * n]; // [cos_theta][alpha]
+    let mut e_avg = vec![0.0f32; n];
+
+    for ai in 0..n {
+        let alpha = (ai as f32 + 0.5) / n as f32;
+        let a2 = alpha * alpha;
+
+        for ci in 0..n {
+            let cos_theta = (ci as f32 + 0.5) / n as f32;
+            let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+
+            let mut sum = 0.0f64;
+            for s in 0..num_samples {
+                // Quasi-random sampling using Hammersley sequence
+                let u1 = s as f64 / num_samples as f64;
+                let mut u2_bits = s;
+                u2_bits = (u2_bits << 16) | (u2_bits >> 16);
+                u2_bits = ((u2_bits & 0x55555555) << 1) | ((u2_bits & 0xAAAAAAAA) >> 1);
+                u2_bits = ((u2_bits & 0x33333333) << 2) | ((u2_bits & 0xCCCCCCCC) >> 2);
+                u2_bits = ((u2_bits & 0x0F0F0F0F) << 4) | ((u2_bits & 0xF0F0F0F0) >> 4);
+                u2_bits = ((u2_bits & 0x00FF00FF) << 8) | ((u2_bits & 0xFF00FF00) >> 8);
+                let u2 = u2_bits as f64 / 0x100000000u64 as f64;
+
+                // Sample GGX half-vector
+                let a2_d = a2 as f64;
+                let cos_h = ((1.0 - u2) / (1.0 + (a2_d - 1.0) * u2)).sqrt();
+                let sin_h = (1.0 - cos_h * cos_h).max(0.0).sqrt();
+                let phi = 2.0 * std::f64::consts::PI * u1;
+
+                // Half-vector in local space (V is along z)
+                let hx = sin_h * phi.cos();
+                let hy = sin_h * phi.sin();
+                let hz = cos_h;
+
+                // View vector in local space
+                let vx = sin_theta as f64;
+                let vy = 0.0f64;
+                let vz = cos_theta as f64;
+
+                // Reflect V around H to get L
+                let v_dot_h = vx * hx + vy * hy + vz * hz;
+                if v_dot_h <= 0.0 {
+                    continue;
+                }
+                let _lx = 2.0 * v_dot_h * hx - vx;
+                let _ly = 2.0 * v_dot_h * hy - vy;
+                let lz = 2.0 * v_dot_h * hz - vz;
+
+                if lz <= 0.0 {
+                    continue;
+                }
+
+                // Smith G2 / (4 * NdotV * NdotH)
+                let n_dot_v = cos_theta as f64;
+                let n_dot_l = lz;
+                let n_dot_h = cos_h;
+
+                // G1 for view
+                let g1_v =
+                    2.0 * n_dot_v / (n_dot_v + (a2_d + (1.0 - a2_d) * n_dot_v * n_dot_v).sqrt());
+                let g1_l =
+                    2.0 * n_dot_l / (n_dot_l + (a2_d + (1.0 - a2_d) * n_dot_l * n_dot_l).sqrt());
+
+                // Weight for importance-sampled GGX: G2 * VdotH / (NdotV * NdotH)
+                let weight = g1_v * g1_l * v_dot_h / (n_dot_v * n_dot_h);
+                sum += weight;
+            }
+            e_lut[ci * n + ai] = (sum / num_samples as f64) as f32;
+        }
+
+        // Compute E_avg by integrating E(μ, α) * 2μ dμ
+        let mut avg = 0.0f64;
+        for ci in 0..n {
+            let mu = (ci as f64 + 0.5) / n as f64;
+            avg += e_lut[ci * n + ai] as f64 * 2.0 * mu / n as f64;
+        }
+        e_avg[ai] = avg as f32;
+    }
+
+    (e_lut, e_avg)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_hitgroup_data(
     mat: &scene::SceneMaterial,
@@ -791,6 +881,11 @@ fn main() -> Result<()> {
         alloc_and_copy_slice(&stream, &scene.triangle_lights)?
     };
 
+    // --- GGX energy compensation LUT ---
+    let (ggx_e_lut_data, ggx_e_avg_data) = generate_ggx_energy_lut();
+    let d_ggx_e_lut = alloc_and_copy_slice(&stream, &ggx_e_lut_data)?;
+    let d_ggx_e_avg = alloc_and_copy_slice(&stream, &ggx_e_avg_data)?;
+
     // --- Launch ---
     let pixel_count = (scene.width * scene.height) as usize;
     let d_image: CudaSlice<u32> = stream.alloc_zeros(pixel_count).cuda()?;
@@ -813,6 +908,8 @@ fn main() -> Result<()> {
         sphere_lights: d_sphere_lights,
         num_triangle_lights: scene.triangle_lights.len() as i32,
         triangle_lights: d_triangle_lights,
+        ggx_e_lut: d_ggx_e_lut,
+        ggx_e_avg_lut: d_ggx_e_avg,
     };
     let d_params = alloc_and_copy(&stream, &launch_params)?;
 

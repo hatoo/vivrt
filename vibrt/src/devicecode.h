@@ -104,6 +104,10 @@ struct LaunchParams {
     SphereLight*  sphere_lights;
     int           num_triangle_lights;
     TriangleLight* triangle_lights;
+
+    // GGX energy compensation LUT (Kulla-Conty)
+    float*        ggx_e_lut;       // E(cosTheta, alpha), 32x32
+    float*        ggx_e_avg_lut;   // E_avg(alpha), 32
 };
 
 struct RayGenData {};

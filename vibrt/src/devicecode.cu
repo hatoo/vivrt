@@ -162,7 +162,64 @@ static __forceinline__ __device__ float3 schlick_fresnel_f0_rgb(float cos_i, flo
         f0.z + (1.0f - f0.z) * x5);
 }
 
-// Evaluate Cook-Torrance specular BRDF for a given light direction
+// ---- GGX Energy Compensation (Kulla-Conty) ----
+
+#define GGX_LUT_SIZE 32
+
+// Look up precomputed directional albedo E(cosθ, α)
+static __forceinline__ __device__ float ggx_E(float cos_theta, float alpha)
+{
+    float u = cos_theta * (GGX_LUT_SIZE - 1);
+    float v = alpha * (GGX_LUT_SIZE - 1);
+    int iu = min(max((int)u, 0), GGX_LUT_SIZE - 1);
+    int iv = min(max((int)v, 0), GGX_LUT_SIZE - 1);
+    return params.ggx_e_lut[iu * GGX_LUT_SIZE + iv];
+}
+
+// Look up precomputed average albedo E_avg(α)
+static __forceinline__ __device__ float ggx_E_avg(float alpha)
+{
+    float v = alpha * (GGX_LUT_SIZE - 1);
+    int iv = min(max((int)v, 0), GGX_LUT_SIZE - 1);
+    return params.ggx_e_avg_lut[iv];
+}
+
+// Compute Kulla-Conty multi-scatter compensation BRDF
+// Returns f_ms * F_avg for the given Fresnel term
+static __forceinline__ __device__ float3 ggx_multiscatter(
+    float NdotV, float NdotL, float alpha, float3 F_avg)
+{
+    float E_o = ggx_E(NdotV, alpha);
+    float E_i = ggx_E(NdotL, alpha);
+    float E_a = ggx_E_avg(alpha);
+    float denom = M_PIf * (1.0f - E_a);
+    if (denom < 1e-8f) return make_float3(0, 0, 0);
+    float f_ms = (1.0f - E_o) * (1.0f - E_i) / denom;
+    return F_avg * f_ms;
+}
+
+// Average Fresnel reflectance for conductors (integral of F over cosθ)
+// For Schlick: F_avg = F0 + (1 - F0) / 21
+static __forceinline__ __device__ float3 conductor_F_avg(
+    float3 albedo, float3 eta, float3 k)
+{
+    bool has_ior = (eta.x > 0 || eta.y > 0 || eta.z > 0 ||
+                    k.x > 0 || k.y > 0 || k.z > 0);
+    if (has_ior) {
+        // Numerical approximation: sample a few angles
+        float3 sum = make_float3(0, 0, 0);
+        for (int i = 0; i < 8; i++) {
+            float mu = (i + 0.5f) / 8.0f;
+            sum = sum + conductor_fresnel(mu, eta, k) * (2.0f * mu / 8.0f);
+        }
+        return sum;
+    } else {
+        // Schlick: F_avg = F0 + (1 - F0) / 21
+        return albedo + (make_float3(1, 1, 1) - albedo) * (1.0f / 21.0f);
+    }
+}
+
+// Evaluate Cook-Torrance specular BRDF with Kulla-Conty energy compensation
 // eta/k = (0,0,0) means use Schlick with albedo as F0
 // alpha_u/alpha_v: anisotropic roughness (set equal for isotropic)
 static __forceinline__ __device__ float3 eval_conductor_brdf(
@@ -176,7 +233,6 @@ static __forceinline__ __device__ float3 eval_conductor_brdf(
 
     float D, G;
     if (alpha_u == alpha_v) {
-        // Isotropic fast path
         float NdotH = fmaxf(dot3(N, H), 0.0f);
         D = ggx_D(NdotH, alpha_u);
         G = ggx_G1(NdotV, alpha_u) * ggx_G1(NdotL, alpha_u);
@@ -188,7 +244,7 @@ static __forceinline__ __device__ float3 eval_conductor_brdf(
             ggx_G1_aniso(L, N, T, B, alpha_u, alpha_v);
     }
 
-    // Fresnel: use exact conductor equations if eta/k available, else Schlick
+    // Fresnel
     float3 F;
     bool has_ior = (eta.x > 0 || eta.y > 0 || eta.z > 0 ||
                     k.x > 0 || k.y > 0 || k.z > 0);
@@ -199,8 +255,17 @@ static __forceinline__ __device__ float3 eval_conductor_brdf(
     }
 
     float denom = 4.0f * NdotV * NdotL;
-    if (denom < 0.0001f) return make_float3(0,0,0);
-    return F * (D * G / denom);
+    if (denom < 0.0001f) return make_float3(0, 0, 0);
+
+    // Single-scatter term
+    float3 f_ss = F * (D * G / denom);
+
+    // Multi-scatter energy compensation (Kulla-Conty)
+    float alpha_avg = 0.5f * (alpha_u + alpha_v);
+    float3 F_a = conductor_F_avg(albedo, eta, k);
+    float3 f_ms = ggx_multiscatter(NdotV, NdotL, alpha_avg, F_a);
+
+    return f_ss + f_ms;
 }
 
 // Cosine-weighted hemisphere sample
@@ -577,7 +642,7 @@ extern "C" __global__ void __raygen__rg()
                     hit_pos, hit_normal, view_dir, hit_albedo, alpha_u, alpha_v, true,
                     cond_eta, cond_k, pixel_idx, s, depth);
 
-                // Specular bounce with Fresnel
+                // Specular bounce with Fresnel + energy compensation
                 float3 H = ggx_sample_aniso(bounce_rng.next(), bounce_rng.next(), alpha_u, alpha_v, hit_normal);
                 float VdotH = fmaxf(dot3(view_dir, H), 0.001f);
                 float3 Fr;
@@ -591,7 +656,15 @@ extern "C" __global__ void __raygen__rg()
                 direction = reflect3(direction, H);
                 if (dot3(direction, hit_normal) <= 0.0f) break;
                 origin = hit_pos;
-                throughput = throughput * Fr;
+                // Energy compensation: scale throughput to recover multi-scatter energy
+                float alpha_avg = 0.5f * (alpha_u + alpha_v);
+                float NdotV = fmaxf(dot3(view_dir, hit_normal), 0.001f);
+                float E_o = ggx_E(NdotV, alpha_avg);
+                float E_a = ggx_E_avg(alpha_avg);
+                float3 F_a = conductor_F_avg(hit_albedo, cond_eta, cond_k);
+                // Scale: F * (1 + F_avg * (1 - E_o) / E_o)
+                float ms_scale = (E_o > 0.001f) ? (1.0f + (1.0f - E_o) / E_o * (E_a > 0.001f ? E_a : 0.001f)) : 1.0f;
+                throughput = throughput * (Fr + F_a * fmaxf(ms_scale - 1.0f, 0.0f));
                 specular_bounce = true;
             }
             else if (mat_type == MAT_COATED_CONDUCTOR) {
@@ -629,7 +702,7 @@ extern "C" __global__ void __raygen__rg()
                         hit_pos, hit_normal, view_dir, hit_albedo, cond_alpha_u, cond_alpha_v, true,
                         cond_eta, cond_k, pixel_idx, s, depth);
 
-                    // Specular bounce off conductor
+                    // Specular bounce off conductor with energy compensation
                     float3 H = ggx_sample_aniso(bounce_rng.next(), bounce_rng.next(), cond_alpha_u, cond_alpha_v, hit_normal);
                     float VdotH = fmaxf(dot3(view_dir, H), 0.001f);
                     float3 Fr;
@@ -643,7 +716,13 @@ extern "C" __global__ void __raygen__rg()
                     direction = reflect3(direction, H);
                     if (dot3(direction, hit_normal) <= 0.0f) break;
                     origin = hit_pos;
-                    throughput = throughput * Fr;
+                    float ca = 0.5f * (cond_alpha_u + cond_alpha_v);
+                    float NdV = fmaxf(dot3(view_dir, hit_normal), 0.001f);
+                    float Eo = ggx_E(NdV, ca);
+                    float Ea = ggx_E_avg(ca);
+                    float3 Fa = conductor_F_avg(hit_albedo, cond_eta, cond_k);
+                    float ms_s = (Eo > 0.001f) ? (1.0f + (1.0f - Eo) / Eo * (Ea > 0.001f ? Ea : 0.001f)) : 1.0f;
+                    throughput = throughput * (Fr + Fa * fmaxf(ms_s - 1.0f, 0.0f));
                     specular_bounce = true;
                 }
             }
