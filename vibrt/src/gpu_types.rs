@@ -5,6 +5,7 @@ pub const MAT_DIFFUSE: i32 = 0;
 pub const MAT_DIELECTRIC: i32 = 1;
 pub const MAT_COATED_DIFFUSE: i32 = 2;
 pub const MAT_CONDUCTOR: i32 = 3;
+pub const MAT_COATED_CONDUCTOR: i32 = 4;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -75,6 +76,8 @@ pub struct HitGroupData {
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
     pub roughness: f32,
+    pub coat_roughness: f32,
+    pub coat_eta: f32,
     pub params: MaterialParams,
     // Geometry
     pub vertices: optix_sys::CUdeviceptr,

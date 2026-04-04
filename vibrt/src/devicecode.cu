@@ -234,13 +234,14 @@ static __forceinline__ __device__ ShadowResult trace_shadow(
     unsigned int sp9 = 0xFFFFFFFF;
     unsigned int sp10 = 0, sp11 = 0, sp12 = 0, sp13 = 0;
     unsigned int sp14 = 0, sp15 = 0, sp16 = 0, sp17 = 0, sp18 = 0, sp19 = 0;
+    unsigned int sp20 = 0, sp21 = 0;
     optixTrace(
         params.traversable, origin, dir,
         0.001f, tmax, 0.0f,
         OptixVisibilityMask(255), ray_flags,
         0, 1, 0,
         p0, p1, p2, p3, p4, p5, p6, p7, p8, sp9, sp10, sp11, sp12, sp13,
-        sp14, sp15, sp16, sp17, sp18, sp19);
+        sp14, sp15, sp16, sp17, sp18, sp19, sp20, sp21);
     ShadowResult res;
     res.hit = (sp9 != 0xFFFFFFFF);
     res.emission = make_float3(__uint_as_float(sp10), __uint_as_float(sp11), __uint_as_float(sp12));
@@ -425,6 +426,7 @@ extern "C" __global__ void __raygen__rg()
         for (unsigned int depth = 0; depth < params.max_depth; depth++) {
             unsigned int p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13;
             unsigned int p14 = 0, p15 = 0, p16 = 0, p17 = 0, p18 = 0, p19 = 0;
+            unsigned int p20 = 0, p21 = 0;
             p9 = 0xFFFFFFFF; // miss sentinel
             p10 = p11 = p12 = p13 = 0;
 
@@ -436,7 +438,7 @@ extern "C" __global__ void __raygen__rg()
                 OPTIX_RAY_FLAG_NONE,
                 0, 1, 0,
                 p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13,
-                p14, p15, p16, p17, p18, p19
+                p14, p15, p16, p17, p18, p19, p20, p21
             );
 
             if (p9 == 0xFFFFFFFF) {
@@ -532,6 +534,57 @@ extern "C" __global__ void __raygen__rg()
                 origin = hit_pos;
                 throughput = throughput * Fr;
                 specular_bounce = true;
+            }
+            else if (mat_type == MAT_COATED_CONDUCTOR) {
+                // Dielectric coating over conductor substrate
+                float hit_roughness = __uint_as_float(p13); // conductor roughness
+                float coat_rough = __uint_as_float(p20);
+                float coat_eta_val = __uint_as_float(p21);
+                float coat_alpha = fmaxf(coat_rough * coat_rough, 0.001f);
+                float cond_alpha = fmaxf(hit_roughness * hit_roughness, 0.001f);
+                RNG bounce_rng(pixel_idx, s, depth + 1);
+                float3 view_dir = direction * (-1.0f);
+
+                float3 cond_eta = make_float3(__uint_as_float(p14), __uint_as_float(p15), __uint_as_float(p16));
+                float3 cond_k = make_float3(__uint_as_float(p17), __uint_as_float(p18), __uint_as_float(p19));
+
+                // Coating Fresnel (dielectric)
+                float cos_i = fmaxf(fabsf(dot3(view_dir, hit_normal)), 0.001f);
+                float coat_F0 = (coat_eta_val - 1.0f) * (coat_eta_val - 1.0f)
+                              / ((coat_eta_val + 1.0f) * (coat_eta_val + 1.0f));
+                float coat_F = fresnel_schlick_f0(cos_i, coat_F0);
+
+                if (bounce_rng.next() < coat_F) {
+                    // Reflected by coating: sample GGX with coating roughness
+                    float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), coat_alpha, hit_normal);
+                    direction = reflect3(direction, H);
+                    if (dot3(direction, hit_normal) <= 0.0f) break;
+                    origin = hit_pos;
+                    specular_bounce = true;
+                } else {
+                    // Transmitted through coating: hit conductor underneath
+                    // NEE with conductor BRDF
+                    radiance = radiance + throughput * compute_nee(
+                        hit_pos, hit_normal, view_dir, hit_albedo, cond_alpha, true,
+                        cond_eta, cond_k, pixel_idx, s, depth);
+
+                    // Specular bounce off conductor
+                    float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), cond_alpha, hit_normal);
+                    float VdotH = fmaxf(dot3(view_dir, H), 0.001f);
+                    float3 Fr;
+                    bool has_ior = (cond_eta.x > 0 || cond_eta.y > 0 || cond_eta.z > 0 ||
+                                    cond_k.x > 0 || cond_k.y > 0 || cond_k.z > 0);
+                    if (has_ior) {
+                        Fr = conductor_fresnel(VdotH, cond_eta, cond_k);
+                    } else {
+                        Fr = schlick_fresnel_f0_rgb(VdotH, hit_albedo);
+                    }
+                    direction = reflect3(direction, H);
+                    if (dot3(direction, hit_normal) <= 0.0f) break;
+                    origin = hit_pos;
+                    throughput = throughput * Fr;
+                    specular_bounce = true;
+                }
             }
             else if (mat_type == MAT_DIELECTRIC) {
                 float eta_val = __uint_as_float(p0);
@@ -843,14 +896,18 @@ extern "C" __global__ void __closesthit__ch()
     }
     optixSetPayload_13(__float_as_uint(roughness_val));
 
-    // Conductor eta/k (payloads 14-19)
-    if (data->material_type == MAT_CONDUCTOR) {
+    // Conductor eta/k (payloads 14-19), coat params (payloads 20-21)
+    if (data->material_type == MAT_CONDUCTOR || data->material_type == MAT_COATED_CONDUCTOR) {
         optixSetPayload_14(__float_as_uint(data->conductor.eta[0]));
         optixSetPayload_15(__float_as_uint(data->conductor.eta[1]));
         optixSetPayload_16(__float_as_uint(data->conductor.eta[2]));
         optixSetPayload_17(__float_as_uint(data->conductor.k[0]));
         optixSetPayload_18(__float_as_uint(data->conductor.k[1]));
         optixSetPayload_19(__float_as_uint(data->conductor.k[2]));
+    }
+    if (data->material_type == MAT_COATED_CONDUCTOR) {
+        optixSetPayload_20(__float_as_uint(data->coat_roughness));
+        optixSetPayload_21(__float_as_uint(data->coat_eta));
     }
 }
 
@@ -899,13 +956,17 @@ extern "C" __global__ void __closesthit__sphere()
     optixSetPayload_12(__float_as_uint(data->emission[2]));
     optixSetPayload_13(__float_as_uint(data->roughness));
 
-    if (data->material_type == MAT_CONDUCTOR) {
+    if (data->material_type == MAT_CONDUCTOR || data->material_type == MAT_COATED_CONDUCTOR) {
         optixSetPayload_14(__float_as_uint(data->conductor.eta[0]));
         optixSetPayload_15(__float_as_uint(data->conductor.eta[1]));
         optixSetPayload_16(__float_as_uint(data->conductor.eta[2]));
         optixSetPayload_17(__float_as_uint(data->conductor.k[0]));
         optixSetPayload_18(__float_as_uint(data->conductor.k[1]));
         optixSetPayload_19(__float_as_uint(data->conductor.k[2]));
+    }
+    if (data->material_type == MAT_COATED_CONDUCTOR) {
+        optixSetPayload_20(__float_as_uint(data->coat_roughness));
+        optixSetPayload_21(__float_as_uint(data->coat_eta));
     }
 }
 

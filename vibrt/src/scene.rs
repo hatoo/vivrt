@@ -25,6 +25,8 @@ pub struct SceneMaterial {
     pub checker_color2: [f32; 3],
     pub conductor_eta: [f32; 3],
     pub conductor_k: [f32; 3],
+    pub coat_roughness: f32,
+    pub coat_eta: f32,
     pub texture: Option<std::sync::Arc<ImageTexture>>,
     pub bump_map: Option<std::sync::Arc<ImageTexture>>,
     pub alpha_map: Option<std::sync::Arc<ImageTexture>>,
@@ -47,6 +49,8 @@ impl Default for SceneMaterial {
             checker_color2: [0.0, 0.0, 0.0],
             conductor_eta: [0.0, 0.0, 0.0],
             conductor_k: [0.0, 0.0, 0.0],
+            coat_roughness: 0.0,
+            coat_eta: 1.5,
             texture: None,
             bump_map: None,
             alpha_map: None,
@@ -806,7 +810,12 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         current_material.roughness = p.float("roughness").unwrap_or(0.0);
                     }
                     "conductor" | "coatedconductor" => {
-                        current_material.material_type = MAT_CONDUCTOR;
+                        let is_coated = ty == "coatedconductor";
+                        current_material.material_type = if is_coated {
+                            MAT_COATED_CONDUCTOR
+                        } else {
+                            MAT_CONDUCTOR
+                        };
                         if let Some(c) = p.rgb("reflectance") {
                             current_material.albedo = c;
                         } else if let Some(eta) = parse_conductor_eta(&p) {
@@ -819,7 +828,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 &current_material.conductor_k,
                             );
                         } else {
-                            // Default: gold-like
+                            // Default: gold-like (PBRT defaults to Cu for coatedconductor)
                             current_material.conductor_eta = [0.143, 0.374, 1.442];
                             current_material.conductor_k = [3.983, 2.380, 1.603];
                             current_material.albedo = conductor_f0(
@@ -827,10 +836,22 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 &current_material.conductor_k,
                             );
                         }
-                        current_material.roughness = p
-                            .float("roughness")
-                            .or(p.float("uroughness"))
-                            .unwrap_or(0.0);
+                        if is_coated {
+                            current_material.roughness = p
+                                .float("conductor.roughness")
+                                .or(p.float("conductor.uroughness"))
+                                .unwrap_or(0.0);
+                            current_material.coat_roughness = p
+                                .float("interface.roughness")
+                                .or(p.float("interface.uroughness"))
+                                .unwrap_or(0.0);
+                            current_material.coat_eta = p.float("interface.eta").unwrap_or(1.5);
+                        } else {
+                            current_material.roughness = p
+                                .float("roughness")
+                                .or(p.float("uroughness"))
+                                .unwrap_or(0.0);
+                        }
                     }
                     "dielectric" | "thindielectric" => {
                         current_material.material_type = MAT_DIELECTRIC;
@@ -900,7 +921,12 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         }
                     }
                     "conductor" | "coatedconductor" => {
-                        mat.material_type = MAT_CONDUCTOR;
+                        let is_coated = ty == "coatedconductor";
+                        mat.material_type = if is_coated {
+                            MAT_COATED_CONDUCTOR
+                        } else {
+                            MAT_CONDUCTOR
+                        };
                         if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
                         } else if let Some(eta) = parse_conductor_eta(&p) {
@@ -914,10 +940,22 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             mat.conductor_k = [3.983, 2.380, 1.603];
                             mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
                         }
-                        mat.roughness = p
-                            .float("roughness")
-                            .or(p.float("uroughness"))
-                            .unwrap_or(0.0);
+                        if is_coated {
+                            mat.roughness = p
+                                .float("conductor.roughness")
+                                .or(p.float("conductor.uroughness"))
+                                .unwrap_or(0.0);
+                            mat.coat_roughness = p
+                                .float("interface.roughness")
+                                .or(p.float("interface.uroughness"))
+                                .unwrap_or(0.0);
+                            mat.coat_eta = p.float("interface.eta").unwrap_or(1.5);
+                        } else {
+                            mat.roughness = p
+                                .float("roughness")
+                                .or(p.float("uroughness"))
+                                .unwrap_or(0.0);
+                        }
                     }
                     "dielectric" | "thindielectric" => {
                         mat.material_type = MAT_DIELECTRIC;

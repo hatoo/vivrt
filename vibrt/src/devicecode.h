@@ -7,6 +7,7 @@ enum MaterialType {
     MAT_DIELECTRIC = 1,
     MAT_COATED_DIFFUSE = 2,
     MAT_CONDUCTOR = 3,
+    MAT_COATED_CONDUCTOR = 4,
 };
 
 struct DistantLight {
@@ -55,6 +56,8 @@ struct HitGroupData {
     float         albedo[3];
     float         emission[3];
     float         roughness;
+    float         coat_roughness;
+    float         coat_eta;
     union {
         DiffuseParams       diffuse;
         DielectricParams    dielectric;
