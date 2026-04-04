@@ -750,6 +750,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     parsed.cam_look = transform_point(parsed.cam_look);
                     parsed.cam_up = transform_vec(parsed.cam_up);
                 }
+                // Save built-in coordinate systems
+                named_coord_systems.insert("camera".to_string(), current_transform);
+                named_coord_systems.insert("world".to_string(), transform::identity());
                 current_transform = transform::identity();
                 _in_world = true;
             }
