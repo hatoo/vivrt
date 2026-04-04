@@ -444,14 +444,19 @@ fn main() -> Result<()> {
         .objects
         .iter()
         .any(|o| matches!(o.shape, SceneShape::Sphere { .. }));
+    let has_disks = scene
+        .objects
+        .iter()
+        .any(|o| matches!(o.shape, SceneShape::Disk { .. }));
+    let has_custom = has_spheres || has_disks;
 
     let mut prim_flags = PrimitiveTypeFlags::TRIANGLE;
-    if has_spheres {
+    if has_custom {
         prim_flags |= PrimitiveTypeFlags::CUSTOM;
     }
 
     let pipeline_options = PipelineCompileOptions::new("params")
-        .traversable_graph_flags(if scene.objects.len() > 1 || has_spheres {
+        .traversable_graph_flags(if scene.objects.len() > 1 || has_custom {
             TraversableGraphFlags::ALLOW_SINGLE_LEVEL_INSTANCING
         } else {
             TraversableGraphFlags::ALLOW_SINGLE_GAS
@@ -492,8 +497,24 @@ fn main() -> Result<()> {
         None
     };
 
+    let hitgroup_disk_pg = if has_disks {
+        Some(
+            ProgramGroup::hitgroup(&ctx)
+                .closest_hit(&module, "__closesthit__disk")
+                .intersection(&module, "__intersection__disk")
+                .build()
+                .context("hitgroup_disk")?
+                .value,
+        )
+    } else {
+        None
+    };
+
     let mut all_pgs: Vec<&ProgramGroup> = vec![&raygen_pg, &miss_pg, &hitgroup_tri_pg];
     if let Some(ref pg) = hitgroup_sphere_pg {
+        all_pgs.push(pg);
+    }
+    if let Some(ref pg) = hitgroup_disk_pg {
         all_pgs.push(pg);
     }
 
@@ -507,7 +528,7 @@ fn main() -> Result<()> {
     )
     .context("pipeline")?
     .value;
-    let max_graph_depth = if scene.objects.len() > 1 || has_spheres {
+    let max_graph_depth = if scene.objects.len() > 1 || has_custom {
         2
     } else {
         1
@@ -517,15 +538,22 @@ fn main() -> Result<()> {
     // --- Build geometry ---
     let mut _device_buffers: Vec<CudaSlice<u8>> = Vec::new();
 
+    #[derive(Clone, Copy)]
+    enum ShapeKind {
+        Triangle,
+        Sphere,
+        Disk,
+    }
     struct GasEntry {
         handle: optix_sys::OptixTraversableHandle,
         sbt_offset: u32,
         transform: [f32; 12],
-        is_sphere: bool,
+        kind: ShapeKind,
     }
     let mut gas_entries: Vec<GasEntry> = Vec::new();
     let mut tri_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
     let mut sphere_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
+    let mut disk_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
 
     let build_options = AccelBuildOptions {
         build_flags: BuildFlags::PREFER_FAST_TRACE,
@@ -600,7 +628,94 @@ fn main() -> Result<()> {
                     handle,
                     sbt_offset,
                     transform: obj.transform,
-                    is_sphere: true,
+                    kind: ShapeKind::Sphere,
+                });
+
+                _device_buffers.push(unsafe { std::mem::transmute(d_aabb) });
+                _device_buffers.push(d_temp);
+                _device_buffers.push(d_output);
+            }
+            SceneShape::Disk {
+                radius,
+                inner_radius,
+                height,
+            } => {
+                let eps = 0.001f32;
+                let aabb = [
+                    -*radius,
+                    -*radius,
+                    *height - eps,
+                    *radius,
+                    *radius,
+                    *height + eps,
+                ];
+                let d_aabb = stream.clone_htod(&aabb).cuda()?;
+                let aabb_ptrs = [dptr(&d_aabb, &stream)];
+                let flags = [GeometryFlags::NONE];
+
+                let custom_input = accel::CustomPrimitiveInput {
+                    aabb_buffers: &aabb_ptrs,
+                    num_primitives: 1,
+                    stride: 0,
+                    flags: &flags,
+                    num_sbt_records: 1,
+                    primitive_index_offset: 0,
+                };
+
+                let bi = [BuildInput::CustomPrimitives(custom_input)];
+                let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &bi)
+                    .context("disk accel memory")?;
+                let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
+                let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
+
+                let handle = accel::accel_build(
+                    &ctx,
+                    cu_stream,
+                    &build_options,
+                    &bi,
+                    dptr(&d_temp, &stream),
+                    sizes.temp_size,
+                    dptr(&d_output, &stream),
+                    sizes.output_size,
+                )
+                .context("disk accel build")?;
+
+                let mut hg_data = make_hitgroup_data(
+                    &obj.material,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                // Store disk params in repurposed fields
+                hg_data.num_vertices = radius.to_bits() as i32;
+                hg_data.texture_width = inner_radius.to_bits() as i32;
+                hg_data.texture_height = height.to_bits() as i32;
+
+                let sbt_offset = disk_hg_records.len() as u32;
+                disk_hg_records.push(SbtRecord::new(
+                    hitgroup_disk_pg.as_ref().context("no disk hitgroup")?,
+                    hg_data,
+                )?);
+
+                gas_entries.push(GasEntry {
+                    handle,
+                    sbt_offset,
+                    transform: obj.transform,
+                    kind: ShapeKind::Disk,
                 });
 
                 _device_buffers.push(unsafe { std::mem::transmute(d_aabb) });
@@ -752,7 +867,7 @@ fn main() -> Result<()> {
                     handle,
                     sbt_offset,
                     transform: transform::identity(),
-                    is_sphere: false,
+                    kind: ShapeKind::Triangle,
                 });
 
                 _device_buffers.push(unsafe { std::mem::transmute(d_verts) });
@@ -766,17 +881,18 @@ fn main() -> Result<()> {
     stream.synchronize().cuda()?;
 
     // --- Build IAS or use single GAS ---
-    let needs_ias = has_spheres || gas_entries.len() > 1;
+    let needs_ias = has_custom || gas_entries.len() > 1;
     let traversable = if needs_ias {
         let sphere_sbt_base = tri_hg_records.len() as u32;
+        let disk_sbt_base = sphere_sbt_base + sphere_hg_records.len() as u32;
         let instances: Vec<optix_sys::OptixInstance> = gas_entries
             .iter()
             .enumerate()
             .map(|(i, entry)| {
-                let sbt_offset = if entry.is_sphere {
-                    sphere_sbt_base + entry.sbt_offset
-                } else {
-                    entry.sbt_offset
+                let sbt_offset = match entry.kind {
+                    ShapeKind::Triangle => entry.sbt_offset,
+                    ShapeKind::Sphere => sphere_sbt_base + entry.sbt_offset,
+                    ShapeKind::Disk => disk_sbt_base + entry.sbt_offset,
                 };
                 optix_sys::OptixInstance {
                     transform: entry.transform,
@@ -844,7 +960,11 @@ fn main() -> Result<()> {
         let bytes = unsafe { std::slice::from_raw_parts(rec as *const _ as *const u8, hg_stride) };
         all_hg_records.extend_from_slice(bytes);
     }
-    let total_hg_count = tri_hg_records.len() + sphere_hg_records.len();
+    for rec in &disk_hg_records {
+        let bytes = unsafe { std::slice::from_raw_parts(rec as *const _ as *const u8, hg_stride) };
+        all_hg_records.extend_from_slice(bytes);
+    }
+    let total_hg_count = tri_hg_records.len() + sphere_hg_records.len() + disk_hg_records.len();
     let d_hg = alloc_and_copy_slice(&stream, &all_hg_records)?;
 
     let sbt = ShaderBindingTableBuilder::new(d_rg)

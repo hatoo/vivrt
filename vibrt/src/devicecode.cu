@@ -1284,3 +1284,95 @@ extern "C" __global__ void __intersection__sphere()
         optixReportIntersection(t2, 0);
     }
 }
+
+// Custom disk intersection: flat circle at z=height
+extern "C" __global__ void __intersection__disk()
+{
+    const float3 ray_orig = optixGetObjectRayOrigin();
+    const float3 ray_dir = optixGetObjectRayDirection();
+    const float tmin = optixGetRayTmin();
+    const float tmax = optixGetRayTmax();
+
+    const HitGroupData* data = reinterpret_cast<const HitGroupData*>(optixGetSbtDataPointer());
+    float radius = __int_as_float(data->num_vertices);
+    float inner_radius = __int_as_float(data->texture_width);
+    float height = __int_as_float(data->texture_height);
+
+    // Ray-plane intersection: z = height
+    if (fabsf(ray_dir.z) < 1e-8f) return; // parallel to disk
+    float t = (height - ray_orig.z) / ray_dir.z;
+    if (t < tmin || t > tmax) return;
+
+    // Check if hit point is within annulus
+    float px = ray_orig.x + t * ray_dir.x;
+    float py = ray_orig.y + t * ray_dir.y;
+    float r2 = px * px + py * py;
+    if (r2 > radius * radius || r2 < inner_radius * inner_radius) return;
+
+    optixReportIntersection(t, 0);
+}
+
+// Closest hit for disk (custom intersection)
+extern "C" __global__ void __closesthit__disk()
+{
+    const HitGroupData* data = reinterpret_cast<const HitGroupData*>(optixGetSbtDataPointer());
+
+    const float t = optixGetRayTmax();
+    const float3 ray_orig = optixGetWorldRayOrigin();
+    const float3 ray_dir = optixGetWorldRayDirection();
+    float3 hit_pos = ray_orig + ray_dir * t;
+
+    // Disk normal is (0,0,1) in object space
+    float3 obj_normal = make_float3(0.0f, 0.0f, 1.0f);
+    float3 world_normal = normalize3(optixTransformNormalFromObjectToWorldSpace(obj_normal));
+
+    if (dot3(world_normal, ray_dir) > 0.0f)
+        world_normal = world_normal * (-1.0f);
+
+    if (data->material_type == MAT_DIELECTRIC) {
+        optixSetPayload_0(__float_as_uint(data->dielectric.eta));
+        optixSetPayload_1(__float_as_uint(data->dielectric.tint[0]));
+        optixSetPayload_2(__float_as_uint(data->dielectric.tint[1]));
+        optixSetPayload_13(__float_as_uint(data->dielectric.tint[2]));
+    } else {
+        float3 albedo = make_f3(data->albedo);
+        optixSetPayload_0(__float_as_uint(albedo.x));
+        optixSetPayload_1(__float_as_uint(albedo.y));
+        optixSetPayload_2(__float_as_uint(albedo.z));
+    }
+
+    optixSetPayload_3(__float_as_uint(hit_pos.x));
+    optixSetPayload_4(__float_as_uint(hit_pos.y));
+    optixSetPayload_5(__float_as_uint(hit_pos.z));
+    optixSetPayload_6(__float_as_uint(world_normal.x));
+    optixSetPayload_7(__float_as_uint(world_normal.y));
+    optixSetPayload_8(__float_as_uint(world_normal.z));
+    optixSetPayload_9((unsigned int)data->material_type);
+    optixSetPayload_10(__float_as_uint(data->emission[0]));
+    optixSetPayload_11(__float_as_uint(data->emission[1]));
+    optixSetPayload_12(__float_as_uint(data->emission[2]));
+    optixSetPayload_13(__float_as_uint(data->roughness));
+    float rv = data->roughness_v;
+    if (rv == 0.0f) rv = data->roughness;
+    optixSetPayload_22(__float_as_uint(rv));
+
+    if (data->material_type == MAT_CONDUCTOR || data->material_type == MAT_COATED_CONDUCTOR) {
+        optixSetPayload_14(__float_as_uint(data->conductor.eta[0]));
+        optixSetPayload_15(__float_as_uint(data->conductor.eta[1]));
+        optixSetPayload_16(__float_as_uint(data->conductor.eta[2]));
+        optixSetPayload_17(__float_as_uint(data->conductor.k[0]));
+        optixSetPayload_18(__float_as_uint(data->conductor.k[1]));
+        optixSetPayload_19(__float_as_uint(data->conductor.k[2]));
+    }
+    if (data->material_type == MAT_COATED_CONDUCTOR) {
+        optixSetPayload_20(__float_as_uint(data->coat_roughness));
+        optixSetPayload_21(__float_as_uint(data->coat_eta));
+    }
+
+    // Disk tangent: (1,0,0) in object space
+    float3 obj_tangent = make_float3(1.0f, 0.0f, 0.0f);
+    float3 world_tangent = normalize3(optixTransformVectorFromObjectToWorldSpace(obj_tangent));
+    optixSetPayload_23(__float_as_uint(world_tangent.x));
+    optixSetPayload_24(__float_as_uint(world_tangent.y));
+    optixSetPayload_25(__float_as_uint(world_tangent.z));
+}

@@ -77,6 +77,11 @@ pub enum SceneShape {
     Sphere {
         radius: f32,
     },
+    Disk {
+        radius: f32,
+        inner_radius: f32,
+        height: f32,
+    },
     TriangleMesh {
         vertices: Vec<f32>,
         indices: Vec<i32>,
@@ -540,6 +545,16 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
                 indices,
                 texcoords,
                 normals: Vec::new(),
+            })
+        }
+        "disk" => {
+            let radius = p.float("radius").unwrap_or(1.0);
+            let inner_radius = p.float("innerradius").unwrap_or(0.0);
+            let height = p.float("height").unwrap_or(0.0);
+            Some(SceneShape::Disk {
+                radius,
+                inner_radius,
+                height,
             })
         }
         "plymesh" => {
