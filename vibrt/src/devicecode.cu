@@ -561,6 +561,41 @@ static __forceinline__ __device__ unsigned int packColor(float3 c) {
     return (255u << 24) | (ib << 16) | (ig << 8) | ir;
 }
 
+// ---- Environment map sampling ----
+
+static __forceinline__ __device__ float3 sample_envmap(float3 dir)
+{
+    if (!params.envmap_data) return make_f3(params.ambient_light);
+
+    // Equirectangular mapping: direction → (u, v)
+    float theta = acosf(fminf(fmaxf(dir.y, -1.0f), 1.0f)); // angle from +Y
+    float phi = atan2f(dir.z, dir.x); // angle in XZ plane
+    float u = 0.5f + phi / (2.0f * M_PIf);
+    float v = theta / M_PIf;
+
+    // Bilinear sample
+    int w = params.envmap_width;
+    int h = params.envmap_height;
+    float fx = u * (w - 1);
+    float fy = v * (h - 1);
+    int ix = (int)fx;
+    int iy = (int)fy;
+    float dx = fx - ix;
+    float dy = fy - iy;
+    ix = max(0, min(ix, w - 1));
+    iy = max(0, min(iy, h - 1));
+    int ix1 = min(ix + 1, w - 1);
+    int iy1 = min(iy + 1, h - 1);
+
+    const float* d = params.envmap_data;
+    float3 c00 = make_float3(d[(iy*w+ix)*3], d[(iy*w+ix)*3+1], d[(iy*w+ix)*3+2]);
+    float3 c10 = make_float3(d[(iy*w+ix1)*3], d[(iy*w+ix1)*3+1], d[(iy*w+ix1)*3+2]);
+    float3 c01 = make_float3(d[(iy1*w+ix)*3], d[(iy1*w+ix)*3+1], d[(iy1*w+ix)*3+2]);
+    float3 c11 = make_float3(d[(iy1*w+ix1)*3], d[(iy1*w+ix1)*3+1], d[(iy1*w+ix1)*3+2]);
+
+    return c00*(1-dx)*(1-dy) + c10*dx*(1-dy) + c01*(1-dx)*dy + c11*dx*dy;
+}
+
 // ---- Programs ----
 
 extern "C" __global__ void __raygen__rg()
@@ -608,8 +643,8 @@ extern "C" __global__ void __raygen__rg()
             );
 
             if (p9 == 0xFFFFFFFF) {
-                // Miss - add environment light
-                float3 bg = make_f3(params.ambient_light);
+                // Miss - sample environment map or use constant ambient
+                float3 bg = sample_envmap(direction);
                 radiance = radiance + throughput * bg;
                 break;
             }

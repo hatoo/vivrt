@@ -107,6 +107,7 @@ pub struct ParsedScene {
     pub objects: Vec<SceneObject>,
     pub filename: String,
     pub cam_flip_x: bool,
+    pub envmap: Option<ImageTexture>,
 }
 
 // ---- Parameter access tracking ----
@@ -643,6 +644,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         objects: Vec::new(),
         filename: "output.png".to_string(),
         cam_flip_x: false,
+        envmap: None,
     };
 
     #[derive(Clone)]
@@ -840,8 +842,34 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             Directive::LightSource { ty, params } => match ty.as_str() {
                 "infinite" => {
                     let p = ParamSet::new(params, "LightSource \"infinite\"");
-                    if let Some(c) = p.rgb("L") {
-                        parsed.ambient_light = c;
+                    let scale = p.rgb("L").unwrap_or([1.0, 1.0, 1.0]);
+                    if let Some(filename) = p.string("filename") {
+                        let path = scene_dir.join(filename);
+                        match image::open(&path) {
+                            Ok(img) => {
+                                let rgb = img.to_rgb32f();
+                                let (w, h) = rgb.dimensions();
+                                let mut data: Vec<f32> = rgb.into_raw();
+                                // Apply L scale to envmap pixels
+                                for pixel in data.chunks_exact_mut(3) {
+                                    pixel[0] *= scale[0];
+                                    pixel[1] *= scale[1];
+                                    pixel[2] *= scale[2];
+                                }
+                                println!("Loaded envmap: {}x{} from {}", w, h, path.display());
+                                parsed.envmap = Some(ImageTexture {
+                                    data,
+                                    width: w,
+                                    height: h,
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to load envmap {}: {e}", path.display());
+                                parsed.ambient_light = scale;
+                            }
+                        }
+                    } else {
+                        parsed.ambient_light = scale;
                     }
                 }
                 "distant" => {

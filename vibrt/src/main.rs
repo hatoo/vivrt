@@ -886,6 +886,14 @@ fn main() -> Result<()> {
     let d_ggx_e_lut = alloc_and_copy_slice(&stream, &ggx_e_lut_data)?;
     let d_ggx_e_avg = alloc_and_copy_slice(&stream, &ggx_e_avg_data)?;
 
+    // --- Environment map ---
+    let (d_envmap, envmap_w, envmap_h) = if let Some(ref env) = scene.envmap {
+        let d = alloc_and_copy_slice(&stream, &env.data)?;
+        (d, env.width as i32, env.height as i32)
+    } else {
+        (0, 0, 0)
+    };
+
     // --- Launch ---
     let pixel_count = (scene.width * scene.height) as usize;
     let d_image: CudaSlice<u32> = stream.alloc_zeros(pixel_count).cuda()?;
@@ -908,6 +916,9 @@ fn main() -> Result<()> {
         sphere_lights: d_sphere_lights,
         num_triangle_lights: scene.triangle_lights.len() as i32,
         triangle_lights: d_triangle_lights,
+        envmap_data: d_envmap,
+        envmap_width: envmap_w,
+        envmap_height: envmap_h,
         ggx_e_lut: d_ggx_e_lut,
         ggx_e_avg_lut: d_ggx_e_avg,
     };
