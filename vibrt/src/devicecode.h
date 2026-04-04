@@ -106,9 +106,12 @@ struct LaunchParams {
     TriangleLight* triangle_lights;
 
     // Environment map (IBL)
-    float*        envmap_data;     // RGB float, width*height*3 (NULL = no envmap)
+    float*        envmap_data;
     int           envmap_width;
     int           envmap_height;
+    float*        envmap_marginal_cdf;     // float[height+1]
+    float*        envmap_conditional_cdf;  // float[height*(width+1)]
+    float         envmap_integral;
 
     // GGX energy compensation LUT (Kulla-Conty)
     float*        ggx_e_lut;       // E(cosTheta, alpha), 32x32

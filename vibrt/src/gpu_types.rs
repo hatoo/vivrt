@@ -125,6 +125,9 @@ pub struct LaunchParams {
     pub envmap_data: optix_sys::CUdeviceptr, // RGB float, width*height*3 (0 = no envmap)
     pub envmap_width: i32,
     pub envmap_height: i32,
+    pub envmap_marginal_cdf: optix_sys::CUdeviceptr, // float[height+1], marginal CDF over rows
+    pub envmap_conditional_cdf: optix_sys::CUdeviceptr, // float[height*(width+1)], conditional CDFs
+    pub envmap_integral: f32,                        // total luminance integral
     // GGX energy compensation LUT (Kulla-Conty)
     pub ggx_e_lut: optix_sys::CUdeviceptr, // E(cosθ, α), 32x32 float
     pub ggx_e_avg_lut: optix_sys::CUdeviceptr, // E_avg(α), 32 float

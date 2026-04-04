@@ -412,6 +412,82 @@ static __forceinline__ __device__ ShadowResult trace_shadow(
     return res;
 }
 
+// ---- Environment map sampling ----
+
+static __forceinline__ __device__ float3 sample_envmap(float3 dir)
+{
+    if (!params.envmap_data) return make_f3(params.ambient_light);
+
+    float theta = acosf(fminf(fmaxf(dir.y, -1.0f), 1.0f));
+    float phi = atan2f(dir.z, dir.x);
+    float u = 0.5f + phi / (2.0f * M_PIf);
+    float v = theta / M_PIf;
+
+    int w = params.envmap_width;
+    int h = params.envmap_height;
+    float fx = u * (w - 1);
+    float fy = v * (h - 1);
+    int ix = (int)fx;
+    int iy = (int)fy;
+    float dx = fx - ix;
+    float dy = fy - iy;
+    ix = max(0, min(ix, w - 1));
+    iy = max(0, min(iy, h - 1));
+    int ix1 = min(ix + 1, w - 1);
+    int iy1 = min(iy + 1, h - 1);
+
+    const float* d = params.envmap_data;
+    float3 c00 = make_float3(d[(iy*w+ix)*3], d[(iy*w+ix)*3+1], d[(iy*w+ix)*3+2]);
+    float3 c10 = make_float3(d[(iy*w+ix1)*3], d[(iy*w+ix1)*3+1], d[(iy*w+ix1)*3+2]);
+    float3 c01 = make_float3(d[(iy1*w+ix)*3], d[(iy1*w+ix)*3+1], d[(iy1*w+ix)*3+2]);
+    float3 c11 = make_float3(d[(iy1*w+ix1)*3], d[(iy1*w+ix1)*3+1], d[(iy1*w+ix1)*3+2]);
+
+    return c00*(1-dx)*(1-dy) + c10*dx*(1-dy) + c01*(1-dx)*dy + c11*dx*dy;
+}
+
+static __forceinline__ __device__ int cdf_search(const float* cdf, int n, float u)
+{
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (cdf[mid + 1] <= u)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+static __forceinline__ __device__ void sample_envmap_direction(
+    float u1, float u2, float3& dir, float3& color, float& pdf)
+{
+    int w = params.envmap_width;
+    int h = params.envmap_height;
+
+    int y = cdf_search(params.envmap_marginal_cdf, h, u1);
+    float cdf_y0 = params.envmap_marginal_cdf[y];
+    float cdf_y1 = params.envmap_marginal_cdf[y + 1];
+    float frac_v = (cdf_y1 > cdf_y0) ? (u1 - cdf_y0) / (cdf_y1 - cdf_y0) : 0.0f;
+    float v = (y + frac_v) / (float)h;
+
+    const float* row_cdf = params.envmap_conditional_cdf + y * (w + 1);
+    int x = cdf_search(row_cdf, w, u2);
+    float cdf_x0 = row_cdf[x];
+    float cdf_x1 = row_cdf[x + 1];
+    float frac_u = (cdf_x1 > cdf_x0) ? (u2 - cdf_x0) / (cdf_x1 - cdf_x0) : 0.0f;
+    float u = (x + frac_u) / (float)w;
+
+    float theta = v * M_PIf;
+    float phi = (u - 0.5f) * 2.0f * M_PIf;
+    float sin_theta = sinf(theta);
+    dir = make_float3(cosf(phi) * sin_theta, cosf(theta), sinf(phi) * sin_theta);
+    color = sample_envmap(dir);
+
+    float marginal_pdf = (cdf_y1 - cdf_y0) * (float)h;
+    float conditional_pdf = (cdf_x1 - cdf_x0) * (float)w;
+    pdf = marginal_pdf * conditional_pdf / (2.0f * M_PIf * M_PIf * fmaxf(sin_theta, 1e-6f));
+}
+
 // ---- NEE (Next Event Estimation) ----
 
 // Evaluate BRDF * NdotL for a given light direction.
@@ -536,6 +612,34 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
     return result;
 }
 
+static __forceinline__ __device__ float3 nee_envmap(
+    float3 hit_pos, float3 hit_normal, float3 V, float3 albedo,
+    float alpha_u, float alpha_v, bool is_conductor,
+    float3 eta, float3 k, float3 geom_tangent,
+    unsigned int pixel_idx, unsigned int sample_idx, unsigned int depth)
+{
+    if (!params.envmap_data || params.envmap_integral <= 0.0f)
+        return make_float3(0, 0, 0);
+
+    RNG env_rng(pixel_idx * 41, sample_idx, depth + 300);
+    float3 L, env_color;
+    float env_pdf;
+    sample_envmap_direction(env_rng.next(), env_rng.next(), L, env_color, env_pdf);
+
+    if (env_pdf <= 0.0f) return make_float3(0, 0, 0);
+
+    float3 bw = eval_brdf_cosine(V, L, hit_normal, albedo, alpha_u, alpha_v,
+                                  is_conductor, eta, k, geom_tangent);
+    if (bw.x <= 0 && bw.y <= 0 && bw.z <= 0) return make_float3(0, 0, 0);
+
+    // Shadow ray — check if direction is unoccluded (misses all geometry)
+    ShadowResult sr = trace_shadow(hit_pos, L, 1e16f, OPTIX_RAY_FLAG_NONE);
+    if (!sr.hit) {
+        return bw * env_color * (1.0f / env_pdf);
+    }
+    return make_float3(0, 0, 0);
+}
+
 static __forceinline__ __device__ float3 compute_nee(
     float3 hit_pos, float3 hit_normal, float3 V, float3 albedo,
     float alpha_u, float alpha_v, bool is_conductor,
@@ -544,7 +648,8 @@ static __forceinline__ __device__ float3 compute_nee(
 {
     return nee_distant_lights(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent)
          + nee_sphere_lights(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent, pixel_idx, sample_idx, depth)
-         + nee_triangle_lights(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent, pixel_idx, sample_idx, depth);
+         + nee_triangle_lights(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent, pixel_idx, sample_idx, depth)
+         + nee_envmap(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent, pixel_idx, sample_idx, depth);
 }
 
 // ---- Pack/unpack color ----
@@ -559,41 +664,6 @@ static __forceinline__ __device__ unsigned int packColor(float3 c) {
     unsigned int ig = (unsigned int)(g * 255.0f);
     unsigned int ib = (unsigned int)(b * 255.0f);
     return (255u << 24) | (ib << 16) | (ig << 8) | ir;
-}
-
-// ---- Environment map sampling ----
-
-static __forceinline__ __device__ float3 sample_envmap(float3 dir)
-{
-    if (!params.envmap_data) return make_f3(params.ambient_light);
-
-    // Equirectangular mapping: direction → (u, v)
-    float theta = acosf(fminf(fmaxf(dir.y, -1.0f), 1.0f)); // angle from +Y
-    float phi = atan2f(dir.z, dir.x); // angle in XZ plane
-    float u = 0.5f + phi / (2.0f * M_PIf);
-    float v = theta / M_PIf;
-
-    // Bilinear sample
-    int w = params.envmap_width;
-    int h = params.envmap_height;
-    float fx = u * (w - 1);
-    float fy = v * (h - 1);
-    int ix = (int)fx;
-    int iy = (int)fy;
-    float dx = fx - ix;
-    float dy = fy - iy;
-    ix = max(0, min(ix, w - 1));
-    iy = max(0, min(iy, h - 1));
-    int ix1 = min(ix + 1, w - 1);
-    int iy1 = min(iy + 1, h - 1);
-
-    const float* d = params.envmap_data;
-    float3 c00 = make_float3(d[(iy*w+ix)*3], d[(iy*w+ix)*3+1], d[(iy*w+ix)*3+2]);
-    float3 c10 = make_float3(d[(iy*w+ix1)*3], d[(iy*w+ix1)*3+1], d[(iy*w+ix1)*3+2]);
-    float3 c01 = make_float3(d[(iy1*w+ix)*3], d[(iy1*w+ix)*3+1], d[(iy1*w+ix)*3+2]);
-    float3 c11 = make_float3(d[(iy1*w+ix1)*3], d[(iy1*w+ix1)*3+1], d[(iy1*w+ix1)*3+2]);
-
-    return c00*(1-dx)*(1-dy) + c10*dx*(1-dy) + c01*(1-dx)*dy + c11*dx*dy;
 }
 
 // ---- Programs ----
@@ -644,8 +714,12 @@ extern "C" __global__ void __raygen__rg()
 
             if (p9 == 0xFFFFFFFF) {
                 // Miss - sample environment map or use constant ambient
-                float3 bg = sample_envmap(direction);
-                radiance = radiance + throughput * bg;
+                // Only add envmap on camera rays or specular bounces to avoid
+                // double-counting with envmap NEE on diffuse paths
+                if (specular_bounce || !params.envmap_data) {
+                    float3 bg = sample_envmap(direction);
+                    radiance = radiance + throughput * bg;
+                }
                 break;
             }
 

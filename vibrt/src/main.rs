@@ -887,13 +887,59 @@ fn main() -> Result<()> {
     let d_ggx_e_lut = alloc_and_copy_slice(&stream, &ggx_e_lut_data)?;
     let d_ggx_e_avg = alloc_and_copy_slice(&stream, &ggx_e_avg_data)?;
 
-    // --- Environment map ---
-    let (d_envmap, envmap_w, envmap_h) = if let Some(ref env) = scene.envmap {
-        let d = alloc_and_copy_slice(&stream, &env.data)?;
-        (d, env.width as i32, env.height as i32)
-    } else {
-        (0, 0, 0)
-    };
+    // --- Environment map + importance sampling CDF ---
+    let (d_envmap, envmap_w, envmap_h, d_marginal_cdf, d_conditional_cdf, envmap_integral) =
+        if let Some(ref env) = scene.envmap {
+            let d = alloc_and_copy_slice(&stream, &env.data)?;
+            let w = env.width as usize;
+            let h = env.height as usize;
+
+            // Build conditional CDFs (per-row) and marginal CDF
+            let mut conditional_cdf = vec![0.0f32; h * (w + 1)];
+            let mut row_integrals = vec![0.0f32; h];
+
+            for y in 0..h {
+                let sin_theta = (std::f32::consts::PI * (y as f32 + 0.5) / h as f32).sin();
+                let row_offset = y * (w + 1);
+                conditional_cdf[row_offset] = 0.0;
+                for x in 0..w {
+                    let idx = (y * w + x) * 3;
+                    let lum = 0.2126 * env.data[idx]
+                        + 0.7152 * env.data[idx + 1]
+                        + 0.0722 * env.data[idx + 2];
+                    conditional_cdf[row_offset + x + 1] =
+                        conditional_cdf[row_offset + x] + lum * sin_theta;
+                }
+                row_integrals[y] = conditional_cdf[row_offset + w];
+                // Normalize conditional CDF
+                if row_integrals[y] > 0.0 {
+                    let inv = 1.0 / row_integrals[y];
+                    for x in 1..=w {
+                        conditional_cdf[row_offset + x] *= inv;
+                    }
+                }
+            }
+
+            // Build marginal CDF
+            let mut marginal_cdf = vec![0.0f32; h + 1];
+            marginal_cdf[0] = 0.0;
+            for y in 0..h {
+                marginal_cdf[y + 1] = marginal_cdf[y] + row_integrals[y];
+            }
+            let total = marginal_cdf[h];
+            if total > 0.0 {
+                let inv = 1.0 / total;
+                for y in 1..=h {
+                    marginal_cdf[y] *= inv;
+                }
+            }
+
+            let d_m = alloc_and_copy_slice(&stream, &marginal_cdf)?;
+            let d_c = alloc_and_copy_slice(&stream, &conditional_cdf)?;
+            (d, w as i32, h as i32, d_m, d_c, total)
+        } else {
+            (0, 0, 0, 0, 0, 0.0)
+        };
 
     // --- Launch ---
     let pixel_count = (scene.width * scene.height) as usize;
@@ -920,6 +966,9 @@ fn main() -> Result<()> {
         envmap_data: d_envmap,
         envmap_width: envmap_w,
         envmap_height: envmap_h,
+        envmap_marginal_cdf: d_marginal_cdf,
+        envmap_conditional_cdf: d_conditional_cdf,
+        envmap_integral: envmap_integral,
         ggx_e_lut: d_ggx_e_lut,
         ggx_e_avg_lut: d_ggx_e_avg,
     };
