@@ -363,6 +363,7 @@ fn parse_conductor_eta(p: &ParamSet) -> Option<[f32; 3]> {
         if let Some(v) = named_metal_eta(s) {
             return Some(v);
         }
+        eprintln!("  warning: unknown named spectrum for eta: {s}");
     }
     // Inline spectrum data
     if let Some(v) = p.spectrum_rgb("eta") {
@@ -385,6 +386,7 @@ fn parse_conductor_k(p: &ParamSet) -> Option<[f32; 3]> {
         if let Some(v) = named_metal_k(s) {
             return Some(v);
         }
+        eprintln!("  warning: unknown named spectrum for k: {s}");
     }
     if let Some(v) = p.spectrum_rgb("k") {
         return Some(v);
@@ -962,7 +964,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 Some(SceneTexture::Image(img)) => {
                                     current_material.texture = Some(img.clone());
                                 }
-                                None => {}
+                                None => {
+                                    eprintln!("  warning: unknown texture reference: {}", tex_name);
+                                }
                             }
                         }
                     }
@@ -983,7 +987,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 Some(SceneTexture::Image(img)) => {
                                     current_material.texture = Some(img.clone());
                                 }
-                                None => {}
+                                None => {
+                                    eprintln!("  warning: unknown texture reference: {}", tex_name);
+                                }
                             }
                         }
                         let (ru, rv) = parse_roughness(&p, "");
@@ -1078,7 +1084,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 Some(SceneTexture::Image(img)) => {
                                     mat.texture = Some(img.clone());
                                 }
-                                None => {}
+                                None => {
+                                    eprintln!("  warning: unknown texture reference: {}", tex_name);
+                                }
                             }
                         }
                     }
