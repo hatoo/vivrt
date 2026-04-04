@@ -354,57 +354,44 @@ fn named_metal_k(name: &str) -> Option<[f32; 3]> {
     }
 }
 
-/// Parse conductor eta with optional prefix (e.g. "conductor" → "conductor.eta").
-fn parse_conductor_eta(p: &ParamSet, prefix: &str) -> Option<[f32; 3]> {
-    let key = if prefix.is_empty() {
-        "eta".to_string()
-    } else {
-        format!("{prefix}.eta")
-    };
-    if let Some(s) = p.spectrum_string(&key) {
+/// Parse conductor eta from ParamSet: supports "spectrum eta" (named or inline), "rgb eta", "float eta".
+fn parse_conductor_eta(p: &ParamSet) -> Option<[f32; 3]> {
+    // Named spectrum string
+    if let Some(s) = p.spectrum_string("eta") {
         if let Some(v) = named_metal_eta(s) {
             return Some(v);
         }
     }
-    if let Some(v) = p.spectrum_rgb(&key) {
+    // Inline spectrum data
+    if let Some(v) = p.spectrum_rgb("eta") {
         return Some(v);
     }
-    if let Some(v) = p.rgb(&key) {
+    // RGB
+    if let Some(v) = p.rgb("eta") {
         return Some(v);
     }
-    if let Some(v) = p.float(&key) {
+    // Single float → uniform across channels
+    if let Some(v) = p.float("eta") {
         return Some([v, v, v]);
-    }
-    // Also try bare "eta" if prefixed search failed
-    if !prefix.is_empty() {
-        return parse_conductor_eta(p, "");
     }
     None
 }
 
-/// Parse conductor k with optional prefix (e.g. "conductor" → "conductor.k").
-fn parse_conductor_k(p: &ParamSet, prefix: &str) -> Option<[f32; 3]> {
-    let key = if prefix.is_empty() {
-        "k".to_string()
-    } else {
-        format!("{prefix}.k")
-    };
-    if let Some(s) = p.spectrum_string(&key) {
+/// Parse conductor k from ParamSet: supports "spectrum k" (named or inline), "rgb k", "float k".
+fn parse_conductor_k(p: &ParamSet) -> Option<[f32; 3]> {
+    if let Some(s) = p.spectrum_string("k") {
         if let Some(v) = named_metal_k(s) {
             return Some(v);
         }
     }
-    if let Some(v) = p.spectrum_rgb(&key) {
+    if let Some(v) = p.spectrum_rgb("k") {
         return Some(v);
     }
-    if let Some(v) = p.rgb(&key) {
+    if let Some(v) = p.rgb("k") {
         return Some(v);
     }
-    if let Some(v) = p.float(&key) {
+    if let Some(v) = p.float("k") {
         return Some([v, v, v]);
-    }
-    if !prefix.is_empty() {
-        return parse_conductor_k(p, "");
     }
     None
 }
@@ -976,12 +963,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         } else {
                             MAT_CONDUCTOR
                         };
-                        let ior_prefix = if is_coated { "conductor" } else { "" };
                         if let Some(c) = p.rgb("reflectance") {
                             current_material.albedo = c;
-                        } else if let Some(eta) = parse_conductor_eta(&p, ior_prefix) {
+                        } else if let Some(eta) = parse_conductor_eta(&p) {
                             current_material.conductor_eta = eta;
-                            if let Some(k) = parse_conductor_k(&p, ior_prefix) {
+                            if let Some(k) = parse_conductor_k(&p) {
                                 current_material.conductor_k = k;
                             }
                             current_material.albedo = conductor_f0(
@@ -989,6 +975,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 &current_material.conductor_k,
                             );
                         } else {
+                            // Default: gold-like (PBRT defaults to Cu for coatedconductor)
                             current_material.conductor_eta = [0.143, 0.374, 1.442];
                             current_material.conductor_k = [3.983, 2.380, 1.603];
                             current_material.albedo = conductor_f0(
@@ -1081,12 +1068,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         } else {
                             MAT_CONDUCTOR
                         };
-                        let ior_prefix = if is_coated { "conductor" } else { "" };
                         if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
-                        } else if let Some(eta) = parse_conductor_eta(&p, ior_prefix) {
+                        } else if let Some(eta) = parse_conductor_eta(&p) {
                             mat.conductor_eta = eta;
-                            if let Some(k) = parse_conductor_k(&p, ior_prefix) {
+                            if let Some(k) = parse_conductor_k(&p) {
                                 mat.conductor_k = k;
                             }
                             mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
