@@ -690,7 +690,6 @@ fn parse_shape(
     let p = ParamSet::new(params, format!("Shape \"{ty}\""));
     let alpha_tex = p.texture_ref("alpha").map(|s| s.to_string());
     let disp_tex = p.texture_ref("displacement").map(|s| s.to_string());
-    // Known but not fully used
     match ty {
         "sphere" => {
             let radius = p.float("radius").unwrap_or(1.0);
@@ -1360,7 +1359,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         None => eprintln!("  warning: roughness texture not found: {tex_name}"),
                     }
                 }
-                // Acknowledge normalmap (not yet implemented but suppress warning)
                 if let Some(nm_path) = p.string("normalmap") {
                     let path = scene_dir.join(nm_path);
                     match image::open(&path) {
