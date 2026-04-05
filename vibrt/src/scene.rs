@@ -690,8 +690,6 @@ fn parse_shape(
     let p = ParamSet::new(params, format!("Shape \"{ty}\""));
     let alpha_tex = p.texture_ref("alpha").map(|s| s.to_string());
     let disp_tex = p.texture_ref("displacement").map(|s| s.to_string());
-    // edgelength controls subdivision for displacement (not implemented)
-    let _ = p.float("edgelength");
     // Known but not fully used
     match ty {
         "sphere" => {
