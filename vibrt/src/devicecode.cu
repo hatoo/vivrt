@@ -528,8 +528,7 @@ nee_distant_lights(float3 hit_pos, float3 hit_normal, float3 V, float3 albedo,
                                  is_conductor, eta, k, geom_tangent);
     if (bw.x <= 0 && bw.y <= 0 && bw.z <= 0)
       continue;
-    ShadowResult sr =
-        trace_shadow(hit_pos, L, 1e16f, OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT);
+    ShadowResult sr = trace_shadow(hit_pos, L, 1e16f, OPTIX_RAY_FLAG_NONE);
     if (!sr.hit) {
       result = result + bw * make_f3(params.distant_lights[i].emission);
     }
