@@ -944,16 +944,15 @@ fn main() -> Result<()> {
         alloc_and_copy_slice(&stream, &scene.triangle_lights)?
     };
 
-    // Build area-weighted CDF for triangle lights
-    let d_tri_light_cdf = if scene.triangle_lights.is_empty() {
-        0
+    // Build power-weighted CDF over triangle light groups (object-based)
+    let (d_tri_light_groups, d_tri_light_group_cdf) = if scene.triangle_light_groups.is_empty() {
+        (0, 0)
     } else {
-        let n = scene.triangle_lights.len();
+        let groups = &scene.triangle_light_groups;
+        let n = groups.len();
         let mut cdf = vec![0.0f32; n + 1];
-        for (i, tl) in scene.triangle_lights.iter().enumerate() {
-            // Weight by area × luminance of emission
-            let lum = 0.2126 * tl.emission[0] + 0.7152 * tl.emission[1] + 0.0722 * tl.emission[2];
-            cdf[i + 1] = cdf[i] + tl.area * lum;
+        for (i, g) in groups.iter().enumerate() {
+            cdf[i + 1] = cdf[i] + g.total_power;
         }
         let total = cdf[n];
         if total > 0.0 {
@@ -962,7 +961,10 @@ fn main() -> Result<()> {
                 *v *= inv;
             }
         }
-        alloc_and_copy_slice(&stream, &cdf)?
+        (
+            alloc_and_copy_slice(&stream, groups)?,
+            alloc_and_copy_slice(&stream, &cdf)?,
+        )
     };
 
     // --- GGX energy compensation LUT ---
@@ -1004,7 +1006,9 @@ fn main() -> Result<()> {
         sphere_lights: d_sphere_lights,
         num_triangle_lights: scene.triangle_lights.len() as i32,
         triangle_lights: d_triangle_lights,
-        triangle_light_cdf: d_tri_light_cdf,
+        triangle_light_groups: d_tri_light_groups,
+        num_triangle_light_groups: scene.triangle_light_groups.len() as i32,
+        triangle_light_group_cdf: d_tri_light_group_cdf,
         envmap_data: d_envmap,
         envmap_width: envmap_w,
         envmap_height: envmap_h,

@@ -32,6 +32,13 @@ struct TriangleLight {
     float _pad;
 };
 
+struct TriangleLightGroup {
+    unsigned int start;
+    unsigned int count;
+    float total_power;
+    float _pad;
+};
+
 struct DiffuseParams {
     int   has_checkerboard;
     float checker_scale_u;
@@ -104,7 +111,9 @@ struct LaunchParams {
     SphereLight*  sphere_lights;
     int           num_triangle_lights;
     TriangleLight* triangle_lights;
-    float*        triangle_light_cdf;  // float[num_triangle_lights+1], area-weighted
+    TriangleLightGroup* triangle_light_groups;
+    int           num_triangle_light_groups;
+    float*        triangle_light_group_cdf; // float[num_groups+1]
 
     // Environment map (IBL)
     float*        envmap_data;

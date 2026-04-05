@@ -37,6 +37,15 @@ pub struct TriangleLight {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct TriangleLightGroup {
+    pub start: u32,       // index into triangle_lights array
+    pub count: u32,       // number of triangles in this group
+    pub total_power: f32, // sum of area * luminance
+    pub _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct DiffuseParams {
     pub has_checkerboard: i32,
     pub checker_scale_u: f32,
@@ -121,7 +130,9 @@ pub struct LaunchParams {
     pub sphere_lights: optix_sys::CUdeviceptr,
     pub num_triangle_lights: i32,
     pub triangle_lights: optix_sys::CUdeviceptr,
-    pub triangle_light_cdf: optix_sys::CUdeviceptr, // float[num_triangle_lights+1], area-weighted CDF
+    pub triangle_light_groups: optix_sys::CUdeviceptr, // TriangleLightGroup[]
+    pub num_triangle_light_groups: i32,
+    pub triangle_light_group_cdf: optix_sys::CUdeviceptr, // float[num_groups+1], power-weighted
     // Environment map (IBL)
     pub envmap_data: optix_sys::CUdeviceptr, // RGB float, width*height*3 (0 = no envmap)
     pub envmap_width: i32,

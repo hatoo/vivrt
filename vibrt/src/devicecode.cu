@@ -593,37 +593,39 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
     float3 eta, float3 k, float3 geom_tangent,
     unsigned int pixel_idx, unsigned int sample_idx, unsigned int depth)
 {
-    int n = params.num_triangle_lights;
-    if (n == 0) return make_float3(0, 0, 0);
+    int n_groups = params.num_triangle_light_groups;
+    if (n_groups == 0) return make_float3(0, 0, 0);
 
-    const int max_samples = 8;
-    int n_samples = min(n, max_samples);
-    bool use_cdf = (n_samples < n) && params.triangle_light_cdf;
+    // Two-level sampling: pick light group (object), then triangle within it
+    const int max_group_samples = 4;
+    int n_group_samples = min(n_groups, max_group_samples);
 
     RNG light_select_rng(pixel_idx * 37, sample_idx, depth + 200);
     float3 result = make_float3(0, 0, 0);
 
-    for (int s = 0; s < n_samples; s++) {
-        int i;
-        float pdf_select;  // probability of selecting this light
-
-        if (n_samples == n) {
-            // Few lights: sample all, each with probability 1
-            i = s;
-            pdf_select = 1.0f;
-        } else if (use_cdf) {
-            // Many lights: importance sample by area × luminance via CDF
-            float xi = light_select_rng.next();
-            i = cdf_search(params.triangle_light_cdf, n, xi);
-            float cdf0 = params.triangle_light_cdf[i];
-            float cdf1 = params.triangle_light_cdf[i + 1];
-            pdf_select = (cdf1 - cdf0) * n_samples; // probability × n_samples for unbiased estimate
+    for (int gs = 0; gs < n_group_samples; gs++) {
+        // Level 1: select a light group (object)
+        int gi;
+        float group_pdf;
+        if (n_group_samples == n_groups) {
+            gi = gs;
+            group_pdf = 1.0f;
         } else {
-            // Fallback: uniform random
-            i = (int)(light_select_rng.next() * n);
-            if (i >= n) i = n - 1;
-            pdf_select = (float)n_samples / (float)n;
+            float xi = light_select_rng.next();
+            gi = cdf_search(params.triangle_light_group_cdf, n_groups, xi);
+            float cdf0 = params.triangle_light_group_cdf[gi];
+            float cdf1 = params.triangle_light_group_cdf[gi + 1];
+            group_pdf = (cdf1 - cdf0) * n_group_samples;
         }
+
+        const TriangleLightGroup& grp = params.triangle_light_groups[gi];
+        int tri_count = (int)grp.count;
+        if (tri_count == 0) continue;
+
+        // Level 2: sample a random triangle within the group (uniform by area)
+        int tri_idx = (int)(light_select_rng.next() * tri_count);
+        if (tri_idx >= tri_count) tri_idx = tri_count - 1;
+        int i = (int)grp.start + tri_idx;
 
         RNG light_rng(pixel_idx * 37 + i, sample_idx, depth + 201);
         float3 lv0 = make_f3(params.triangle_lights[i].v0);
@@ -652,8 +654,10 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
         ShadowResult sr = trace_shadow(hit_pos, L, 1e16f, OPTIX_RAY_FLAG_NONE);
         bool unoccluded = !sr.hit || (sr.emission.x > 0 || sr.emission.y > 0 || sr.emission.z > 0);
         if (unoccluded) {
+            // Weight: area_geo / (group_pdf * (1/tri_count))
             float geo = light_area * lndotl / dist2;
-            result = result + bw * light_em * (geo / fmaxf(pdf_select, 1e-8f));
+            float tri_pdf = group_pdf / (float)tri_count;
+            result = result + bw * light_em * (geo / fmaxf(tri_pdf, 1e-8f));
         }
     }
     return result;

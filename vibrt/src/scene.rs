@@ -106,6 +106,7 @@ pub struct ParsedScene {
     pub distant_lights: Vec<DistantLight>,
     pub sphere_lights: Vec<SphereLight>,
     pub triangle_lights: Vec<TriangleLight>,
+    pub triangle_light_groups: Vec<TriangleLightGroup>,
     pub objects: Vec<SceneObject>,
     pub filename: String,
     pub cam_flip_x: bool,
@@ -665,6 +666,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         distant_lights: Vec::new(),
         sphere_lights: Vec::new(),
         triangle_lights: Vec::new(),
+        triangle_light_groups: Vec::new(),
         objects: Vec::new(),
         filename: "output.png".to_string(),
         cam_flip_x: false,
@@ -1499,7 +1501,9 @@ fn register_area_light(
             vertices, indices, ..
         } = shape
         {
-            // Register each triangle as an area light
+            let start = scene.triangle_lights.len() as u32;
+            let lum = 0.2126 * em[0] + 0.7152 * em[1] + 0.0722 * em[2];
+            let mut group_power = 0.0f32;
             let transformed = transform::transform_vertices(vertices, xform);
             for tri in indices.chunks(3) {
                 if tri.len() < 3 {
@@ -1525,6 +1529,7 @@ fn register_area_light(
                 } else {
                     [0.0, 1.0, 0.0]
                 };
+                group_power += area * lum;
                 scene.triangle_lights.push(TriangleLight {
                     v0,
                     v1,
@@ -1532,6 +1537,15 @@ fn register_area_light(
                     emission: em,
                     normal,
                     area,
+                    _pad: 0.0,
+                });
+            }
+            let count = scene.triangle_lights.len() as u32 - start;
+            if count > 0 {
+                scene.triangle_light_groups.push(TriangleLightGroup {
+                    start,
+                    count,
+                    total_power: group_power,
                     _pad: 0.0,
                 });
             }
