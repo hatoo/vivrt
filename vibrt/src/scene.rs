@@ -882,6 +882,265 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
     }
     let mut textures = std::collections::HashMap::<String, SceneTexture>::new();
     let mut named_materials = std::collections::HashMap::<String, SceneMaterial>::new();
+
+    // Shared material parser for Material and MakeNamedMaterial directives
+    let parse_material_fn = |ty: &str,
+                             p: &ParamSet,
+                             textures: &std::collections::HashMap<String, SceneTexture>,
+                             named_materials: &std::collections::HashMap<String, SceneMaterial>,
+                             scene_dir: &std::path::Path|
+     -> SceneMaterial {
+        let mut mat = SceneMaterial::default();
+        match ty {
+            "diffuse" => {
+                mat.material_type = MAT_DIFFUSE;
+                if let Some(c) = p.rgb("reflectance") {
+                    mat.albedo = c;
+                }
+                if let Some(tex_name) = p.texture_ref("reflectance") {
+                    match textures.get(tex_name) {
+                        Some(SceneTexture::Checker(tex)) => {
+                            mat.has_checkerboard = true;
+                            mat.checker_scale_u = tex.scale_u;
+                            mat.checker_scale_v = tex.scale_v;
+                            mat.checker_color1 = tex.color1;
+                            mat.checker_color2 = tex.color2;
+                        }
+                        Some(SceneTexture::Image(img)) => {
+                            mat.texture = Some(img.clone());
+                        }
+                        None => {
+                            eprintln!("  warning: unknown texture reference: {}", tex_name);
+                        }
+                    }
+                }
+            }
+            "coateddiffuse" => {
+                mat.material_type = MAT_COATED_DIFFUSE;
+                if let Some(c) = p.rgb("reflectance") {
+                    mat.albedo = c;
+                }
+                if let Some(tex_name) = p.texture_ref("reflectance") {
+                    match textures.get(tex_name) {
+                        Some(SceneTexture::Checker(tex)) => {
+                            mat.has_checkerboard = true;
+                            mat.checker_scale_u = tex.scale_u;
+                            mat.checker_scale_v = tex.scale_v;
+                            mat.checker_color1 = tex.color1;
+                            mat.checker_color2 = tex.color2;
+                        }
+                        Some(SceneTexture::Image(img)) => {
+                            mat.texture = Some(img.clone());
+                        }
+                        None => {
+                            eprintln!("  warning: unknown texture reference: {}", tex_name);
+                        }
+                    }
+                }
+                let remap = p.bool("remaproughness").unwrap_or(true);
+                let (ru, rv) = parse_roughness(p, "", remap);
+                mat.roughness = ru;
+                mat.roughness_v = rv;
+                mat.coat_eta = p.float("eta").unwrap_or(1.5);
+            }
+            "conductor" | "coatedconductor" => {
+                let is_coated = ty == "coatedconductor";
+                mat.material_type = if is_coated {
+                    MAT_COATED_CONDUCTOR
+                } else {
+                    MAT_CONDUCTOR
+                };
+                let eta_found = if is_coated {
+                    parse_conductor_eta(p).or_else(|| {
+                        p.spectrum_string("conductor.eta")
+                            .and_then(named_metal_eta)
+                            .or_else(|| p.spectrum_rgb("conductor.eta"))
+                            .or_else(|| p.rgb("conductor.eta"))
+                    })
+                } else {
+                    parse_conductor_eta(p)
+                };
+                let k_found = if is_coated {
+                    parse_conductor_k(p).or_else(|| {
+                        p.spectrum_string("conductor.k")
+                            .and_then(named_metal_k)
+                            .or_else(|| p.spectrum_rgb("conductor.k"))
+                            .or_else(|| p.rgb("conductor.k"))
+                    })
+                } else {
+                    parse_conductor_k(p)
+                };
+                let has_reflectance_tex = if let Some(tex_name) = p.texture_ref("reflectance") {
+                    match textures.get(tex_name) {
+                        Some(SceneTexture::Image(img)) => {
+                            mat.texture = Some(img.clone());
+                            true
+                        }
+                        Some(_) => {
+                            eprintln!(
+                                "  warning: non-image texture type not supported for: {tex_name}"
+                            );
+                            false
+                        }
+                        None => {
+                            eprintln!("  warning: unknown texture reference: {tex_name}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if let Some(c) = p.rgb("reflectance") {
+                    mat.albedo = c;
+                }
+                if let Some(eta) = eta_found {
+                    mat.conductor_eta = eta;
+                    if let Some(k) = k_found {
+                        mat.conductor_k = k;
+                    }
+                    if mat.albedo == [0.5, 0.5, 0.5] {
+                        mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
+                    }
+                } else if !has_reflectance_tex && p.rgb("reflectance").is_none() {
+                    mat.conductor_eta = [0.143, 0.374, 1.442];
+                    mat.conductor_k = [3.983, 2.380, 1.603];
+                    mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
+                }
+                let remap = p.bool("remaproughness").unwrap_or(true);
+                if is_coated {
+                    let (ru, rv) = parse_roughness(p, "conductor", remap);
+                    mat.roughness = ru;
+                    mat.roughness_v = rv;
+                    mat.coat_roughness = parse_roughness(p, "interface", remap).0;
+                    mat.coat_eta = p.float("interface.eta").unwrap_or(1.5);
+                    mat.coat_thickness = p.float("thickness").unwrap_or(0.01);
+                    mat.coat_albedo = p.rgb("albedo").unwrap_or([0.0, 0.0, 0.0]);
+                } else {
+                    let (ru, rv) = parse_roughness(p, "", remap);
+                    mat.roughness = ru;
+                    mat.roughness_v = rv;
+                }
+            }
+            "dielectric" | "thindielectric" => {
+                mat.material_type = MAT_DIELECTRIC;
+                mat.eta = p
+                    .float("eta")
+                    .or_else(|| p.spectrum_avg("eta"))
+                    .unwrap_or(1.5);
+            }
+            "mix" => {
+                if let Some(names) = p.strings("materials") {
+                    if let Some(first) = names.first() {
+                        if let Some(m1) = named_materials.get(first.as_str()) {
+                            mat.mix_mat1 = Some(Box::new(m1.clone()));
+                        }
+                    }
+                    if let Some(second) = names.get(1) {
+                        if let Some(m2) = named_materials.get(second.as_str()) {
+                            mat.mix_mat2 = Some(Box::new(m2.clone()));
+                        }
+                    }
+                }
+                if let Some(tex_name) = p.texture_ref("amount") {
+                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
+                        mat.mix_amount = Some(img.clone());
+                    }
+                }
+                if let Some(v) = p.float("amount") {
+                    mat.mix_amount_value = v;
+                }
+            }
+            "measured" => {
+                let filename = p.string("filename").unwrap_or("");
+                let bsdf_path = scene_dir.join(filename);
+                if let Some(approx) = crate::bsdf::load_and_approximate(&bsdf_path) {
+                    mat.albedo = approx.albedo;
+                    mat.roughness = approx.roughness;
+                    if approx.is_metallic {
+                        mat.material_type = MAT_CONDUCTOR;
+                        mat.conductor_eta = approx.eta;
+                        mat.conductor_k = approx.k;
+                    } else {
+                        mat.material_type = MAT_COATED_DIFFUSE;
+                        mat.coat_eta = 1.5;
+                    }
+                    eprintln!(
+                        "  Loaded measured BSDF: {} → {} (albedo=[{:.2},{:.2},{:.2}], roughness={:.2})",
+                        filename,
+                        if approx.is_metallic { "conductor" } else { "coateddiffuse" },
+                        approx.albedo[0], approx.albedo[1], approx.albedo[2],
+                        approx.roughness,
+                    );
+                } else {
+                    mat.material_type = MAT_COATED_DIFFUSE;
+                    mat.coat_eta = 1.5;
+                    mat.roughness = 0.1;
+                    eprintln!(
+                        "  warning: failed to load measured BSDF: {}, using fallback",
+                        filename,
+                    );
+                }
+            }
+            "diffusetransmission" => {
+                mat.material_type = MAT_DIFFUSE;
+                if let Some(c) = p.rgb("reflectance") {
+                    mat.albedo = c;
+                }
+                if let Some(tex_name) = p.texture_ref("reflectance") {
+                    match textures.get(tex_name) {
+                        Some(SceneTexture::Image(img)) => mat.texture = Some(img.clone()),
+                        Some(_) => eprintln!(
+                            "  warning: non-image texture type not supported for: {tex_name}"
+                        ),
+                        None => eprintln!("  warning: unknown texture reference: {tex_name}"),
+                    }
+                }
+            }
+            _ => {
+                eprintln!("  warning: unsupported material type: {ty}");
+            }
+        }
+        if let Some(tex_name) = p.texture_ref("displacement") {
+            match textures.get(tex_name) {
+                Some(SceneTexture::Image(img)) => mat.bump_map = Some(img.clone()),
+                Some(_) => {
+                    eprintln!("  warning: non-image texture type not supported for: {tex_name}")
+                }
+                None => eprintln!("  warning: displacement texture not found: {tex_name}"),
+            }
+        }
+        if let Some(tex_name) = p.texture_ref("alpha") {
+            match textures.get(tex_name) {
+                Some(SceneTexture::Image(img)) => mat.alpha_map = Some(img.clone()),
+                Some(_) => {
+                    eprintln!("  warning: non-image texture type not supported for: {tex_name}")
+                }
+                None => eprintln!("  warning: alpha texture not found: {tex_name}"),
+            }
+        }
+        if let Some(tex_name) = p.texture_ref("roughness") {
+            match textures.get(tex_name) {
+                Some(SceneTexture::Image(img)) => mat.roughness_map = Some(img.clone()),
+                Some(_) => {
+                    eprintln!("  warning: non-image texture type not supported for: {tex_name}")
+                }
+                None => eprintln!("  warning: roughness texture not found: {tex_name}"),
+            }
+        }
+        if let Some(nm_path) = p.string("normalmap") {
+            let path = scene_dir.join(nm_path);
+            match image::open(&path) {
+                Ok(img) => {
+                    let rgb = img.to_rgb32f();
+                    let (w, h) = rgb.dimensions();
+                    let data: Vec<f32> = rgb.into_raw();
+                    mat.normal_map = Some(std::sync::Arc::new(ImageTexture::new(data, w, h)));
+                }
+                Err(e) => eprintln!("Failed to load normalmap {}: {e}", path.display()),
+            }
+        }
+        mat
+    };
     // Named media: name -> tint color (exp(-sigma_a * typical_distance))
     let mut named_media = std::collections::HashMap::<String, [f32; 3]>::new();
     let mut current_material = SceneMaterial::default();
@@ -1178,458 +1437,13 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             },
             Directive::Material { ty, params } => {
                 let p = ParamSet::new(params, format!("Material \"{ty}\""));
-                current_material = SceneMaterial::default();
-                match ty.as_str() {
-                    "diffuse" => {
-                        current_material.material_type = MAT_DIFFUSE;
-                        if let Some(c) = p.rgb("reflectance") {
-                            current_material.albedo = c;
-                        }
-                        if let Some(tex_name) = p.texture_ref("reflectance") {
-                            match textures.get(tex_name) {
-                                Some(SceneTexture::Checker(tex)) => {
-                                    current_material.has_checkerboard = true;
-                                    current_material.checker_scale_u = tex.scale_u;
-                                    current_material.checker_scale_v = tex.scale_v;
-                                    current_material.checker_color1 = tex.color1;
-                                    current_material.checker_color2 = tex.color2;
-                                }
-                                Some(SceneTexture::Image(img)) => {
-                                    current_material.texture = Some(img.clone());
-                                }
-                                None => {
-                                    eprintln!("  warning: unknown texture reference: {}", tex_name);
-                                }
-                            }
-                        }
-                    }
-                    "coateddiffuse" => {
-                        current_material.material_type = MAT_COATED_DIFFUSE;
-                        if let Some(c) = p.rgb("reflectance") {
-                            current_material.albedo = c;
-                        }
-                        if let Some(tex_name) = p.texture_ref("reflectance") {
-                            match textures.get(tex_name) {
-                                Some(SceneTexture::Checker(tex)) => {
-                                    current_material.has_checkerboard = true;
-                                    current_material.checker_scale_u = tex.scale_u;
-                                    current_material.checker_scale_v = tex.scale_v;
-                                    current_material.checker_color1 = tex.color1;
-                                    current_material.checker_color2 = tex.color2;
-                                }
-                                Some(SceneTexture::Image(img)) => {
-                                    current_material.texture = Some(img.clone());
-                                }
-                                None => {
-                                    eprintln!("  warning: unknown texture reference: {}", tex_name);
-                                }
-                            }
-                        }
-                        let remap = p.bool("remaproughness").unwrap_or(true);
-                        let (ru, rv) = parse_roughness(&p, "", remap);
-                        current_material.roughness = ru;
-                        current_material.roughness_v = rv;
-                        current_material.coat_eta = p.float("eta").unwrap_or(1.5);
-                    }
-                    "conductor" | "coatedconductor" => {
-                        let is_coated = ty == "coatedconductor";
-                        current_material.material_type = if is_coated {
-                            MAT_COATED_CONDUCTOR
-                        } else {
-                            MAT_CONDUCTOR
-                        };
-                        let eta_found = if is_coated {
-                            parse_conductor_eta(&p).or_else(|| {
-                                p.spectrum_string("conductor.eta")
-                                    .and_then(named_metal_eta)
-                                    .or_else(|| p.spectrum_rgb("conductor.eta"))
-                                    .or_else(|| p.rgb("conductor.eta"))
-                            })
-                        } else {
-                            parse_conductor_eta(&p)
-                        };
-                        let k_found = if is_coated {
-                            parse_conductor_k(&p).or_else(|| {
-                                p.spectrum_string("conductor.k")
-                                    .and_then(named_metal_k)
-                                    .or_else(|| p.spectrum_rgb("conductor.k"))
-                                    .or_else(|| p.rgb("conductor.k"))
-                            })
-                        } else {
-                            parse_conductor_k(&p)
-                        };
-                        let has_reflectance_tex = if let Some(tex_name) =
-                            p.texture_ref("reflectance")
-                        {
-                            match textures.get(tex_name) {
-                                Some(SceneTexture::Image(img)) => {
-                                    current_material.texture = Some(img.clone());
-                                    true
-                                }
-                                Some(_) => {
-                                    eprintln!("  warning: non-image texture type not supported for: {tex_name}");
-                                    false
-                                }
-                                None => {
-                                    eprintln!("  warning: unknown texture reference: {tex_name}");
-                                    false
-                                }
-                            }
-                        } else {
-                            false
-                        };
-                        if let Some(c) = p.rgb("reflectance") {
-                            current_material.albedo = c;
-                        }
-                        if let Some(eta) = eta_found {
-                            current_material.conductor_eta = eta;
-                            if let Some(k) = k_found {
-                                current_material.conductor_k = k;
-                            }
-                            if current_material.albedo == [0.5, 0.5, 0.5] {
-                                current_material.albedo = conductor_f0(
-                                    &current_material.conductor_eta,
-                                    &current_material.conductor_k,
-                                );
-                            }
-                        } else if !has_reflectance_tex && p.rgb("reflectance").is_none() {
-                            current_material.conductor_eta = [0.143, 0.374, 1.442];
-                            current_material.conductor_k = [3.983, 2.380, 1.603];
-                            current_material.albedo = conductor_f0(
-                                &current_material.conductor_eta,
-                                &current_material.conductor_k,
-                            );
-                        }
-                        let remap = p.bool("remaproughness").unwrap_or(true);
-                        if is_coated {
-                            let (ru, rv) = parse_roughness(&p, "conductor", remap);
-                            current_material.roughness = ru;
-                            current_material.roughness_v = rv;
-                            current_material.coat_roughness =
-                                parse_roughness(&p, "interface", remap).0;
-                            current_material.coat_eta = p.float("interface.eta").unwrap_or(1.5);
-                            current_material.coat_thickness = p.float("thickness").unwrap_or(0.01);
-                            current_material.coat_albedo =
-                                p.rgb("albedo").unwrap_or([0.0, 0.0, 0.0]);
-                        } else {
-                            let (ru, rv) = parse_roughness(&p, "", remap);
-                            current_material.roughness = ru;
-                            current_material.roughness_v = rv;
-                        }
-                    }
-                    "dielectric" | "thindielectric" => {
-                        current_material.material_type = MAT_DIELECTRIC;
-                        current_material.eta = p
-                            .float("eta")
-                            .or_else(|| p.spectrum_avg("eta"))
-                            .unwrap_or(1.5);
-                    }
-                    _ => eprintln!("  warning: unsupported material type: {ty}"),
-                }
-                if let Some(tex_name) = p.texture_ref("displacement") {
-                    match textures.get(tex_name) {
-                        Some(SceneTexture::Image(img)) => {
-                            current_material.bump_map = Some(img.clone())
-                        }
-                        Some(_) => eprintln!(
-                            "  warning: non-image texture type not supported for: {tex_name}"
-                        ),
-                        None => eprintln!("  warning: displacement texture not found: {tex_name}"),
-                    }
-                }
-                if let Some(tex_name) = p.texture_ref("alpha") {
-                    match textures.get(tex_name) {
-                        Some(SceneTexture::Image(img)) => {
-                            current_material.alpha_map = Some(img.clone())
-                        }
-                        Some(_) => eprintln!(
-                            "  warning: non-image texture type not supported for: {tex_name}"
-                        ),
-                        None => eprintln!("  warning: alpha texture not found: {tex_name}"),
-                    }
-                }
-                if let Some(tex_name) = p.texture_ref("roughness") {
-                    match textures.get(tex_name) {
-                        Some(SceneTexture::Image(img)) => {
-                            current_material.roughness_map = Some(img.clone())
-                        }
-                        Some(_) => eprintln!(
-                            "  warning: non-image texture type not supported for: {tex_name}"
-                        ),
-                        None => eprintln!("  warning: roughness texture not found: {tex_name}"),
-                    }
-                }
-                if let Some(nm_path) = p.string("normalmap") {
-                    let path = scene_dir.join(nm_path);
-                    match image::open(&path) {
-                        Ok(img) => {
-                            let rgb = img.to_rgb32f();
-                            let (w, h) = rgb.dimensions();
-                            let data: Vec<f32> = rgb.into_raw();
-                            current_material.normal_map =
-                                Some(std::sync::Arc::new(ImageTexture::new(data, w, h)));
-                        }
-                        Err(e) => eprintln!("Failed to load normalmap {}: {e}", path.display()),
-                    }
-                }
+                current_material =
+                    parse_material_fn(ty, &p, &textures, &named_materials, scene_dir);
             }
             Directive::MakeNamedMaterial { name, params } => {
                 let p = ParamSet::new(params, format!("MakeNamedMaterial \"{name}\""));
                 let ty = p.string("type").unwrap_or("diffuse");
-                let mut mat = SceneMaterial::default();
-                match ty {
-                    "diffuse" => {
-                        mat.material_type = MAT_DIFFUSE;
-                        if let Some(c) = p.rgb("reflectance") {
-                            mat.albedo = c;
-                        }
-                        if let Some(tex_name) = p.texture_ref("reflectance") {
-                            match textures.get(tex_name) {
-                                Some(SceneTexture::Checker(tex)) => {
-                                    mat.has_checkerboard = true;
-                                    mat.checker_scale_u = tex.scale_u;
-                                    mat.checker_scale_v = tex.scale_v;
-                                    mat.checker_color1 = tex.color1;
-                                    mat.checker_color2 = tex.color2;
-                                }
-                                Some(SceneTexture::Image(img)) => {
-                                    mat.texture = Some(img.clone());
-                                }
-                                None => {
-                                    eprintln!("  warning: unknown texture reference: {}", tex_name);
-                                }
-                            }
-                        }
-                    }
-                    "coateddiffuse" => {
-                        mat.material_type = MAT_COATED_DIFFUSE;
-                        if let Some(c) = p.rgb("reflectance") {
-                            mat.albedo = c;
-                        }
-                        let remap = p.bool("remaproughness").unwrap_or(true);
-                        let (ru, rv) = parse_roughness(&p, "", remap);
-                        mat.roughness = ru;
-                        mat.roughness_v = rv;
-                        mat.coat_eta = p.float("eta").unwrap_or(1.5);
-                        if let Some(tex_name) = p.texture_ref("reflectance") {
-                            match textures.get(tex_name) {
-                                Some(SceneTexture::Image(img)) => mat.texture = Some(img.clone()),
-                                Some(_) => eprintln!("  warning: non-image texture type not supported for: {tex_name}"),
-                                None => eprintln!("  warning: unknown texture reference: {tex_name}"),
-                            }
-                        }
-                    }
-                    "conductor" | "coatedconductor" => {
-                        let is_coated = ty == "coatedconductor";
-                        mat.material_type = if is_coated {
-                            MAT_COATED_CONDUCTOR
-                        } else {
-                            MAT_CONDUCTOR
-                        };
-                        // Try conductor.eta/conductor.k first for coatedconductor, then bare eta/k
-                        let eta_found = if is_coated {
-                            parse_conductor_eta(&p).or_else(|| {
-                                // Try prefixed versions
-                                p.spectrum_string("conductor.eta")
-                                    .and_then(named_metal_eta)
-                                    .or_else(|| p.spectrum_rgb("conductor.eta"))
-                                    .or_else(|| p.rgb("conductor.eta"))
-                            })
-                        } else {
-                            parse_conductor_eta(&p)
-                        };
-                        let k_found = if is_coated {
-                            parse_conductor_k(&p).or_else(|| {
-                                p.spectrum_string("conductor.k")
-                                    .and_then(named_metal_k)
-                                    .or_else(|| p.spectrum_rgb("conductor.k"))
-                                    .or_else(|| p.rgb("conductor.k"))
-                            })
-                        } else {
-                            parse_conductor_k(&p)
-                        };
-                        // Check for texture reflectance
-                        let has_reflectance_tex = if let Some(tex_name) =
-                            p.texture_ref("reflectance")
-                        {
-                            match textures.get(tex_name) {
-                                Some(SceneTexture::Image(img)) => {
-                                    mat.texture = Some(img.clone());
-                                    true
-                                }
-                                Some(_) => {
-                                    eprintln!("  warning: non-image texture type not supported for: {tex_name}");
-                                    false
-                                }
-                                None => {
-                                    eprintln!("  warning: unknown texture reference: {tex_name}");
-                                    false
-                                }
-                            }
-                        } else {
-                            false
-                        };
-                        if let Some(c) = p.rgb("reflectance") {
-                            mat.albedo = c;
-                        }
-                        if let Some(eta) = eta_found {
-                            mat.conductor_eta = eta;
-                            if let Some(k) = k_found {
-                                mat.conductor_k = k;
-                            }
-                            if mat.albedo == [0.5, 0.5, 0.5] {
-                                // Only override default albedo with F0 if no explicit reflectance
-                                mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
-                            }
-                        } else if !has_reflectance_tex && p.rgb("reflectance").is_none() {
-                            // No reflectance (rgb or texture) and no eta/k: use default copper
-                            mat.conductor_eta = [0.143, 0.374, 1.442];
-                            mat.conductor_k = [3.983, 2.380, 1.603];
-                            mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
-                        }
-                        // If reflectance texture/rgb is provided but no eta/k,
-                        // leave conductor_eta/k at zero → GPU uses Schlick with albedo as F0
-                        let remap = p.bool("remaproughness").unwrap_or(true);
-                        if is_coated {
-                            let (ru, rv) = parse_roughness(&p, "conductor", remap);
-                            mat.roughness = ru;
-                            mat.roughness_v = rv;
-                            mat.coat_roughness = parse_roughness(&p, "interface", remap).0;
-                            mat.coat_eta = p.float("interface.eta").unwrap_or(1.5);
-                            mat.coat_thickness = p.float("thickness").unwrap_or(0.01);
-                            mat.coat_albedo = p.rgb("albedo").unwrap_or([0.0, 0.0, 0.0]);
-                        } else {
-                            let (ru, rv) = parse_roughness(&p, "", remap);
-                            mat.roughness = ru;
-                            mat.roughness_v = rv;
-                        }
-                    }
-                    "dielectric" | "thindielectric" => {
-                        mat.material_type = MAT_DIELECTRIC;
-                        mat.eta = p
-                            .float("eta")
-                            .or_else(|| p.spectrum_avg("eta"))
-                            .unwrap_or(1.5);
-                    }
-                    "mix" => {
-                        if let Some(names) = p.strings("materials") {
-                            if let Some(first) = names.first() {
-                                if let Some(m1) = named_materials.get(first.as_str()) {
-                                    mat.mix_mat1 = Some(Box::new(m1.clone()));
-                                }
-                            }
-                            if let Some(second) = names.get(1) {
-                                if let Some(m2) = named_materials.get(second.as_str()) {
-                                    mat.mix_mat2 = Some(Box::new(m2.clone()));
-                                }
-                            }
-                        }
-                        // Amount: texture ref or constant float
-                        if let Some(tex_name) = p.texture_ref("amount") {
-                            if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
-                                mat.mix_amount = Some(img.clone());
-                            }
-                        }
-                        if let Some(v) = p.float("amount") {
-                            mat.mix_amount_value = v;
-                        }
-                    }
-                    "measured" => {
-                        let filename = p.string("filename").unwrap_or("");
-                        let bsdf_path = scene_dir.join(filename);
-                        if let Some(approx) = crate::bsdf::load_and_approximate(&bsdf_path) {
-                            mat.albedo = approx.albedo;
-                            mat.roughness = approx.roughness;
-                            if approx.is_metallic {
-                                mat.material_type = MAT_CONDUCTOR;
-                                mat.conductor_eta = approx.eta;
-                                mat.conductor_k = approx.k;
-                            } else {
-                                mat.material_type = MAT_COATED_DIFFUSE;
-                                mat.coat_eta = 1.5;
-                            }
-                            eprintln!(
-                                "  Loaded measured BSDF: {} → {} (albedo=[{:.2},{:.2},{:.2}], roughness={:.2})",
-                                filename,
-                                if approx.is_metallic { "conductor" } else { "coateddiffuse" },
-                                approx.albedo[0], approx.albedo[1], approx.albedo[2],
-                                approx.roughness,
-                            );
-                        } else {
-                            // Fallback: coated diffuse
-                            mat.material_type = MAT_COATED_DIFFUSE;
-                            mat.coat_eta = 1.5;
-                            mat.roughness = 0.1;
-                            eprintln!(
-                                "  warning: failed to load measured BSDF: {}, using fallback",
-                                filename,
-                            );
-                        }
-                    }
-                    "diffusetransmission" => {
-                        // Approximate as diffuse (ignore transmittance)
-                        mat.material_type = MAT_DIFFUSE;
-                        if let Some(c) = p.rgb("reflectance") {
-                            mat.albedo = c;
-                        }
-                        if let Some(tex_name) = p.texture_ref("reflectance") {
-                            match textures.get(tex_name) {
-                                Some(SceneTexture::Image(img)) => {
-                                    mat.texture = Some(img.clone())
-                                }
-                                Some(_) => eprintln!(
-                                    "  warning: non-image texture type not supported for: {tex_name}"
-                                ),
-                                None => eprintln!(
-                                    "  warning: unknown texture reference: {tex_name}"
-                                ),
-                            }
-                        }
-                    }
-                    _ => {
-                        eprintln!("  warning: unsupported MakeNamedMaterial type: {ty}");
-                    }
-                }
-                if let Some(tex_name) = p.texture_ref("displacement") {
-                    match textures.get(tex_name) {
-                        Some(SceneTexture::Image(img)) => mat.bump_map = Some(img.clone()),
-                        Some(_) => eprintln!(
-                            "  warning: non-image texture type not supported for: {tex_name}"
-                        ),
-                        None => eprintln!("  warning: displacement texture not found: {tex_name}"),
-                    }
-                }
-                if let Some(tex_name) = p.texture_ref("alpha") {
-                    match textures.get(tex_name) {
-                        Some(SceneTexture::Image(img)) => mat.alpha_map = Some(img.clone()),
-                        Some(_) => eprintln!(
-                            "  warning: non-image texture type not supported for: {tex_name}"
-                        ),
-                        None => eprintln!("  warning: alpha texture not found: {tex_name}"),
-                    }
-                }
-                if let Some(tex_name) = p.texture_ref("roughness") {
-                    match textures.get(tex_name) {
-                        Some(SceneTexture::Image(img)) => mat.roughness_map = Some(img.clone()),
-                        Some(_) => eprintln!(
-                            "  warning: non-image texture type not supported for: {tex_name}"
-                        ),
-                        None => eprintln!("  warning: roughness texture not found: {tex_name}"),
-                    }
-                }
-                if let Some(nm_path) = p.string("normalmap") {
-                    let path = scene_dir.join(nm_path);
-                    match image::open(&path) {
-                        Ok(img) => {
-                            let rgb = img.to_rgb32f();
-                            let (w, h) = rgb.dimensions();
-                            let data: Vec<f32> = rgb.into_raw();
-                            mat.normal_map =
-                                Some(std::sync::Arc::new(ImageTexture::new(data, w, h)));
-                        }
-                        Err(e) => eprintln!("Failed to load normalmap {}: {e}", path.display()),
-                    }
-                }
+                let mat = parse_material_fn(ty, &p, &textures, &named_materials, scene_dir);
                 named_materials.insert(name.clone(), mat);
             }
             Directive::NamedMaterial(name) => {
