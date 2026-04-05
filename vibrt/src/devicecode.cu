@@ -761,6 +761,10 @@ static __forceinline__ __device__ float3 nee_envmap(
     unsigned int pixel_idx, unsigned int sample_idx, unsigned int depth) {
   if (!params.envmap_data || params.envmap_integral <= 0.0f)
     return make_float3(0, 0, 0);
+  // Skip envmap importance sampling when portal is active (portal NEE handles
+  // it)
+  if (params.has_portal)
+    return make_float3(0, 0, 0);
 
   RNG env_rng(pixel_idx * 41, sample_idx, depth + 300);
   float3 L, env_color;
