@@ -18,10 +18,14 @@ A GPU path tracer that reads [PBRTv4](https://pbrt.org/fileformat-v4) scene file
 ### Features
 
 - Path tracing with configurable depth and samples per pixel
-- Materials: diffuse, coated diffuse (GGX), conductor (metallic Fresnel), dielectric (glass)
+- Materials: diffuse, coated diffuse, conductor, coated conductor, dielectric, mix (stochastic, nested)
+- GGX microfacet BRDF with anisotropic roughness, VNDF importance sampling, Kulla-Conty energy compensation
+- Exact conductor Fresnel (complex IOR eta+ik), coated conductor with multi-layer scattering
 - Geometry: triangle meshes, PLY meshes (binary, gzip), spheres (built-in intersection), bilinear patches, Loop subdivision
-- Lighting: distant, infinite, sphere area lights, triangle area lights with next-event estimation
-- Imagemap textures with bilinear filtering, checkerboard procedural texture
+- Lighting: distant, infinite (envmap with importance sampling), sphere area lights, triangle area lights with power-weighted two-level NEE
+- Textures: imagemap (bilinear), bump map, normal map, roughness map, alpha cutout, checkerboard, planar UV mapping
+- Mix and directionmix texture blending
+- sRGB-aware texture loading
 - CUDA device code compiled at runtime via NVRTC
 
 ### Usage
