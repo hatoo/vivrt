@@ -26,16 +26,13 @@ struct TriangleLight {
     float v0[3];
     float v1[3];
     float v2[3];
-    float emission[3];
-    float normal[3];
-    float area;
-    float _pad;
 };
 
 struct TriangleLightGroup {
     unsigned int start;
     unsigned int count;
     float total_power;
+    float emission[3];
     float _pad;
 };
 

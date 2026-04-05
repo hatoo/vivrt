@@ -632,9 +632,11 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
         float3 lv0 = make_f3(params.triangle_lights[i].v0);
         float3 lv1 = make_f3(params.triangle_lights[i].v1);
         float3 lv2 = make_f3(params.triangle_lights[i].v2);
-        float3 light_em = make_f3(params.triangle_lights[i].emission);
-        float3 light_normal = make_f3(params.triangle_lights[i].normal);
-        float light_area = params.triangle_lights[i].area;
+        float3 light_em = make_f3(grp.emission);
+        float3 cross_e = cross3(lv1 - lv0, lv2 - lv0);
+        float cross_len = sqrtf(dot3(cross_e, cross_e));
+        float light_area = cross_len * 0.5f;
+        float3 light_normal = (cross_len > 0.0f) ? cross_e * (1.0f / cross_len) : make_float3(0, 1, 0);
 
         float u1 = light_rng.next();
         float u2 = light_rng.next();

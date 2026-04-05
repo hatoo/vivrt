@@ -1523,22 +1523,8 @@ fn register_area_light(
                     e1[0] * e2[1] - e1[1] * e2[0],
                 ];
                 let area = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() * 0.5;
-                let len = area * 2.0;
-                let normal = if len > 0.0 {
-                    [n[0] / len, n[1] / len, n[2] / len]
-                } else {
-                    [0.0, 1.0, 0.0]
-                };
                 group_power += area * lum;
-                scene.triangle_lights.push(TriangleLight {
-                    v0,
-                    v1,
-                    v2,
-                    emission: em,
-                    normal,
-                    area,
-                    _pad: 0.0,
-                });
+                scene.triangle_lights.push(TriangleLight { v0, v1, v2 });
             }
             let count = scene.triangle_lights.len() as u32 - start;
             if count > 0 {
@@ -1546,6 +1532,7 @@ fn register_area_light(
                     start,
                     count,
                     total_power: group_power,
+                    emission: em,
                     _pad: 0.0,
                 });
             }

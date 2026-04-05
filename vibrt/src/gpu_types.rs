@@ -29,18 +29,15 @@ pub struct TriangleLight {
     pub v0: [f32; 3],
     pub v1: [f32; 3],
     pub v2: [f32; 3],
-    pub emission: [f32; 3],
-    pub normal: [f32; 3],
-    pub area: f32,
-    pub _pad: f32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TriangleLightGroup {
-    pub start: u32,       // index into triangle_lights array
-    pub count: u32,       // number of triangles in this group
-    pub total_power: f32, // sum of area * luminance
+    pub start: u32,         // index into triangle_lights array
+    pub count: u32,         // number of triangles in this group
+    pub total_power: f32,   // sum of area * luminance
+    pub emission: [f32; 3], // shared emission for all triangles in group
     pub _pad: f32,
 }
 
