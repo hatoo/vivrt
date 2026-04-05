@@ -1144,6 +1144,38 @@ extern "C" __global__ void __closesthit__ch() {
     idx2 = prim_idx * 3 + 2;
   }
 
+  // Stochastic mix material selection
+  if (data->mat2) {
+    float amount = data->mix_amount_value;
+    if (data->mix_amount_data && data->texcoords) {
+      float wt_ = 1.0f - bary.x - bary.y;
+      float mu = wt_ * data->texcoords[idx0 * 2] +
+                 bary.x * data->texcoords[idx1 * 2] +
+                 bary.y * data->texcoords[idx2 * 2];
+      float mv = wt_ * data->texcoords[idx0 * 2 + 1] +
+                 bary.x * data->texcoords[idx1 * 2 + 1] +
+                 bary.y * data->texcoords[idx2 * 2 + 1];
+      mu = mu - floorf(mu);
+      mv = mv - floorf(mv);
+      int mx = max(0, min((int)(mu * (data->mix_amount_width - 1)),
+                          data->mix_amount_width - 1));
+      int my = max(0, min((int)((1.0f - mv) * (data->mix_amount_height - 1)),
+                          data->mix_amount_height - 1));
+      amount = data->mix_amount_data[my * data->mix_amount_width + mx];
+    }
+    // Hash-based random for stochastic selection
+    unsigned int h = __float_as_uint(ray_orig.x) ^
+                     (__float_as_uint(ray_orig.y) * 2654435761u) ^
+                     (__float_as_uint(ray_dir.x) * 2246822519u) ^
+                     ((unsigned int)prim_idx * 3266489917u);
+    h ^= h >> 16;
+    h *= 0x45d9f3b;
+    h ^= h >> 16;
+    float rnd = (h >> 8) * (1.0f / 16777216.0f);
+    if (rnd < amount)
+      mat = data->mat2;
+  }
+
   // Load triangle vertices
   float3 v0, v1, v2;
   if (data->indices) {

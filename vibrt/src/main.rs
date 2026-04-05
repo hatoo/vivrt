@@ -685,6 +685,11 @@ fn main() -> Result<()> {
                 let d_mat_ptr = upload_material(&mat_data, &stream)?;
                 let mut hg_data = HitGroupData {
                     mat: d_mat_ptr,
+                    mat2: 0,
+                    mix_amount_data: 0,
+                    mix_amount_width: 0,
+                    mix_amount_height: 0,
+                    mix_amount_value: 0.5,
                     vertices: 0,
                     normals: 0,
                     indices: 0,
@@ -822,8 +827,57 @@ fn main() -> Result<()> {
                     nmap_h,
                 );
                 let d_mat_ptr = upload_material(&mat_data, &stream)?;
+
+                // Mix material: upload second material and amount texture
+                let (d_mat2, d_mix_amt, mix_amt_w, mix_amt_h) =
+                    if let Some(ref m2) = obj.material.mix_mat2 {
+                        let (m2_tex, m2_tw, m2_th) = if let Some(ref tex) = m2.texture {
+                            upload_texture(tex, &stream, &mut _device_buffers)?
+                        } else {
+                            (0, 0, 0)
+                        };
+                        let (m2_bump, m2_bw, m2_bh) = if let Some(ref bmp) = m2.bump_map {
+                            upload_bump(bmp, &stream, &mut _device_buffers)?
+                        } else {
+                            (0, 0, 0)
+                        };
+                        let (m2_alpha, m2_aw, m2_ah) = if let Some(ref a) = m2.alpha_map {
+                            upload_bump(a, &stream, &mut _device_buffers)?
+                        } else {
+                            (0, 0, 0)
+                        };
+                        let (m2_rough, m2_rw, m2_rh) = if let Some(ref r) = m2.roughness_map {
+                            upload_bump(r, &stream, &mut _device_buffers)?
+                        } else {
+                            (0, 0, 0)
+                        };
+                        let (m2_nmap, m2_nw, m2_nh) = if let Some(ref nm) = m2.normal_map {
+                            upload_texture(nm, &stream, &mut _device_buffers)?
+                        } else {
+                            (0, 0, 0)
+                        };
+                        let mat2_data = make_material_data(
+                            m2, m2_tex, m2_tw, m2_th, m2_bump, m2_bw, m2_bh, m2_alpha, m2_aw,
+                            m2_ah, m2_rough, m2_rw, m2_rh, m2_nmap, m2_nw, m2_nh,
+                        );
+                        let d_m2 = upload_material(&mat2_data, &stream)?;
+                        let (d_amt, aw, ah) = if let Some(ref amt) = obj.material.mix_amount {
+                            upload_bump(amt, &stream, &mut _device_buffers)?
+                        } else {
+                            (0, 0, 0)
+                        };
+                        (d_m2, d_amt, aw, ah)
+                    } else {
+                        (0, 0, 0, 0)
+                    };
+
                 let hg_data = HitGroupData {
                     mat: d_mat_ptr,
+                    mat2: d_mat2,
+                    mix_amount_data: d_mix_amt,
+                    mix_amount_width: mix_amt_w,
+                    mix_amount_height: mix_amt_h,
+                    mix_amount_value: obj.material.mix_amount_value,
                     vertices: dptr(&d_verts, &stream),
                     normals: d_normals,
                     indices: dptr(&d_indices, &stream),

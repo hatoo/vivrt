@@ -90,6 +90,11 @@ struct MaterialData {
 
 struct HitGroupData {
   MaterialData *mat;
+  MaterialData *mat2; // second material for mix (NULL if not mix)
+  float *mix_amount_data;
+  int mix_amount_width;
+  int mix_amount_height;
+  float mix_amount_value;
   // Geometry
   float *vertices;
   float *normals;

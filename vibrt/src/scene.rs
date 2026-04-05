@@ -72,6 +72,10 @@ pub struct SceneMaterial {
     pub alpha_map: Option<std::sync::Arc<ImageTexture>>,
     pub roughness_map: Option<std::sync::Arc<ImageTexture>>,
     pub normal_map: Option<std::sync::Arc<ImageTexture>>,
+    // Mix material
+    pub mix_mat2: Option<Box<SceneMaterial>>,
+    pub mix_amount: Option<std::sync::Arc<ImageTexture>>,
+    pub mix_amount_value: f32,
 }
 
 impl Default for SceneMaterial {
@@ -100,6 +104,9 @@ impl Default for SceneMaterial {
             alpha_map: None,
             roughness_map: None,
             normal_map: None,
+            mix_mat2: None,
+            mix_amount: None,
+            mix_amount_value: 0.5,
         }
     }
 }
@@ -112,6 +119,8 @@ impl Clone for SceneMaterial {
             normal_map: self.normal_map.clone(),
             alpha_map: self.alpha_map.clone(),
             roughness_map: self.roughness_map.clone(),
+            mix_mat2: self.mix_mat2.clone(),
+            mix_amount: self.mix_amount.clone(),
             ..*self
         }
     }
@@ -207,6 +216,17 @@ impl<'a> ParamSet<'a> {
             .find(|p| p.name == name)
             .and_then(|p| match &p.value {
                 ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
+                _ => None,
+            })
+    }
+
+    fn strings(&self, name: &str) -> Option<&'a [String]> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| match &p.value {
+                ParamValue::Strings(v) => Some(v.as_slice()),
                 _ => None,
             })
     }
@@ -1363,15 +1383,27 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             .unwrap_or(1.5);
                     }
                     "mix" => {
-                        // Use the first referenced material as approximation
-                        if let Some(param) = params.iter().find(|param| param.name == "materials") {
-                            if let ParamValue::Strings(names) = &param.value {
-                                if let Some(first) = names.first() {
-                                    if let Some(base) = named_materials.get(first.as_str()) {
-                                        mat = base.clone();
-                                    }
+                        if let Some(names) = p.strings("materials") {
+                            // First material is the base (amount=0), second is mat2 (amount=1)
+                            if let Some(first) = names.first() {
+                                if let Some(base) = named_materials.get(first.as_str()) {
+                                    mat = base.clone();
                                 }
                             }
+                            if let Some(second) = names.get(1) {
+                                if let Some(m2) = named_materials.get(second.as_str()) {
+                                    mat.mix_mat2 = Some(Box::new(m2.clone()));
+                                }
+                            }
+                        }
+                        // Amount: texture ref or constant float
+                        if let Some(tex_name) = p.texture_ref("amount") {
+                            if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
+                                mat.mix_amount = Some(img.clone());
+                            }
+                        }
+                        if let Some(v) = p.float("amount") {
+                            mat.mix_amount_value = v;
                         }
                     }
                     "measured" => {

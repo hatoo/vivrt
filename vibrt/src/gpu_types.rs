@@ -109,7 +109,12 @@ pub struct MaterialData {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct HitGroupData {
-    pub mat: optix_sys::CUdeviceptr, // pointer to MaterialData on device
+    pub mat: optix_sys::CUdeviceptr,  // pointer to MaterialData on device
+    pub mat2: optix_sys::CUdeviceptr, // second material for mix (0 if not mix)
+    pub mix_amount_data: optix_sys::CUdeviceptr,
+    pub mix_amount_width: i32,
+    pub mix_amount_height: i32,
+    pub mix_amount_value: f32,
     // Geometry
     pub vertices: optix_sys::CUdeviceptr,
     pub normals: optix_sys::CUdeviceptr,
