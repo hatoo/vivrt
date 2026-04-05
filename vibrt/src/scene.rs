@@ -18,6 +18,27 @@ pub struct ImageTexture {
     pub data: Vec<f32>, // RGB float, width*height*3
     pub width: u32,
     pub height: u32,
+    /// Planar mapping: if Some, UVs are computed as dot(pos, v1)+udelta, dot(pos, v2)+vdelta
+    pub planar: Option<PlanarMapping>,
+}
+
+impl ImageTexture {
+    pub fn new(data: Vec<f32>, width: u32, height: u32) -> Self {
+        Self {
+            data,
+            width,
+            height,
+            planar: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PlanarMapping {
+    pub v1: [f32; 3],
+    pub v2: [f32; 3],
+    pub udelta: f32,
+    pub vdelta: f32,
 }
 
 pub struct SceneMaterial {
@@ -952,11 +973,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                     pixel[2] *= scale[2];
                                 }
                                 println!("Loaded envmap: {}x{} from {}", w, h, path.display());
-                                parsed.envmap = Some(ImageTexture {
-                                    data,
-                                    width: w,
-                                    height: h,
-                                });
+                                parsed.envmap = Some(ImageTexture::new(data, w, h));
                             }
                             Err(e) => {
                                 eprintln!("Failed to load envmap {}: {e}", path.display());
@@ -1149,11 +1166,8 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             let rgb = img.to_rgb32f();
                             let (w, h) = rgb.dimensions();
                             let data: Vec<f32> = rgb.into_raw();
-                            current_material.normal_map = Some(std::sync::Arc::new(ImageTexture {
-                                data,
-                                width: w,
-                                height: h,
-                            }));
+                            current_material.normal_map =
+                                Some(std::sync::Arc::new(ImageTexture::new(data, w, h)));
                         }
                         Err(e) => eprintln!("Failed to load normalmap {}: {e}", path.display()),
                     }
@@ -1374,11 +1388,8 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             let rgb = img.to_rgb32f();
                             let (w, h) = rgb.dimensions();
                             let data: Vec<f32> = rgb.into_raw();
-                            mat.normal_map = Some(std::sync::Arc::new(ImageTexture {
-                                data,
-                                width: w,
-                                height: h,
-                            }));
+                            mat.normal_map =
+                                Some(std::sync::Arc::new(ImageTexture::new(data, w, h)));
                         }
                         Err(e) => eprintln!("Failed to load normalmap {}: {e}", path.display()),
                     }
@@ -1448,13 +1459,30 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                     }
                                 };
                                 println!("Loaded texture: {}x{} from {}", w, h, path.display());
+                                let mut tex = ImageTexture::new(data, w, h);
+                                // Check for planar mapping
+                                let mapping = p.string("mapping").unwrap_or("uv");
+                                if mapping == "planar" {
+                                    let v1 = p
+                                        .floats("v1")
+                                        .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
+                                        .unwrap_or([1.0, 0.0, 0.0]);
+                                    let v2 = p
+                                        .floats("v2")
+                                        .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
+                                        .unwrap_or([0.0, 1.0, 0.0]);
+                                    let udelta = p.float("udelta").unwrap_or(0.0);
+                                    let vdelta = p.float("vdelta").unwrap_or(0.0);
+                                    tex.planar = Some(PlanarMapping {
+                                        v1,
+                                        v2,
+                                        udelta,
+                                        vdelta,
+                                    });
+                                }
                                 textures.insert(
                                     name.clone(),
-                                    SceneTexture::Image(std::sync::Arc::new(ImageTexture {
-                                        data,
-                                        width: w,
-                                        height: h,
-                                    })),
+                                    SceneTexture::Image(std::sync::Arc::new(tex)),
                                 );
                             }
                             Err(e) => eprintln!("Failed to load texture {}: {e}", path.display()),
@@ -1469,11 +1497,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     });
                     textures.insert(
                         name.clone(),
-                        SceneTexture::Image(std::sync::Arc::new(ImageTexture {
-                            data: vec![color[0], color[1], color[2]],
-                            width: 1,
-                            height: 1,
-                        })),
+                        SceneTexture::Image(std::sync::Arc::new(ImageTexture::new(
+                            vec![color[0], color[1], color[2]],
+                            1,
+                            1,
+                        ))),
                     );
                 } else if class == "scale" {
                     let scale_val = p.float("scale").unwrap_or(1.0);
@@ -1486,11 +1514,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 base.data.iter().map(|v| v * scale_val).collect();
                             textures.insert(
                                 name.clone(),
-                                SceneTexture::Image(std::sync::Arc::new(ImageTexture {
-                                    data: scaled_data,
-                                    width: base.width,
-                                    height: base.height,
-                                })),
+                                SceneTexture::Image(std::sync::Arc::new(ImageTexture::new(
+                                    scaled_data,
+                                    base.width,
+                                    base.height,
+                                ))),
                             );
                         } else if let Some(base) = textures.get(tex_ref) {
                             textures.insert(name.clone(), base.clone());
@@ -1500,11 +1528,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         let sc = [c[0] * scale_val, c[1] * scale_val, c[2] * scale_val];
                         textures.insert(
                             name.clone(),
-                            SceneTexture::Image(std::sync::Arc::new(ImageTexture {
-                                data: vec![sc[0], sc[1], sc[2]],
-                                width: 1,
-                                height: 1,
-                            })),
+                            SceneTexture::Image(std::sync::Arc::new(ImageTexture::new(
+                                vec![sc[0], sc[1], sc[2]],
+                                1,
+                                1,
+                            ))),
                         );
                     }
                 } else if class == "mix" {
@@ -1524,11 +1552,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         if let Some(c) = p.rgb("tex1").or_else(|| p.rgb("tex2")) {
                             textures.insert(
                                 name.clone(),
-                                SceneTexture::Image(std::sync::Arc::new(ImageTexture {
-                                    data: vec![c[0], c[1], c[2]],
-                                    width: 1,
-                                    height: 1,
-                                })),
+                                SceneTexture::Image(std::sync::Arc::new(ImageTexture::new(
+                                    vec![c[0], c[1], c[2]],
+                                    1,
+                                    1,
+                                ))),
                             );
                         }
                     }
@@ -1577,6 +1605,39 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             }
                         }
                     }
+                    // If the reflectance texture uses planar mapping, compute projected UVs
+                    if let Some(ref tex) = mat_override.texture {
+                        if let Some(ref planar) = tex.planar {
+                            if let SceneShape::TriangleMesh {
+                                ref vertices,
+                                ref mut texcoords,
+                                ..
+                            } = shape
+                            {
+                                let transformed =
+                                    transform::transform_vertices(vertices, &current_transform);
+                                let n_verts = transformed.len() / 3;
+                                let mut new_uv = Vec::with_capacity(n_verts * 2);
+                                for i in 0..n_verts {
+                                    let px = transformed[i * 3];
+                                    let py = transformed[i * 3 + 1];
+                                    let pz = transformed[i * 3 + 2];
+                                    let u = px * planar.v1[0]
+                                        + py * planar.v1[1]
+                                        + pz * planar.v1[2]
+                                        + planar.udelta;
+                                    let v = px * planar.v2[0]
+                                        + py * planar.v2[1]
+                                        + pz * planar.v2[2]
+                                        + planar.vdelta;
+                                    new_uv.push(u);
+                                    new_uv.push(v);
+                                }
+                                *texcoords = new_uv;
+                            }
+                        }
+                    }
+
                     let obj = SceneObject {
                         shape,
                         material: mat_override,
