@@ -5,6 +5,15 @@ use crate::{ply, subdivision, transform};
 use pbrt_parser::{self, Directive, ParamType, ParamValue};
 use std::path::Path;
 
+/// Convert sRGB-encoded value to linear light.
+fn srgb_to_linear(x: f32) -> f32 {
+    if x <= 0.04045 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 pub struct ImageTexture {
     pub data: Vec<f32>, // RGB float, width*height*3
     pub width: u32,
@@ -1400,7 +1409,17 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                             .collect()
                                     }
                                 } else {
-                                    img.to_rgb32f().into_raw()
+                                    let raw = img.to_rgb32f().into_raw();
+                                    // Apply sRGB→linear for non-HDR formats (PNG, JPEG, etc.)
+                                    let is_hdr = filename.ends_with(".exr")
+                                        || filename.ends_with(".hdr")
+                                        || filename.ends_with(".EXR")
+                                        || filename.ends_with(".HDR");
+                                    if is_hdr {
+                                        raw
+                                    } else {
+                                        raw.into_iter().map(srgb_to_linear).collect()
+                                    }
                                 };
                                 println!("Loaded texture: {}x{} from {}", w, h, path.display());
                                 textures.insert(
