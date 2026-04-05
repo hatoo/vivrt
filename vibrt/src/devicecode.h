@@ -71,6 +71,9 @@ struct MaterialData {
     ConductorParams conductor;
   };
   // Texture maps
+  int texture_mapping; // 0=uv, 1=spherical, 2=cylindrical
+  float
+      texture_inv_transform[12]; // inverse transform for spherical/cylindrical
   float *texture_data;
   int texture_width;
   int texture_height;

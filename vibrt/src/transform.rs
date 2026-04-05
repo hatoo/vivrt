@@ -53,6 +53,40 @@ pub fn rotate(angle_deg: f32, ax: f32, ay: f32, az: f32) -> [f32; 12] {
     ]
 }
 
+/// Invert a 3x4 affine transform. Returns identity if singular.
+pub fn invert(t: &[f32; 12]) -> [f32; 12] {
+    // Cofactor matrix of 3x3 part
+    let c00 = t[5] * t[10] - t[6] * t[9];
+    let c01 = t[6] * t[8] - t[4] * t[10];
+    let c02 = t[4] * t[9] - t[5] * t[8];
+    let det = t[0] * c00 + t[1] * c01 + t[2] * c02;
+    if det.abs() < 1e-20 {
+        return identity();
+    }
+    let inv_det = 1.0 / det;
+    let c10 = t[2] * t[9] - t[1] * t[10];
+    let c11 = t[0] * t[10] - t[2] * t[8];
+    let c12 = t[1] * t[8] - t[0] * t[9];
+    let c20 = t[1] * t[6] - t[2] * t[5];
+    let c21 = t[2] * t[4] - t[0] * t[6];
+    let c22 = t[0] * t[5] - t[1] * t[4];
+    // Inverse 3x3
+    let r00 = c00 * inv_det;
+    let r01 = c10 * inv_det;
+    let r02 = c20 * inv_det;
+    let r10 = c01 * inv_det;
+    let r11 = c11 * inv_det;
+    let r12 = c21 * inv_det;
+    let r20 = c02 * inv_det;
+    let r21 = c12 * inv_det;
+    let r22 = c22 * inv_det;
+    // Inverse translation
+    let tx = -(r00 * t[3] + r01 * t[7] + r02 * t[11]);
+    let ty = -(r10 * t[3] + r11 * t[7] + r12 * t[11]);
+    let tz = -(r20 * t[3] + r21 * t[7] + r22 * t[11]);
+    [r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz]
+}
+
 /// Transform normals by the inverse-transpose of the 3x3 upper-left.
 /// Uses cofactor matrix (equivalent to inverse-transpose up to scale).
 pub fn transform_normals(normals: &[f32], t: &[f32; 12]) -> Vec<f32> {

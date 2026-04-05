@@ -20,6 +20,9 @@ pub struct ImageTexture {
     pub height: u32,
     /// Planar mapping: if Some, UVs are computed as dot(pos, v1)+udelta, dot(pos, v2)+vdelta
     pub planar: Option<PlanarMapping>,
+    /// Spherical/cylindrical mapping
+    pub spherical: Option<SphericalMapping>,
+    pub cylindrical: Option<SphericalMapping>,
     /// UV scale and offset (applied to mesh UVs before texture lookup)
     pub uscale: f32,
     pub vscale: f32,
@@ -34,6 +37,8 @@ impl ImageTexture {
             width,
             height,
             planar: None,
+            spherical: None,
+            cylindrical: None,
             uscale: 1.0,
             vscale: 1.0,
             udelta: 0.0,
@@ -46,6 +51,12 @@ impl ImageTexture {
 pub struct PlanarMapping {
     pub v1: [f32; 3],
     pub v2: [f32; 3],
+}
+
+/// Spherical/cylindrical mapping: inverse transform to map hit pos to texture space
+#[derive(Clone)]
+pub struct SphericalMapping {
+    pub inv_transform: [f32; 12], // inverse of the texture's attribute transform
 }
 
 pub struct SceneMaterial {
@@ -1727,6 +1738,14 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                         .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
                                         .unwrap_or([0.0, 1.0, 0.0]);
                                     tex.planar = Some(PlanarMapping { v1, v2 });
+                                } else if mapping == "spherical" {
+                                    tex.spherical = Some(SphericalMapping {
+                                        inv_transform: transform::invert(&current_transform),
+                                    });
+                                } else if mapping == "cylindrical" {
+                                    tex.cylindrical = Some(SphericalMapping {
+                                        inv_transform: transform::invert(&current_transform),
+                                    });
                                 }
                                 textures.insert(
                                     name.clone(),

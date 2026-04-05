@@ -89,6 +89,8 @@ pub struct MaterialData {
     pub coat_albedo: [f32; 3],
     pub params: MaterialParams,
     // Texture maps
+    pub texture_mapping: i32, // 0=uv, 1=spherical, 2=cylindrical
+    pub texture_inv_transform: [f32; 12],
     pub texture_data: optix_sys::CUdeviceptr,
     pub texture_width: i32,
     pub texture_height: i32,

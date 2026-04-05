@@ -1489,13 +1489,39 @@ extern "C" __global__ void __closesthit__ch() {
   }
 
   // Image texture sampling
-  if (mat->texture_data && data->texcoords) {
-    float u_coord = wt * data->texcoords[idx0 * 2] +
-                    bary.x * data->texcoords[idx1 * 2] +
-                    bary.y * data->texcoords[idx2 * 2];
-    float v_coord = wt * data->texcoords[idx0 * 2 + 1] +
-                    bary.x * data->texcoords[idx1 * 2 + 1] +
-                    bary.y * data->texcoords[idx2 * 2 + 1];
+  if (mat->texture_data && (data->texcoords || mat->texture_mapping != 0)) {
+    float u_coord, v_coord;
+    if (mat->texture_mapping == 1 || mat->texture_mapping == 2) {
+      // Spherical or cylindrical: compute UVs from world-space hit position
+      const float *ti = mat->texture_inv_transform;
+      float lx =
+          ti[0] * hit_pos.x + ti[1] * hit_pos.y + ti[2] * hit_pos.z + ti[3];
+      float ly =
+          ti[4] * hit_pos.x + ti[5] * hit_pos.y + ti[6] * hit_pos.z + ti[7];
+      float lz =
+          ti[8] * hit_pos.x + ti[9] * hit_pos.y + ti[10] * hit_pos.z + ti[11];
+      if (mat->texture_mapping == 1) {
+        // Spherical
+        float r = sqrtf(lx * lx + ly * ly + lz * lz);
+        float theta =
+            (r > 0.0f) ? acosf(fminf(fmaxf(ly / r, -1.0f), 1.0f)) : 0.0f;
+        float phi = atan2f(lx, lz);
+        u_coord = phi / (2.0f * M_PIf) + 0.5f;
+        v_coord = theta / M_PIf;
+      } else {
+        // Cylindrical
+        float phi = atan2f(lx, lz);
+        u_coord = phi / (2.0f * M_PIf) + 0.5f;
+        v_coord = ly;
+      }
+    } else {
+      u_coord = wt * data->texcoords[idx0 * 2] +
+                bary.x * data->texcoords[idx1 * 2] +
+                bary.y * data->texcoords[idx2 * 2];
+      v_coord = wt * data->texcoords[idx0 * 2 + 1] +
+                bary.x * data->texcoords[idx1 * 2 + 1] +
+                bary.y * data->texcoords[idx2 * 2 + 1];
+    }
 
     // Wrap UVs
     u_coord = u_coord - floorf(u_coord);

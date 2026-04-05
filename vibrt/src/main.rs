@@ -249,6 +249,8 @@ fn make_material_data(
         coat_thickness: mat.coat_thickness,
         coat_albedo: mat.coat_albedo,
         params,
+        texture_mapping: 0,
+        texture_inv_transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
         texture_data,
         texture_width,
         texture_height,
@@ -367,6 +369,17 @@ fn upload_scene_material(
     let mut mat_data = make_material_data(
         mat, d_tex, tw, th, d_bump, bw, bh, d_alpha, aw, ah, d_rough, rw, rh, d_nmap, nw, nh,
     );
+
+    // Set texture mapping type
+    if let Some(ref tex) = mat.texture {
+        if let Some(ref sph) = tex.spherical {
+            mat_data.texture_mapping = 1;
+            mat_data.texture_inv_transform = sph.inv_transform;
+        } else if let Some(ref cyl) = tex.cylindrical {
+            mat_data.texture_mapping = 2;
+            mat_data.texture_inv_transform = cyl.inv_transform;
+        }
+    }
 
     // Recursively upload mix sub-materials
     if let Some(ref m1) = mat.mix_mat1 {
