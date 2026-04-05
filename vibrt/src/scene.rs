@@ -1231,11 +1231,31 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         } else {
                             MAT_CONDUCTOR
                         };
+                        let eta_found = if is_coated {
+                            parse_conductor_eta(&p).or_else(|| {
+                                p.spectrum_string("conductor.eta")
+                                    .and_then(named_metal_eta)
+                                    .or_else(|| p.spectrum_rgb("conductor.eta"))
+                                    .or_else(|| p.rgb("conductor.eta"))
+                            })
+                        } else {
+                            parse_conductor_eta(&p)
+                        };
+                        let k_found = if is_coated {
+                            parse_conductor_k(&p).or_else(|| {
+                                p.spectrum_string("conductor.k")
+                                    .and_then(named_metal_k)
+                                    .or_else(|| p.spectrum_rgb("conductor.k"))
+                                    .or_else(|| p.rgb("conductor.k"))
+                            })
+                        } else {
+                            parse_conductor_k(&p)
+                        };
                         if let Some(c) = p.rgb("reflectance") {
                             current_material.albedo = c;
-                        } else if let Some(eta) = parse_conductor_eta(&p) {
+                        } else if let Some(eta) = eta_found {
                             current_material.conductor_eta = eta;
-                            if let Some(k) = parse_conductor_k(&p) {
+                            if let Some(k) = k_found {
                                 current_material.conductor_k = k;
                             }
                             current_material.albedo = conductor_f0(
@@ -1243,7 +1263,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 &current_material.conductor_k,
                             );
                         } else {
-                            // Default: gold-like (PBRT defaults to Cu for coatedconductor)
                             current_material.conductor_eta = [0.143, 0.374, 1.442];
                             current_material.conductor_k = [3.983, 2.380, 1.603];
                             current_material.albedo = conductor_f0(
@@ -1498,8 +1517,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
                         }
-                        // Acknowledge transmittance param
-                        let _ = p.rgb("transmittance");
                         if let Some(tex_name) = p.texture_ref("reflectance") {
                             match textures.get(tex_name) {
                                 Some(SceneTexture::Image(img)) => {
