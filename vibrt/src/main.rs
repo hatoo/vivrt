@@ -222,7 +222,7 @@ fn make_material_data(
                 tint: mat.tint,
             },
         },
-        MAT_CONDUCTOR => MaterialParams {
+        MAT_CONDUCTOR | MAT_COATED_CONDUCTOR => MaterialParams {
             conductor: ConductorParams {
                 eta: mat.conductor_eta,
                 k: mat.conductor_k,
@@ -686,7 +686,7 @@ fn main() -> Result<()> {
         &ctx,
         &pipeline_options,
         &PipelineLinkOptions {
-            max_trace_depth: scene.max_depth,
+            max_trace_depth: 2, // iterative path tracing: primary + shadow ray
         },
         &all_pgs,
     )
@@ -807,7 +807,8 @@ fn main() -> Result<()> {
                     0
                 };
                 let d_normals = if !normals.is_empty() {
-                    let s = stream.clone_htod(normals).cuda()?;
+                    let transformed_normals = transform::transform_normals(normals, &obj.transform);
+                    let s = stream.clone_htod(&transformed_normals).cuda()?;
                     let ptr = dptr(&s, &stream);
                     _device_buffers.push(unsafe { std::mem::transmute(s) });
                     ptr

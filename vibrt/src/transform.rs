@@ -53,6 +53,42 @@ pub fn rotate(angle_deg: f32, ax: f32, ay: f32, az: f32) -> [f32; 12] {
     ]
 }
 
+/// Transform normals by the inverse-transpose of the 3x3 upper-left.
+/// Uses cofactor matrix (equivalent to inverse-transpose up to scale).
+pub fn transform_normals(normals: &[f32], t: &[f32; 12]) -> Vec<f32> {
+    // Cofactor matrix of the 3x3 part (= inverse-transpose * det)
+    let c00 = t[5] * t[10] - t[6] * t[9];
+    let c01 = t[6] * t[8] - t[4] * t[10];
+    let c02 = t[4] * t[9] - t[5] * t[8];
+    let c10 = t[2] * t[9] - t[1] * t[10];
+    let c11 = t[0] * t[10] - t[2] * t[8];
+    let c12 = t[1] * t[8] - t[0] * t[9];
+    let c20 = t[1] * t[6] - t[2] * t[5];
+    let c21 = t[2] * t[4] - t[0] * t[6];
+    let c22 = t[0] * t[5] - t[1] * t[4];
+
+    let mut result = Vec::with_capacity(normals.len());
+    for i in (0..normals.len()).step_by(3) {
+        let x = normals[i];
+        let y = normals[i + 1];
+        let z = normals[i + 2];
+        let nx = c00 * x + c10 * y + c20 * z;
+        let ny = c01 * x + c11 * y + c21 * z;
+        let nz = c02 * x + c12 * y + c22 * z;
+        let len = (nx * nx + ny * ny + nz * nz).sqrt();
+        if len > 1e-20 {
+            result.push(nx / len);
+            result.push(ny / len);
+            result.push(nz / len);
+        } else {
+            result.push(0.0);
+            result.push(0.0);
+            result.push(1.0);
+        }
+    }
+    result
+}
+
 pub fn transform_vertices(verts: &[f32], t: &[f32; 12]) -> Vec<f32> {
     let mut result = Vec::with_capacity(verts.len());
     for i in (0..verts.len()).step_by(3) {
