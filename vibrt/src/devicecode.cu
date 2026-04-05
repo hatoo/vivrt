@@ -858,17 +858,21 @@ set_common_payloads(const HitGroupData *data, float3 hit_pos, float3 normal,
 
 // ---- Pack/unpack color ----
 
+// sRGB transfer function (linear to sRGB)
+static __forceinline__ __device__ float linear_to_srgb(float x) {
+  if (x <= 0.0f)
+    return 0.0f;
+  if (x >= 1.0f)
+    return 1.0f;
+  if (x <= 0.0031308f)
+    return 12.92f * x;
+  return 1.055f * powf(x, 1.0f / 2.4f) - 0.055f;
+}
+
 static __forceinline__ __device__ unsigned int packColor(float3 c) {
-  auto clamp01 = [](float x) {
-    return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
-  };
-  // Apply simple gamma (sRGB approximation)
-  float r = sqrtf(clamp01(c.x));
-  float g = sqrtf(clamp01(c.y));
-  float b = sqrtf(clamp01(c.z));
-  unsigned int ir = (unsigned int)(r * 255.0f);
-  unsigned int ig = (unsigned int)(g * 255.0f);
-  unsigned int ib = (unsigned int)(b * 255.0f);
+  unsigned int ir = (unsigned int)(linear_to_srgb(c.x) * 255.0f);
+  unsigned int ig = (unsigned int)(linear_to_srgb(c.y) * 255.0f);
+  unsigned int ib = (unsigned int)(linear_to_srgb(c.z) * 255.0f);
   return (255u << 24) | (ib << 16) | (ig << 8) | ir;
 }
 
