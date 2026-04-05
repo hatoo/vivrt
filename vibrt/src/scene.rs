@@ -751,11 +751,10 @@ fn parse_shape(
                 .floats("P")
                 .map(|v| v.iter().map(|x| *x as f32).collect())
                 .unwrap_or_default();
-            let texcoords: Vec<f32> = if p.floats("uv").is_some() {
-                vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]
-            } else {
-                Vec::new()
-            };
+            let texcoords: Vec<f32> = p
+                .floats("uv")
+                .map(|v| v.iter().map(|x| *x as f32).collect())
+                .unwrap_or_default();
             let indices = vec![0, 1, 3, 0, 3, 2];
             Some(SceneShape::TriangleMesh {
                 vertices: verts,
