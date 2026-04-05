@@ -168,6 +168,7 @@ pub struct ParsedScene {
     pub filename: String,
     pub cam_flip_x: bool,
     pub envmap: Option<ImageTexture>,
+    pub portal: Option<[[f32; 3]; 4]>, // 4 vertices of portal quad
 }
 
 // ---- Parameter access tracking ----
@@ -821,6 +822,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         filename: "output.png".to_string(),
         cam_flip_x: false,
         envmap: None,
+        portal: None,
     };
 
     #[derive(Clone)]
@@ -1054,7 +1056,10 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 "infinite" => {
                     let p = ParamSet::new(params, "LightSource \"infinite\"");
                     let float_scale = p.float("scale").unwrap_or(1.0);
-                    let scale = p.rgb("L").unwrap_or([1.0, 1.0, 1.0]);
+                    let mut scale = p.rgb("L").unwrap_or([1.0, 1.0, 1.0]);
+                    if let Some(k) = p.blackbody("L") {
+                        scale = blackbody_to_rgb(k);
+                    }
                     let scale = [
                         scale[0] * float_scale,
                         scale[1] * float_scale,
@@ -1083,6 +1088,17 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         }
                     } else {
                         parsed.ambient_light = scale;
+                    }
+                    // Parse portal quad (4 vertices)
+                    if let Some(pts) = p.floats("portal") {
+                        if pts.len() >= 12 {
+                            parsed.portal = Some([
+                                [pts[0] as f32, pts[1] as f32, pts[2] as f32],
+                                [pts[3] as f32, pts[4] as f32, pts[5] as f32],
+                                [pts[6] as f32, pts[7] as f32, pts[8] as f32],
+                                [pts[9] as f32, pts[10] as f32, pts[11] as f32],
+                            ]);
+                        }
                     }
                 }
                 "distant" => {

@@ -137,6 +137,10 @@ struct LaunchParams {
   float *envmap_conditional_cdf; // float[height*(width+1)]
   float envmap_integral;
 
+  // Environment map portal (quad for importance sampling)
+  int has_portal;
+  float portal[12]; // 4 vertices * 3 floats
+
   // GGX energy compensation LUT (Kulla-Conty)
   float *ggx_e_lut;     // E(cosTheta, alpha), 32x32
   float *ggx_e_avg_lut; // E_avg(alpha), 32

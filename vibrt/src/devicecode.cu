@@ -695,6 +695,66 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
   return result;
 }
 
+// Portal-guided environment light NEE
+static __forceinline__ __device__ float3 nee_portal(
+    float3 hit_pos, float3 hit_normal, float3 V, float3 albedo, float alpha_u,
+    float alpha_v, bool is_conductor, float3 eta, float3 k, float3 geom_tangent,
+    unsigned int pixel_idx, unsigned int sample_idx, unsigned int depth) {
+  if (!params.has_portal)
+    return make_float3(0, 0, 0);
+
+  // Portal quad vertices
+  float3 p0 = make_float3(params.portal[0], params.portal[1], params.portal[2]);
+  float3 p1 = make_float3(params.portal[3], params.portal[4], params.portal[5]);
+  float3 p2 = make_float3(params.portal[6], params.portal[7], params.portal[8]);
+  float3 p3 =
+      make_float3(params.portal[9], params.portal[10], params.portal[11]);
+
+  // Portal edges and normal
+  float3 e1 = p1 - p0;
+  float3 e2 = p3 - p0;
+  float3 portal_normal = cross3(e1, e2);
+  float portal_area = sqrtf(dot3(portal_normal, portal_normal));
+  if (portal_area < 1e-8f)
+    return make_float3(0, 0, 0);
+  portal_normal = portal_normal * (1.0f / portal_area);
+
+  RNG portal_rng(pixel_idx * 59, sample_idx, depth + 400);
+  float u1 = portal_rng.next();
+  float u2 = portal_rng.next();
+
+  // Sample point on quad (bilinear interpolation)
+  float3 portal_point = p0 + e1 * u1 + e2 * u2;
+  float3 to_portal = portal_point - hit_pos;
+  float dist2 = dot3(to_portal, to_portal);
+  float dist = sqrtf(dist2);
+  float3 L = to_portal * (1.0f / dist);
+
+  // Geometry term: cos at portal surface
+  float cos_portal = fabsf(dot3(portal_normal, L * (-1.0f)));
+  if (cos_portal < 1e-6f)
+    return make_float3(0, 0, 0);
+
+  // PDF: 1/area * distance^2 / cos_portal = solid angle PDF
+  float pdf = dist2 / (portal_area * cos_portal);
+  if (pdf <= 0.0f)
+    return make_float3(0, 0, 0);
+
+  float3 bw = eval_brdf_cosine(V, L, hit_normal, albedo, alpha_u, alpha_v,
+                               is_conductor, eta, k, geom_tangent);
+  if (bw.x <= 0 && bw.y <= 0 && bw.z <= 0)
+    return make_float3(0, 0, 0);
+
+  // Shadow ray toward portal point
+  ShadowResult sr = trace_shadow(hit_pos, L, dist - 0.01f, OPTIX_RAY_FLAG_NONE);
+  if (!sr.hit) {
+    // Sample environment light color in the portal direction
+    float3 env_color = sample_envmap(L);
+    return bw * env_color * (1.0f / pdf);
+  }
+  return make_float3(0, 0, 0);
+}
+
 static __forceinline__ __device__ float3 nee_envmap(
     float3 hit_pos, float3 hit_normal, float3 V, float3 albedo, float alpha_u,
     float alpha_v, bool is_conductor, float3 eta, float3 k, float3 geom_tangent,
@@ -737,6 +797,9 @@ static __forceinline__ __device__ float3 compute_nee(
                              is_conductor, eta, k, geom_tangent, pixel_idx,
                              sample_idx, depth) +
          nee_envmap(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v,
+                    is_conductor, eta, k, geom_tangent, pixel_idx, sample_idx,
+                    depth) +
+         nee_portal(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v,
                     is_conductor, eta, k, geom_tangent, pixel_idx, sample_idx,
                     depth);
 }

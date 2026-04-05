@@ -1082,6 +1082,15 @@ fn main() -> Result<()> {
         envmap_marginal_cdf: d_marginal_cdf,
         envmap_conditional_cdf: d_conditional_cdf,
         envmap_integral: envmap_integral,
+        has_portal: if scene.portal.is_some() { 1 } else { 0 },
+        portal: if let Some(p) = &scene.portal {
+            [
+                p[0][0], p[0][1], p[0][2], p[1][0], p[1][1], p[1][2], p[2][0], p[2][1], p[2][2],
+                p[3][0], p[3][1], p[3][2],
+            ]
+        } else {
+            [0.0; 12]
+        },
         ggx_e_lut: d_ggx_e_lut,
         ggx_e_avg_lut: d_ggx_e_avg,
     };
