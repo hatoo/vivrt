@@ -140,6 +140,9 @@ struct LaunchParams {
   float *envmap_conditional_cdf; // float[height*(width+1)]
   float envmap_integral;
 
+  // Environment map rotation (inverse of light transform, 3x3 row-major)
+  float envmap_inv_rotation[9];
+
   // Environment map portal (quad for importance sampling)
   int has_portal;
   float portal[12]; // 4 vertices * 3 floats

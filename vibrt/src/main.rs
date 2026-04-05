@@ -1096,6 +1096,13 @@ fn main() -> Result<()> {
         envmap_marginal_cdf: d_marginal_cdf,
         envmap_conditional_cdf: d_conditional_cdf,
         envmap_integral: envmap_integral,
+        envmap_inv_rotation: {
+            let inv = transform::invert(&scene.envmap_transform);
+            // Extract 3x3 rotation from 3x4 inverse transform
+            [
+                inv[0], inv[1], inv[2], inv[4], inv[5], inv[6], inv[8], inv[9], inv[10],
+            ]
+        },
         has_portal: if scene.portal.is_some() { 1 } else { 0 },
         portal: if let Some(p) = &scene.portal {
             [

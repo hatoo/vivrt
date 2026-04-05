@@ -179,6 +179,7 @@ pub struct ParsedScene {
     pub filename: String,
     pub cam_flip_x: bool,
     pub envmap: Option<ImageTexture>,
+    pub envmap_transform: [f32; 12], // envmap light transform (rotation)
     pub portal: Option<[[f32; 3]; 4]>, // 4 vertices of portal quad
 }
 
@@ -866,6 +867,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         cam_flip_x: false,
         envmap: None,
         portal: None,
+        envmap_transform: transform::identity(),
     };
 
     #[derive(Clone)]
@@ -1367,6 +1369,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         scale[1] * float_scale,
                         scale[2] * float_scale,
                     ];
+                    parsed.envmap_transform = current_transform;
                     if let Some(filename) = p.string("filename") {
                         let path = scene_dir.join(filename);
                         match image::open(&path) {

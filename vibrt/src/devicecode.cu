@@ -447,8 +447,14 @@ static __forceinline__ __device__ float3 sample_envmap(float3 dir) {
   if (!params.envmap_data)
     return make_f3(params.ambient_light);
 
-  float theta = acosf(fminf(fmaxf(dir.y, -1.0f), 1.0f));
-  float phi = atan2f(dir.z, dir.x);
+  // Apply inverse envmap rotation to transform direction to texture space
+  const float *r = params.envmap_inv_rotation;
+  float3 rd = make_float3(r[0] * dir.x + r[1] * dir.y + r[2] * dir.z,
+                          r[3] * dir.x + r[4] * dir.y + r[5] * dir.z,
+                          r[6] * dir.x + r[7] * dir.y + r[8] * dir.z);
+
+  float theta = acosf(fminf(fmaxf(rd.y, -1.0f), 1.0f));
+  float phi = atan2f(rd.z, rd.x);
   float u = 0.5f + phi / (2.0f * M_PIf);
   float v = theta / M_PIf;
 
@@ -514,8 +520,19 @@ sample_envmap_direction(float u1, float u2, float3 &dir, float3 &color,
   float theta = v * M_PIf;
   float phi = (u - 0.5f) * 2.0f * M_PIf;
   float sin_theta = sinf(theta);
-  dir = make_float3(cosf(phi) * sin_theta, cosf(theta), sinf(phi) * sin_theta);
-  color = sample_envmap(dir);
+  // Direction in texture space
+  float3 tex_dir =
+      make_float3(cosf(phi) * sin_theta, cosf(theta), sinf(phi) * sin_theta);
+  color =
+      sample_envmap(tex_dir); // sample_envmap applies inv rotation internally
+  // But we skip it for the CDF-sampled direction since we have the texel
+  // directly Rotate texture-space direction to world space using forward envmap
+  // rotation Forward rotation = transpose of inverse rotation (for orthogonal
+  // transforms)
+  const float *r = params.envmap_inv_rotation;
+  dir = make_float3(r[0] * tex_dir.x + r[3] * tex_dir.y + r[6] * tex_dir.z,
+                    r[1] * tex_dir.x + r[4] * tex_dir.y + r[7] * tex_dir.z,
+                    r[2] * tex_dir.x + r[5] * tex_dir.y + r[8] * tex_dir.z);
 
   float marginal_pdf = (cdf_y1 - cdf_y0) * (float)h;
   float conditional_pdf = (cdf_x1 - cdf_x0) * (float)w;
