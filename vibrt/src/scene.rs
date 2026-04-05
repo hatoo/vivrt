@@ -533,32 +533,68 @@ fn parse_roughness(p: &ParamSet, prefix: &str, remap: bool) -> (f32, f32) {
     }
 }
 
+/// Planck spectral radiance B(λ, T) in W·sr⁻¹·m⁻³
+fn planck(lambda_nm: f64, temp_k: f64) -> f64 {
+    const H: f64 = 6.62607015e-34; // Planck constant
+    const C: f64 = 2.99792458e8; // speed of light
+    const KB: f64 = 1.380649e-23; // Boltzmann constant
+    let lambda = lambda_nm * 1e-9;
+    let l5 = lambda * lambda * lambda * lambda * lambda;
+    let exponent = H * C / (lambda * KB * temp_k);
+    if exponent > 500.0 {
+        return 0.0;
+    }
+    (2.0 * H * C * C) / (l5 * (exponent.exp() - 1.0))
+}
+
+/// Convert blackbody temperature to RGB by integrating Planck spectrum
+/// against CIE 1931 XYZ color matching functions, then XYZ→linear sRGB.
 fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
-    let temp = kelvin / 100.0;
-    let r = if temp <= 66.0 {
-        1.0
-    } else {
-        let x = temp - 60.0;
-        (329.699_f32 * x.powf(-0.13320_f32) / 255.0).clamp(0.0, 1.0)
-    };
-    let g = if temp <= 66.0 {
-        let x = temp;
-        (99.4708_f32 * x.ln() - 161.1196_f32) / 255.0
-    } else {
-        let x = temp - 60.0;
-        288.1222_f32 * x.powf(-0.07551_f32) / 255.0
+    // CIE 1931 2° observer, sampled at 5nm intervals from 380-780nm
+    // Using the analytical Gaussian approximation from Wyman et al. 2013
+    let t = kelvin as f64;
+    let mut x = 0.0_f64;
+    let mut y = 0.0_f64;
+    let mut z = 0.0_f64;
+    let step = 5.0;
+    let mut lambda = 380.0;
+    while lambda <= 780.0 {
+        let b = planck(lambda, t);
+
+        // CIE XYZ multi-lobe Gaussian fit (Wyman, Sloan, Shirley 2013)
+        let t1 = (lambda - 442.0) * (if lambda < 442.0 { 0.0624 } else { 0.0374 });
+        let t2 = (lambda - 599.8) * (if lambda < 599.8 { 0.0264 } else { 0.0323 });
+        let t3 = (lambda - 501.1) * (if lambda < 501.1 { 0.0490 } else { 0.0382 });
+        let t4 = (lambda - 568.8) * (if lambda < 568.8 { 0.0213 } else { 0.0247 });
+        let t5 = (lambda - 530.9) * (if lambda < 530.9 { 0.0613 } else { 0.0322 });
+        let t6 = (lambda - 437.0) * (if lambda < 437.0 { 0.0845 } else { 0.0278 });
+
+        let xbar = 0.362 * (-0.5 * t1 * t1).exp() + 1.056 * (-0.5 * t2 * t2).exp()
+            - 0.065 * (-0.5 * t3 * t3).exp();
+        let ybar = 0.821 * (-0.5 * t4 * t4).exp() + 0.286 * (-0.5 * t5 * t5).exp();
+        let zbar = 1.217 * (-0.5 * t6 * t6).exp()
+            + 0.681 * (-0.5 * (((lambda - 459.0) * 0.0385) * ((lambda - 459.0) * 0.0385))).exp();
+
+        x += b * xbar * step;
+        y += b * ybar * step;
+        z += b * zbar * step;
+        lambda += step;
     }
-    .clamp(0.0, 1.0);
-    let b = if temp >= 66.0 {
-        1.0
-    } else if temp <= 19.0 {
-        0.0
-    } else {
-        let x = temp - 10.0;
-        (138.5177_f32 * x.ln() - 305.0448_f32) / 255.0
+
+    // Normalize so that Y (luminance) = 1
+    if y > 0.0 {
+        let scale = 1.0 / y;
+        x *= scale;
+        y = 1.0;
+        z *= scale;
     }
-    .clamp(0.0, 1.0);
-    [r, g, b]
+
+    // XYZ to linear sRGB (D65 illuminant)
+    let r = 3.2406 * x - 1.5372 * y - 0.4986 * z;
+    let g = -0.9689 * x + 1.8758 * y + 0.0415 * z;
+    let b = 0.0557 * x - 0.2040 * y + 1.0570 * z;
+
+    [r.max(0.0) as f32, g.max(0.0) as f32, b.max(0.0) as f32]
 }
 
 /// Sample an image texture at pixel (x, y), clamped
