@@ -1079,9 +1079,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             current_material.coat_thickness = p.float("thickness").unwrap_or(0.01);
                             current_material.coat_albedo =
                                 p.rgb("albedo").unwrap_or([0.0, 0.0, 0.0]);
-                            let _ = p.float("g"); // scattering asymmetry (not implemented)
-                            let _ = p.ints("maxdepth"); // layer simulation quality (not applicable)
-                            let _ = p.ints("nsamples");
                         } else {
                             let (ru, rv) = parse_roughness(&p, "", remap);
                             current_material.roughness = ru;
@@ -1239,9 +1236,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             mat.coat_eta = p.float("interface.eta").unwrap_or(1.5);
                             mat.coat_thickness = p.float("thickness").unwrap_or(0.01);
                             mat.coat_albedo = p.rgb("albedo").unwrap_or([0.0, 0.0, 0.0]);
-                            let _ = p.float("g"); // scattering asymmetry (not implemented)
-                            let _ = p.ints("maxdepth"); // layer simulation quality (not applicable)
-                            let _ = p.ints("nsamples");
                         } else {
                             let (ru, rv) = parse_roughness(&p, "", remap);
                             mat.roughness = ru;
