@@ -1394,15 +1394,21 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     } else {
                         parsed.ambient_light = scale;
                     }
-                    // Parse portal quad (4 vertices)
+                    // Parse portal quad (4 vertices), transform to world space
                     if let Some(pts) = p.floats("portal") {
                         if pts.len() >= 12 {
-                            parsed.portal = Some([
-                                [pts[0] as f32, pts[1] as f32, pts[2] as f32],
-                                [pts[3] as f32, pts[4] as f32, pts[5] as f32],
-                                [pts[6] as f32, pts[7] as f32, pts[8] as f32],
-                                [pts[9] as f32, pts[10] as f32, pts[11] as f32],
-                            ]);
+                            let t = &current_transform;
+                            let xf = |i: usize| -> [f32; 3] {
+                                let x = pts[i] as f32;
+                                let y = pts[i + 1] as f32;
+                                let z = pts[i + 2] as f32;
+                                [
+                                    t[0] * x + t[1] * y + t[2] * z + t[3],
+                                    t[4] * x + t[5] * y + t[6] * z + t[7],
+                                    t[8] * x + t[9] * y + t[10] * z + t[11],
+                                ]
+                            };
+                            parsed.portal = Some([xf(0), xf(3), xf(6), xf(9)]);
                         }
                     }
                 }
