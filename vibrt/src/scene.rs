@@ -28,6 +28,8 @@ pub struct SceneMaterial {
     pub conductor_k: [f32; 3],
     pub coat_roughness: f32,
     pub coat_eta: f32,
+    pub coat_thickness: f32,
+    pub coat_albedo: [f32; 3],
     pub texture: Option<std::sync::Arc<ImageTexture>>,
     pub bump_map: Option<std::sync::Arc<ImageTexture>>,
     pub alpha_map: Option<std::sync::Arc<ImageTexture>>,
@@ -54,6 +56,8 @@ impl Default for SceneMaterial {
             conductor_k: [0.0, 0.0, 0.0],
             coat_roughness: 0.0,
             coat_eta: 1.5,
+            coat_thickness: 0.01,
+            coat_albedo: [0.0, 0.0, 0.0],
             texture: None,
             bump_map: None,
             alpha_map: None,
@@ -1072,6 +1076,12 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             current_material.coat_roughness =
                                 parse_roughness(&p, "interface", remap).0;
                             current_material.coat_eta = p.float("interface.eta").unwrap_or(1.5);
+                            current_material.coat_thickness = p.float("thickness").unwrap_or(0.01);
+                            current_material.coat_albedo =
+                                p.rgb("albedo").unwrap_or([0.0, 0.0, 0.0]);
+                            let _ = p.float("g"); // scattering asymmetry (not implemented)
+                            let _ = p.ints("maxdepth"); // layer simulation quality (not applicable)
+                            let _ = p.ints("nsamples");
                         } else {
                             let (ru, rv) = parse_roughness(&p, "", remap);
                             current_material.roughness = ru;
@@ -1220,10 +1230,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
                         }
                         // Acknowledge coatedconductor-specific params
-                        if is_coated {
-                            let _ = p.float("thickness");
-                            let _ = p.rgb("albedo");
-                        }
                         let remap = p.bool("remaproughness").unwrap_or(true);
                         if is_coated {
                             let (ru, rv) = parse_roughness(&p, "conductor", remap);
@@ -1231,6 +1237,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             mat.roughness_v = rv;
                             mat.coat_roughness = parse_roughness(&p, "interface", remap).0;
                             mat.coat_eta = p.float("interface.eta").unwrap_or(1.5);
+                            mat.coat_thickness = p.float("thickness").unwrap_or(0.01);
+                            mat.coat_albedo = p.rgb("albedo").unwrap_or([0.0, 0.0, 0.0]);
+                            let _ = p.float("g"); // scattering asymmetry (not implemented)
+                            let _ = p.ints("maxdepth"); // layer simulation quality (not applicable)
+                            let _ = p.ints("nsamples");
                         } else {
                             let (ru, rv) = parse_roughness(&p, "", remap);
                             mat.roughness = ru;

@@ -86,6 +86,8 @@ pub struct HitGroupData {
     pub roughness_v: f32,
     pub coat_roughness: f32,
     pub coat_eta: f32,
+    pub coat_thickness: f32,
+    pub coat_albedo: [f32; 3],
     pub params: MaterialParams,
     // Geometry
     pub vertices: optix_sys::CUdeviceptr,

@@ -64,6 +64,8 @@ struct HitGroupData {
   float roughness_v;
   float coat_roughness;
   float coat_eta;
+  float coat_thickness;
+  float coat_albedo[3];
   union {
     DiffuseParams diffuse;
     DielectricParams dielectric;

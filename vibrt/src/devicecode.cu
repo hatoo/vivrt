@@ -400,11 +400,13 @@ trace_shadow(float3 origin, float3 dir, float tmax, unsigned int ray_flags) {
   unsigned int sp9 = 0xFFFFFFFF;
   unsigned int sp10 = 0, sp11 = 0, sp12 = 0, sp13 = 0;
   unsigned int sp14 = 0, sp15 = 0, sp16 = 0, sp17 = 0, sp18 = 0, sp19 = 0;
-  unsigned int sp20 = 0, sp21 = 0, sp22 = 0, sp23 = 0, sp24 = 0, sp25 = 0;
+  unsigned int sp20 = 0, sp21 = 0, sp22 = 0, sp23 = 0, sp24 = 0, sp25 = 0,
+               sp26 = 0, sp27 = 0, sp28 = 0, sp29 = 0;
   optixTrace(params.traversable, origin, dir, 0.001f, tmax, 0.0f,
              OptixVisibilityMask(255), ray_flags, 0, 1, 0, p0, p1, p2, p3, p4,
              p5, p6, p7, p8, sp9, sp10, sp11, sp12, sp13, sp14, sp15, sp16,
-             sp17, sp18, sp19, sp20, sp21, sp22, sp23, sp24, sp25);
+             sp17, sp18, sp19, sp20, sp21, sp22, sp23, sp24, sp25, sp26, sp27,
+             sp28, sp29);
   ShadowResult res;
   res.hit = (sp9 != 0xFFFFFFFF);
   res.emission = make_float3(__uint_as_float(sp10), __uint_as_float(sp11),
@@ -842,6 +844,12 @@ set_common_payloads(const HitGroupData *data, float3 hit_pos, float3 normal,
     optixSetPayload_20(__float_as_uint(data->coat_roughness));
     optixSetPayload_21(__float_as_uint(data->coat_eta));
   }
+  if (data->material_type == MAT_COATED_CONDUCTOR) {
+    optixSetPayload_26(__float_as_uint(data->coat_thickness));
+    optixSetPayload_27(__float_as_uint(data->coat_albedo[0]));
+    optixSetPayload_28(__float_as_uint(data->coat_albedo[1]));
+    optixSetPayload_29(__float_as_uint(data->coat_albedo[2]));
+  }
 
   optixSetPayload_23(__float_as_uint(tangent.x));
   optixSetPayload_24(__float_as_uint(tangent.y));
@@ -895,13 +903,15 @@ extern "C" __global__ void __raygen__rg() {
       unsigned int p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13;
       unsigned int p14 = 0, p15 = 0, p16 = 0, p17 = 0, p18 = 0, p19 = 0;
       unsigned int p20 = 0, p21 = 0, p22 = 0, p23 = 0, p24 = 0, p25 = 0;
+      unsigned int p26 = 0, p27 = 0, p28 = 0, p29 = 0;
       p9 = 0xFFFFFFFF; // miss sentinel
       p10 = p11 = p12 = p13 = 0;
 
       optixTrace(params.traversable, origin, direction, 0.001f, 1e16f, 0.0f,
                  OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1, 0, p0, p1,
                  p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15,
-                 p16, p17, p18, p19, p20, p21, p22, p23, p24, p25);
+                 p16, p17, p18, p19, p20, p21, p22, p23, p24, p25, p26, p27,
+                 p28, p29);
 
       if (p9 == 0xFFFFFFFF) {
         // Miss - sample environment map or use constant ambient
@@ -1006,6 +1016,9 @@ extern "C" __global__ void __raygen__rg() {
         float cond_alpha_v = fmaxf(__uint_as_float(p22), 0.001f);
         float coat_alpha = fmaxf(__uint_as_float(p20), 0.001f);
         float coat_eta_val = __uint_as_float(p21);
+        float coat_thick = __uint_as_float(p26);
+        float3 coat_alb = make_float3(
+            __uint_as_float(p27), __uint_as_float(p28), __uint_as_float(p29));
         float3 cond_eta = make_float3(
             __uint_as_float(p14), __uint_as_float(p15), __uint_as_float(p16));
         float3 cond_k = make_float3(__uint_as_float(p17), __uint_as_float(p18),
@@ -1023,6 +1036,13 @@ extern "C" __global__ void __raygen__rg() {
           origin = hit_pos;
           specular_bounce = true;
         } else {
+          // Coating absorption: Beer's law attenuation through the coating
+          // layer Path length through coating ≈ thickness / cos(theta)
+          float coat_path = coat_thick / fmaxf(cos_i, 0.01f);
+          float3 coat_absorption = make_float3(expf(-coat_alb.x * coat_path),
+                                               expf(-coat_alb.y * coat_path),
+                                               expf(-coat_alb.z * coat_path));
+
           // Multi-layer scattering: geometric series for inter-layer bounces
           float coat_F_inner = coat_F;
           float3 Fr_avg = conductor_F_avg(hit_albedo, cond_eta, cond_k);
@@ -1033,6 +1053,7 @@ extern "C" __global__ void __raygen__rg() {
                               fmaxf(1.0f - coat_F_inner * Fr_avg.y, 0.01f),
                           (1.0f - coat_F_inner) /
                               fmaxf(1.0f - coat_F_inner * Fr_avg.z, 0.01f));
+          coat_tp = coat_tp * coat_absorption;
 
           radiance = radiance +
                      throughput * coat_tp *
