@@ -523,16 +523,16 @@ sample_envmap_direction(float u1, float u2, float3 &dir, float3 &color,
   // Direction in texture space
   float3 tex_dir =
       make_float3(cosf(phi) * sin_theta, cosf(theta), sinf(phi) * sin_theta);
-  color =
-      sample_envmap(tex_dir); // sample_envmap applies inv rotation internally
-  // But we skip it for the CDF-sampled direction since we have the texel
-  // directly Rotate texture-space direction to world space using forward envmap
-  // rotation Forward rotation = transpose of inverse rotation (for orthogonal
-  // transforms)
+
+  // Rotate texture-space direction to world space using forward envmap rotation
   const float *r = params.envmap_inv_rotation;
+  // Forward = transpose of inverse (valid for orthogonal + reflection
+  // transforms)
   dir = make_float3(r[0] * tex_dir.x + r[3] * tex_dir.y + r[6] * tex_dir.z,
                     r[1] * tex_dir.x + r[4] * tex_dir.y + r[7] * tex_dir.z,
                     r[2] * tex_dir.x + r[5] * tex_dir.y + r[8] * tex_dir.z);
+  // Look up envmap color using the world-space direction
+  color = sample_envmap(dir);
 
   float marginal_pdf = (cdf_y1 - cdf_y0) * (float)h;
   float conditional_pdf = (cdf_x1 - cdf_x0) * (float)w;
