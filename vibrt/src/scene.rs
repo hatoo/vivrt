@@ -1327,7 +1327,6 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                     _ => eprintln!("  warning: unsupported material type: {ty}"),
                 }
-                // Mark known-but-unhandled params so they don't trigger warnings
                 if let Some(tex_name) = p.texture_ref("displacement") {
                     match textures.get(tex_name) {
                         Some(SceneTexture::Image(img)) => {
