@@ -49,8 +49,24 @@ def _write_blob(buf: bytearray, data: bytes) -> dict:
     return {"offset": off, "len": len(data)}
 
 
+class _PreBakedTexture:
+    """A synthetic, fully-resolved linear RGB texture produced offline (e.g. by
+    pre-mixing the two sides of a two-texture Mix node).
+
+    Carries `rgb` as a numpy (h, w, 3) float32 array and a `cache_key` so the
+    main exporter can dedupe and write it without going through `bpy.Image`.
+    """
+    __slots__ = ("rgb", "w", "h", "cache_key")
+
+    def __init__(self, rgb, w: int, h: int, cache_key: str):
+        self.rgb = rgb
+        self.w = w
+        self.h = h
+        self.cache_key = cache_key
+
+
 def export_image_texture(
-    image: bpy.types.Image,
+    image,
     buf: bytearray,
     textures: list,
     colorspace: str | None = None,
@@ -58,12 +74,12 @@ def export_image_texture(
 ) -> int:
     """Serialize an image into scene.bin and register a TextureDesc entry.
 
-    `chain` is a sequence of `(id_tuple, apply_fn)` color transforms (typically
-    from `_socket_linked_image_with_chain`) to bake into the pixels. When
-    non-empty, pixels are linearised, transformed, and stored as linear.
-
-    Returns the texture index. Reuses existing entries by (image, chain) key.
+    Accepts either a `bpy.types.Image` (chain transforms baked into its pixels)
+    or a `_PreBakedTexture` (already in linear space; chain ignored, must be
+    empty). Returns the texture index. Reuses existing entries by cache key.
     """
+    if isinstance(image, _PreBakedTexture):
+        return _export_prebaked(image, buf, textures)
     chain_key = "" if not chain else "|" + repr(tuple(x[0] for x in chain))
     key = f"__image__{image.name}{chain_key}"
     for i, t in enumerate(textures):
@@ -95,6 +111,81 @@ def export_image_texture(
     }
     textures.append(desc)
     return len(textures) - 1
+
+
+def _export_prebaked(pb: "_PreBakedTexture", buf: bytearray, textures: list) -> int:
+    import numpy as np
+    for i, t in enumerate(textures):
+        if t.get("_key") == pb.cache_key:
+            return i
+    rgba = np.concatenate(
+        [pb.rgb, np.ones((pb.h, pb.w, 1), dtype=np.float32)], axis=-1
+    )
+    pixels = rgba.astype(np.float32).reshape(-1).tolist()
+    desc = {
+        "width": int(pb.w),
+        "height": int(pb.h),
+        "channels": 4,
+        "colorspace": "linear",
+        "pixels": _write_blob(buf, _pack_f32(pixels)),
+        "_key": pb.cache_key,
+    }
+    textures.append(desc)
+    return len(textures) - 1
+
+
+def _image_to_linear_rgb(image):
+    """Decode a `bpy.types.Image` into a (h, w, 3) numpy array in linear space."""
+    import numpy as np
+    if image.size[0] == 0 or image.size[1] == 0:
+        image.update()
+    w, h = int(image.size[0]), int(image.size[1])
+    if w == 0 or h == 0:
+        return np.ones((1, 1, 3), dtype=np.float32), 1, 1
+    px = np.asarray(list(image.pixels[:]), dtype=np.float32).reshape((h, w, 4))
+    rgb = px[..., :3].copy()
+    if image.colorspace_settings.name.lower().startswith("srgb"):
+        rgb = _srgb_to_linear_np(rgb).astype(np.float32)
+    return rgb, w, h
+
+
+def _bake_source_to_linear(source, chain):
+    """Resolve any texture source (`bpy.Image` or `_PreBakedTexture`) plus chain
+    into a linear (h, w, 3) numpy array.
+    """
+    if isinstance(source, _PreBakedTexture):
+        # PreBaked is already linear; chains on top would be unusual.
+        rgb = source.rgb
+        for _id, apply_fn in chain:
+            rgb = apply_fn(rgb)
+        return rgb, source.w, source.h
+    rgb, w, h = _image_to_linear_rgb(source)
+    for _id, apply_fn in chain:
+        rgb = apply_fn(rgb)
+    return rgb, w, h
+
+
+def _resample_bilinear(rgb, target_h: int, target_w: int):
+    import numpy as np
+    h, w, _ = rgb.shape
+    if h == target_h and w == target_w:
+        return rgb
+    ys = np.linspace(0.0, h - 1, target_h, dtype=np.float32)
+    xs = np.linspace(0.0, w - 1, target_w, dtype=np.float32)
+    y0 = np.floor(ys).astype(np.int32)
+    y1 = np.minimum(y0 + 1, h - 1)
+    x0 = np.floor(xs).astype(np.int32)
+    x1 = np.minimum(x0 + 1, w - 1)
+    fy = (ys - y0)[:, None, None]
+    fx = (xs - x0)[None, :, None]
+    a00 = rgb[y0[:, None], x0[None, :]]
+    a01 = rgb[y0[:, None], x1[None, :]]
+    a10 = rgb[y1[:, None], x0[None, :]]
+    a11 = rgb[y1[:, None], x1[None, :]]
+    return (a00 * (1 - fy) * (1 - fx)
+            + a01 * (1 - fy) * fx
+            + a10 * fy * (1 - fx)
+            + a11 * fy * fx).astype(np.float32)
 
 
 def _srgb_to_linear_np(x):
@@ -155,12 +246,18 @@ _PROCEDURAL_LEAF_DEFAULTS: dict[str, list[float]] = {
 def _socket_constant_rgb(sock) -> list[float] | None:
     """Return a constant RGB triple if the socket is effectively constant.
 
-    Accepts unlinked sockets (uses default_value), sockets linked to a
-    `ShaderNodeRGB`, `ShaderNodeBlackbody` (computed from Temperature), and
-    procedural / data-driven leaves listed in `_PROCEDURAL_LEAF_DEFAULTS`
-    (collapsed to a representative constant — spatial detail is lost).
-    Returns None for any other linked source.
+    Walks through bakeable colour-modifying nodes (RGBCurve, Gamma, Mix when
+    both sides resolve to constants, ColorRamp with unlinked Fac, ...) so that
+    a sub-tree with no TexImage anywhere collapses cleanly. Returns None if
+    any node on the path is non-bakeable or any leaf is a TexImage (which
+    isn't a constant — callers should treat it as a real texture chain).
     """
+    return _resolve_constant_socket(sock, depth=0)
+
+
+def _resolve_constant_socket(sock, depth: int = 0):
+    if depth > 8:
+        return None
     if not sock.is_linked:
         return _socket_rgb(sock)
     src = sock.links[0].from_node
@@ -174,6 +271,62 @@ def _socket_constant_rgb(sock) -> list[float] | None:
         return _blackbody_to_linear_rgb(_socket_f(temp_sock))
     if src.bl_idname in _PROCEDURAL_LEAF_DEFAULTS:
         return list(_PROCEDURAL_LEAF_DEFAULTS[src.bl_idname])
+    if src.bl_idname == "ShaderNodeTexImage":
+        # A real texture isn't a constant; callers handle textures separately.
+        return None
+    if src.bl_idname == "ShaderNodeValToRGB":
+        # ColorRamp: walk the Fac input to a scalar constant, then evaluate.
+        fac_sock = src.inputs.get("Fac")
+        if fac_sock is None:
+            return None
+        if fac_sock.is_linked:
+            inner = _resolve_constant_socket(fac_sock, depth + 1)
+            if inner is None:
+                return None
+            fac = float(inner[0])  # collapse to scalar via R channel
+        else:
+            fac = _socket_f(fac_sock)
+        ramp_color = list(src.color_ramp.evaluate(max(0.0, min(1.0, fac))))[:3]
+        return [float(c) for c in ramp_color]
+    if src.bl_idname in ("ShaderNodeMix", "ShaderNodeMixRGB"):
+        fac_sock, a_sock, b_sock, blend, use_clamp, ok = _mix_node_params(src)
+        if not ok or fac_sock.is_linked or blend not in _SUPPORTED_MIX_BLENDS:
+            return None
+        a_const = _resolve_constant_socket(a_sock, depth + 1)
+        b_const = _resolve_constant_socket(b_sock, depth + 1)
+        if a_const is None or b_const is None:
+            return None
+        import numpy as np
+        a = np.array([a_const], dtype=np.float32)
+        b = np.array([b_const], dtype=np.float32)
+        out = _apply_mix_blend(a, b, _socket_f(fac_sock), blend, use_clamp)
+        return [float(c) for c in out[0]]
+    # Try transforms that take a single Color input (Gamma, BrightContrast,
+    # Invert, HueSaturation, RGBCurve, Clamp). Walk their input to a constant
+    # and apply the transform's LUT.
+    candidates = _chain_candidates(src)
+    if candidates is None:
+        return None
+    for name, inp in candidates:
+        # Skip vector inputs (e.g. Mapping's "Vector"); we want colour ones.
+        if inp.type not in ("RGBA", "VALUE"):
+            continue
+        if inp.is_linked:
+            inner = _resolve_constant_socket(inp, depth + 1)
+            if inner is None:
+                continue
+        else:
+            try:
+                inner = _socket_rgb(inp)
+            except Exception:
+                continue
+        xform = _node_color_transform(src, chain_input_name=name)
+        if xform is None:
+            return inner
+        import numpy as np
+        arr = np.array([[inner]], dtype=np.float32)
+        arr = xform[1](arr)
+        return [float(c) for c in arr[0, 0]]
     return None
 
 
@@ -395,6 +548,12 @@ def _socket_linked_image_with_chain(sock, depth: int = 0, group_stack=None):
         return _follow_into_group(src, from_socket, depth, group_stack)
     if src.bl_idname == "NodeGroupInput":
         return _follow_out_of_group(from_socket, depth, group_stack)
+    if src.bl_idname in ("ShaderNodeMix", "ShaderNodeMixRGB"):
+        # Both sides may be textures — collapse the whole Mix into one offline
+        # baked texture so the chain returning from here is empty.
+        prebaked = _try_premix_two_textures(src, group_stack)
+        if prebaked is not None:
+            return prebaked, ()
     candidates = _chain_candidates(src)
     if candidates is None:
         _warn(
@@ -757,37 +916,86 @@ _SUPPORTED_MIX_BLENDS = frozenset((
 ))
 
 
-def _mix_transform(node, chain_input_name):
-    """Bake a Mix node when the non-chain input is a constant colour.
-
-    Formulas match Blender's `ramp_blend` (intern/cycles/kernel/svm/mix.h): the
-    chain side is always treated as col1 when is_a_chain, else col2. If the
-    factor, or the non-chain input, is linked, we can't bake (return None and
-    the node's effect is silently dropped — same as pre-bake behaviour).
+def _mix_node_params(node):
+    """Return `(fac_sock, a_sock, b_sock, blend, use_clamp, ok)` for a Mix node,
+    or `(*_, False)` if the node isn't a bakeable RGBA-mode Mix.
     """
-    import numpy as np
     if node.bl_idname == "ShaderNodeMixRGB":
         fac_sock = node.inputs["Fac"]
         a_sock = node.inputs["Color1"]
         b_sock = node.inputs["Color2"]
         blend = node.blend_type
-        is_a_chain = chain_input_name == "Color1"
+        use_clamp = bool(getattr(node, "use_clamp", False))
+        return fac_sock, a_sock, b_sock, blend, use_clamp, True
+    if getattr(node, "data_type", "RGBA") != "RGBA":
+        return None, None, None, "MIX", False, False
+    fac_sock, a_sock, b_sock = _mix_rgba_sockets(node)
+    if fac_sock is None or a_sock is None or b_sock is None:
+        return None, None, None, "MIX", False, False
+    blend = getattr(node, "blend_type", "MIX")
+    use_clamp = bool(
+        getattr(node, "clamp_result", False) or getattr(node, "use_clamp", False)
+    )
+    return fac_sock, a_sock, b_sock, blend, use_clamp, True
+
+
+def _apply_mix_blend(col1, col2, fac: float, blend: str, use_clamp: bool):
+    """Blender ramp_blend applied to two arrays (or array + broadcast scalar)."""
+    import numpy as np
+    facm = 1.0 - fac
+    if blend == "MIX":
+        out = col1 * facm + col2 * fac
+    elif blend == "MULTIPLY":
+        out = col1 * (facm + fac * col2)
+    elif blend == "ADD":
+        out = col1 + fac * col2
+    elif blend == "SUBTRACT":
+        out = col1 - fac * col2
+    elif blend == "SCREEN":
+        out = 1.0 - (facm + fac * (1.0 - col2)) * (1.0 - col1)
+    elif blend == "DIVIDE":
+        col2_safe = np.where(col2 == 0.0, 1.0, col2)
+        out = np.where(col2 == 0.0, col1, facm * col1 + fac * col1 / col2_safe)
+    elif blend == "DIFFERENCE":
+        out = facm * col1 + fac * np.abs(col1 - col2)
+    elif blend == "DARKEN":
+        out = facm * col1 + fac * np.minimum(col1, col2)
+    elif blend == "LIGHTEN":
+        # Blender's asymmetric formula: max(col1, col2*fac).
+        out = np.maximum(col1, col2 * fac)
+    elif blend == "OVERLAY":
+        lo = col1 * (facm + 2.0 * fac * col2)
+        hi = 1.0 - (facm + 2.0 * fac * (1.0 - col2)) * (1.0 - col1)
+        out = np.where(col1 < 0.5, lo, hi)
+    elif blend == "SOFT_LIGHT":
+        scr = 1.0 - (1.0 - col2) * (1.0 - col1)
+        out = facm * col1 + fac * ((1.0 - col1) * col2 * col1 + col1 * scr)
+    elif blend == "LINEAR_LIGHT":
+        out = col1 + fac * (2.0 * col2 - 1.0)
     else:
-        if getattr(node, "data_type", "RGBA") != "RGBA":
-            _warn(
-                f"mix-dt2:{node.as_pointer()}",
-                f"{_node_tag(node)}: data_type not RGBA — effect not baked",
-            )
-            return None
-        fac_sock, a_sock, b_sock = _mix_rgba_sockets(node)
-        if fac_sock is None or a_sock is None or b_sock is None:
-            _warn(
-                f"mix-sock2:{node.as_pointer()}",
-                f"{_node_tag(node)}: could not locate RGBA sockets — effect not baked",
-            )
-            return None
-        blend = getattr(node, "blend_type", "MIX")
-        is_a_chain = chain_input_name == "A"
+        raise AssertionError(f"unreachable blend: {blend}")
+    if use_clamp:
+        out = np.clip(out, 0.0, 1.0)
+    return out.astype(np.float32)
+
+
+def _mix_transform(node, chain_input_name):
+    """Bake a Mix node when the non-chain input is a constant colour.
+
+    For two-texture mixes (both inputs driven by chains) the pre-bake step in
+    `_try_premix_two_textures` collapses the entire Mix into a synthetic
+    texture, so the chain reaching this point sees an unlinked operand.
+    """
+    import numpy as np
+    fac_sock, a_sock, b_sock, blend, use_clamp, ok = _mix_node_params(node)
+    if not ok:
+        _warn(
+            f"mix-dt2:{node.as_pointer()}",
+            f"{_node_tag(node)}: data_type not RGBA / sockets unresolved — "
+            f"effect not baked",
+        )
+        return None
+    is_a_chain = chain_input_name in ("A", "Color1")
 
     if blend not in _SUPPORTED_MIX_BLENDS:
         _warn(
@@ -813,10 +1021,6 @@ def _mix_transform(node, chain_input_name):
         return None
 
     fac = _socket_f(fac_sock)
-    facm = 1.0 - fac
-    use_clamp = bool(
-        getattr(node, "use_clamp", False) or getattr(node, "clamp_result", False)
-    )
     other_rgb = np.array(other_const, dtype=np.float32)
     id_tuple = (
         "Mix", blend, is_a_chain, round(fac, 6),
@@ -824,50 +1028,50 @@ def _mix_transform(node, chain_input_name):
         use_clamp,
     )
 
-    def _clamp01(x):
-        return np.clip(x, 0.0, 1.0) if use_clamp else x
-
-    def _blend(col1, col2):
-        """Apply Blender's ramp_blend with col1=A (base), col2=B (top)."""
-        if blend == "MIX":
-            return col1 * facm + col2 * fac
-        if blend == "MULTIPLY":
-            return col1 * (facm + fac * col2)
-        if blend == "ADD":
-            return col1 + fac * col2
-        if blend == "SUBTRACT":
-            return col1 - fac * col2
-        if blend == "SCREEN":
-            return 1.0 - (facm + fac * (1.0 - col2)) * (1.0 - col1)
-        if blend == "DIVIDE":
-            col2_safe = np.where(col2 == 0.0, 1.0, col2)
-            return np.where(col2 == 0.0, col1, facm * col1 + fac * col1 / col2_safe)
-        if blend == "DIFFERENCE":
-            return facm * col1 + fac * np.abs(col1 - col2)
-        if blend == "DARKEN":
-            return facm * col1 + fac * np.minimum(col1, col2)
-        if blend == "LIGHTEN":
-            # Blender's asymmetric formula: max(col1, col2*fac).
-            return np.maximum(col1, col2 * fac)
-        if blend == "OVERLAY":
-            lo = col1 * (facm + 2.0 * fac * col2)
-            hi = 1.0 - (facm + 2.0 * fac * (1.0 - col2)) * (1.0 - col1)
-            return np.where(col1 < 0.5, lo, hi)
-        if blend == "SOFT_LIGHT":
-            scr = 1.0 - (1.0 - col2) * (1.0 - col1)
-            return facm * col1 + fac * ((1.0 - col1) * col2 * col1 + col1 * scr)
-        if blend == "LINEAR_LIGHT":
-            return col1 + fac * (2.0 * col2 - 1.0)
-        raise AssertionError(f"unreachable blend: {blend}")
-
     if is_a_chain:
         def apply(rgb):
-            return _clamp01(_blend(rgb, other_rgb)).astype(np.float32)
+            return _apply_mix_blend(rgb, other_rgb, fac, blend, use_clamp)
     else:
         def apply(rgb):
-            return _clamp01(_blend(other_rgb, rgb)).astype(np.float32)
+            return _apply_mix_blend(other_rgb, rgb, fac, blend, use_clamp)
 
     return id_tuple, apply
+
+
+def _try_premix_two_textures(mix_node, group_stack):
+    """If both Mix inputs resolve to texture chains, pre-bake the mix into a
+    `_PreBakedTexture` (linear RGB). Returns None if either side is not a
+    bakeable texture chain, the factor is linked, the blend isn't supported,
+    or the Mix node is in an unsupported mode.
+    """
+    fac_sock, a_sock, b_sock, blend, use_clamp, ok = _mix_node_params(mix_node)
+    if not ok:
+        return None
+    if fac_sock.is_linked or blend not in _SUPPORTED_MIX_BLENDS:
+        return None
+    img_a, chain_a = _socket_linked_image_with_chain(a_sock, group_stack=group_stack)
+    img_b, chain_b = _socket_linked_image_with_chain(b_sock, group_stack=group_stack)
+    if img_a is None or img_b is None:
+        return None
+    fac = _socket_f(fac_sock)
+    chain_a_id = tuple(x[0] for x in chain_a)
+    chain_b_id = tuple(x[0] for x in chain_b)
+
+    def _src_id(src):
+        return src.cache_key if isinstance(src, _PreBakedTexture) else f"img:{src.name}"
+
+    cache_key = (
+        f"__mix2tex__|{_src_id(img_a)}|{chain_a_id!r}|{_src_id(img_b)}|"
+        f"{chain_b_id!r}|{blend}|{round(fac, 6)}|{use_clamp}"
+    )
+    rgb_a, wa, ha = _bake_source_to_linear(img_a, chain_a)
+    rgb_b, wb, hb = _bake_source_to_linear(img_b, chain_b)
+    out_h = max(ha, hb)
+    out_w = max(wa, wb)
+    rgb_a = _resample_bilinear(rgb_a, out_h, out_w)
+    rgb_b = _resample_bilinear(rgb_b, out_h, out_w)
+    mixed = _apply_mix_blend(rgb_a, rgb_b, fac, blend, use_clamp)
+    return _PreBakedTexture(mixed, out_w, out_h, cache_key)
 
 
 def _normal_perturbation(normal_sock):
