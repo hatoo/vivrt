@@ -3,3 +3,5 @@
 *.png
 !crown.png
 *.pbrt
+__pycache__/
+*.pyc
