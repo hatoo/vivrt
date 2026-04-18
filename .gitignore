@@ -3,6 +3,7 @@
 *.png
 !crown.png
 *.pbrt
+*.raw
 __pycache__/
 *.pyc
 blender/vibrt_blender.zip
