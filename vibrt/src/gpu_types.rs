@@ -34,7 +34,15 @@ pub struct PrincipledGpu {
     pub bump_tex_w: i32,
     pub bump_tex_h: i32,
     pub bump_tex_channels: i32,
-    pub _pad_bump: i32,
+    pub alpha_threshold: f32,
+    pub anisotropy: f32,
+    pub tangent_rotation: f32,
+    pub coat_weight: f32,
+    pub coat_roughness: f32,
+    pub coat_ior: f32,
+    pub sheen_weight: f32,
+    pub sheen_roughness: f32,
+    pub sheen_tint: [f32; 3],
 }
 
 #[repr(C)]

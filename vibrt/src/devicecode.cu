@@ -184,6 +184,54 @@ static __forceinline__ __device__ float ggx_vndf_pdf(float NoV, float NoH,
   return ggx_D(NoH, alpha) * smith_G1(NoV, alpha) / fmaxf(4.0f * NoV, 1e-12f);
 }
 
+// ---------- GGX (anisotropic) ----------
+// All inputs in the local tangent frame (z = Ns, x = T, y = B).
+static __forceinline__ __device__ float
+ggx_D_aniso(float3 Hlocal, float ax, float ay) {
+  float x = Hlocal.x / fmaxf(ax, 1e-4f);
+  float y = Hlocal.y / fmaxf(ay, 1e-4f);
+  float z = Hlocal.z;
+  float d = x * x + y * y + z * z;
+  return 1.0f / fmaxf(M_PIf * ax * ay * d * d, 1e-12f);
+}
+
+static __forceinline__ __device__ float
+smith_G1_aniso(float3 Vlocal, float ax, float ay) {
+  float axv = ax * Vlocal.x;
+  float ayv = ay * Vlocal.y;
+  float Vz = fmaxf(Vlocal.z, 1e-6f);
+  return 2.0f * Vz / fmaxf(Vz + sqrtf(axv * axv + ayv * ayv + Vz * Vz), 1e-12f);
+}
+
+static __device__ float3 sample_ggx_vndf_aniso(float3 V, float ax, float ay,
+                                               float u1, float u2) {
+  float3 Vh = normalize3(make_float3(ax * V.x, ay * V.y, V.z));
+  float len2 = Vh.x * Vh.x + Vh.y * Vh.y;
+  float3 T1 = len2 > 0.0f
+                  ? make_float3(-Vh.y, Vh.x, 0.0f) * (1.0f / sqrtf(len2))
+                  : make_float3(1, 0, 0);
+  float3 T2 = cross3(Vh, T1);
+  float r = sqrtf(u1);
+  float phi = 2.0f * M_PIf * u2;
+  float t1 = r * cosf(phi);
+  float t2 = r * sinf(phi);
+  float s = 0.5f * (1.0f + Vh.z);
+  t2 = (1.0f - s) * sqrtf(fmaxf(0.0f, 1.0f - t1 * t1)) + s * t2;
+  float3 Nh =
+      T1 * t1 + T2 * t2 + Vh * sqrtf(fmaxf(0.0f, 1.0f - t1 * t1 - t2 * t2));
+  return normalize3(
+      make_float3(ax * Nh.x, ay * Nh.y, fmaxf(0.0f, Nh.z)));
+}
+
+static __forceinline__ __device__ float
+ggx_vndf_pdf_aniso(float3 Vlocal, float3 Hlocal, float ax, float ay) {
+  if (Hlocal.z <= 0.0f || Vlocal.z <= 0.0f)
+    return 0.0f;
+  float D = ggx_D_aniso(Hlocal, ax, ay);
+  float G1 = smith_G1_aniso(Vlocal, ax, ay);
+  return D * G1 / fmaxf(4.0f * Vlocal.z, 1e-12f);
+}
+
 // ---------- GGX energy compensation (Kulla-Conty) ----------
 // LUT layout matches pipeline::generate_ggx_energy_lut():
 //   e_lut[ci * n + ai]  with  cos_theta = (ci+0.5)/n,  alpha = (ai+0.5)/n
@@ -396,18 +444,22 @@ struct MaterialEval {
   float3 base_color;
   float metallic;
   float roughness;
-  float alpha; // roughness^2, clamped
+  float alpha;   // isotropic α = roughness², used for LUT + transmission
+  float alpha_x; // anisotropic αx (along tangent T)
+  float alpha_y; // anisotropic αy (along bitangent B)
   float ior;
   float transmission;
   float3 emission;
   float3 Ns; // shading normal
-  float3 T;
+  float3 T;  // rotated by tangent_rotation for anisotropy
   float3 B;
+  PrincipledGpu *mat; // raw material ptr for coat/sheen/sss params
 };
 
 static __device__ MaterialEval eval_material(const PathVertex &v) {
   MaterialEval e;
   PrincipledGpu *m = v.mat;
+  e.mat = m;
   e.base_color = make_f3(m->base_color);
   e.metallic = m->metallic;
   e.roughness = m->roughness;
@@ -492,6 +544,27 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
   }
   e.Ns = Ns;
   build_frame(e.Ns, e.T, e.B);
+
+  // Anisotropic α. Disney remap: aspect = sqrt(1 - 0.9·|aniso|).
+  float aniso = fminf(fmaxf(m->anisotropy, -1.0f), 1.0f);
+  float aspect = sqrtf(fmaxf(1.0f - 0.9f * fabsf(aniso), 1e-4f));
+  if (aniso >= 0.0f) {
+    e.alpha_x = e.alpha / aspect;
+    e.alpha_y = e.alpha * aspect;
+  } else {
+    e.alpha_x = e.alpha * aspect;
+    e.alpha_y = e.alpha / aspect;
+  }
+  // Tangent rotation around Ns.
+  float rot = m->tangent_rotation;
+  if (rot != 0.0f) {
+    float c = cosf(rot);
+    float s = sinf(rot);
+    float3 Trot = e.T * c + e.B * s;
+    float3 Brot = e.B * c - e.T * s;
+    e.T = normalize3(Trot);
+    e.B = normalize3(Brot);
+  }
   return e;
 }
 
@@ -540,9 +613,12 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
     float3 H = normalize3(wo + wi);
     float NoH = fmaxf(dot3(e.Ns, H), 0.0f);
     float VoH = fmaxf(dot3(wo, H), 0.0f);
-    float D = ggx_D(NoH, e.alpha);
-    float G1_v = smith_G1(NoV, e.alpha);
-    float G1_l = smith_G1(NoL, e.alpha);
+    float3 Vloc = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
+    float3 Lloc = make_float3(dot3(wi, e.T), dot3(wi, e.B), dot3(wi, e.Ns));
+    float3 Hloc = make_float3(dot3(H, e.T), dot3(H, e.B), dot3(H, e.Ns));
+    float D = ggx_D_aniso(Hloc, e.alpha_x, e.alpha_y);
+    float G1_v = smith_G1_aniso(Vloc, e.alpha_x, e.alpha_y);
+    float G1_l = smith_G1_aniso(Lloc, e.alpha_x, e.alpha_y);
     float G = G1_v * G1_l;
     float3 F_metal = schlick_rgb(VoH, e.base_color);
     float F_dielec = schlick_scalar(VoH, F0_d);
@@ -579,8 +655,38 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
                  make_float3(f_dielec_ms, f_dielec_ms, f_dielec_ms);
 
     r.f = r.f + f_spec * NoL;
-    float pdf_spec = ggx_vndf_pdf(NoV, NoH, e.alpha);
+    float pdf_spec = ggx_vndf_pdf_aniso(Vloc, Hloc, e.alpha_x, e.alpha_y);
     r.pdf += p_spec * pdf_spec;
+
+    // --- Coat (clearcoat): additive isotropic GGX dielectric above base. ---
+    PrincipledGpu *mc = e.mat;
+    float coat_w = mc->coat_weight;
+    if (coat_w > 0.0f) {
+      float coat_alpha = fmaxf(mc->coat_roughness * mc->coat_roughness, 1e-4f);
+      float cF0 =
+          ((mc->coat_ior - 1.0f) / (mc->coat_ior + 1.0f)) *
+          ((mc->coat_ior - 1.0f) / (mc->coat_ior + 1.0f));
+      float Fc = schlick_scalar(VoH, cF0);
+      float cD = ggx_D(NoH, coat_alpha);
+      float cG = smith_G1(NoV, coat_alpha) * smith_G1(NoL, coat_alpha);
+      float coat_f = coat_w * Fc * cD * cG / fmaxf(4.0f * NoV * NoL, 1e-8f);
+      // Attenuate existing lobes by the coat "loss" at view+light directions.
+      float loss = coat_w * 0.5f * (schlick_scalar(NoV, cF0) +
+                                    schlick_scalar(NoL, cF0));
+      r.f = r.f * (1.0f - loss);
+      r.f = r.f + make_float3(coat_f, coat_f, coat_f) * NoL;
+      float pdf_coat = ggx_vndf_pdf(NoV, NoH, coat_alpha);
+      r.pdf += coat_w * pdf_coat; // add (unnormalised) coat sampling weight
+    }
+
+    // --- Sheen: soft angular cosine lobe on top of diffuse. ---
+    float sheen_w = mc->sheen_weight;
+    if (sheen_w > 0.0f) {
+      float sr = fmaxf(mc->sheen_roughness, 1e-3f);
+      float sf = powf(fmaxf(1.0f - NoV, 0.0f), 1.0f / sr) * sheen_w;
+      float3 tint = make_f3(mc->sheen_tint);
+      r.f = r.f + tint * sf * NoL;
+    }
   } else if (transmit) {
     // Rough dielectric transmission: evaluate using Walter et al. BTDF.
     float eta = e.ior;
@@ -652,9 +758,10 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
                                sqrtf(fmaxf(0.0f, 1.0f - u1)));
     s.wi = normalize3(e.T * local.x + e.B * local.y + e.Ns * local.z);
   } else if (u < p_diff + p_spec) {
-    // GGX VNDF specular
+    // GGX VNDF specular (anisotropic)
     float3 Vlocal = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
-    float3 Hlocal = sample_ggx_vndf(Vlocal, e.alpha, u1, u2);
+    float3 Hlocal =
+        sample_ggx_vndf_aniso(Vlocal, e.alpha_x, e.alpha_y, u1, u2);
     float3 H = normalize3(e.T * Hlocal.x + e.B * Hlocal.y + e.Ns * Hlocal.z);
     float VoH = dot3(wo, H);
     float3 wi = normalize3(H * (2.0f * VoH) - wo);
@@ -871,6 +978,63 @@ extern "C" __global__ void __closesthit__ch() {
 
 extern "C" __global__ void __closesthit__shadow() {
   // Not used when TERMINATE_ON_FIRST_HIT is set — kept to satisfy SBT.
+}
+
+// Shared by radiance and shadow ray types: alpha-mask cutout.
+extern "C" __global__ void __anyhit__ah() {
+  HitGroupData *hg = (HitGroupData *)optixGetSbtDataPointer();
+  PrincipledGpu *m = hg->mat;
+  if (m->alpha_threshold <= 0.0f || m->base_color_tex == nullptr)
+    return;
+  // Recompute UV from barycentrics.
+  if (hg->uvs == nullptr)
+    return;
+  unsigned int prim = optixGetPrimitiveIndex();
+  int i0 = hg->indices[prim * 3 + 0];
+  int i1 = hg->indices[prim * 3 + 1];
+  int i2 = hg->indices[prim * 3 + 2];
+  float2 bary = optixGetTriangleBarycentrics();
+  float b0 = 1.0f - bary.x - bary.y;
+  float2 uv0 = make_float2(hg->uvs[i0 * 2 + 0], hg->uvs[i0 * 2 + 1]);
+  float2 uv1 = make_float2(hg->uvs[i1 * 2 + 0], hg->uvs[i1 * 2 + 1]);
+  float2 uv2 = make_float2(hg->uvs[i2 * 2 + 0], hg->uvs[i2 * 2 + 1]);
+  float2 uv =
+      make_float2(b0 * uv0.x + bary.x * uv1.x + bary.y * uv2.x,
+                  b0 * uv0.y + bary.x * uv1.y + bary.y * uv2.y);
+  const float *M = m->uv_transform;
+  uv = make_float2(M[0] * uv.x + M[1] * uv.y + M[2],
+                   M[3] * uv.x + M[4] * uv.y + M[5]);
+  // Bilinear fetch of the alpha channel, wrapped.
+  int w = m->base_color_tex_w;
+  int h = m->base_color_tex_h;
+  if (w <= 0 || h <= 0)
+    return;
+  float u = uv.x - floorf(uv.x);
+  float v = uv.y - floorf(uv.y);
+  float fx = u * (float)w - 0.5f;
+  float fy = (1.0f - v) * (float)h - 0.5f;
+  int x0 = (int)floorf(fx);
+  int y0 = (int)floorf(fy);
+  float dx = fx - (float)x0;
+  float dy = fy - (float)y0;
+  auto wrap = [](int v, int m) {
+    int r = v % m;
+    return r < 0 ? r + m : r;
+  };
+  int x1 = wrap(x0 + 1, w);
+  int y1 = wrap(y0 + 1, h);
+  x0 = wrap(x0, w);
+  y0 = wrap(y0, h);
+  const float *data = m->base_color_tex;
+  float a00 = data[(y0 * w + x0) * 4 + 3];
+  float a10 = data[(y0 * w + x1) * 4 + 3];
+  float a01 = data[(y1 * w + x0) * 4 + 3];
+  float a11 = data[(y1 * w + x1) * 4 + 3];
+  float a0 = a00 * (1.0f - dx) + a10 * dx;
+  float a1 = a01 * (1.0f - dx) + a11 * dx;
+  float alpha = a0 * (1.0f - dy) + a1 * dy;
+  if (alpha < m->alpha_threshold)
+    optixIgnoreIntersection();
 }
 
 extern "C" __global__ void __miss__ms() {

@@ -32,7 +32,15 @@ struct PrincipledGpu {
   int bump_tex_w;
   int bump_tex_h;
   int bump_tex_channels;
-  int _pad_bump;
+  float alpha_threshold;
+  float anisotropy;
+  float tangent_rotation;
+  float coat_weight;
+  float coat_roughness;
+  float coat_ior;
+  float sheen_weight;
+  float sheen_roughness;
+  float sheen_tint[3];
 };
 
 struct HitGroupData {

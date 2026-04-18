@@ -272,6 +272,70 @@ def _from_principled(node, buf, textures) -> dict:
         p["emission"] = [c * strength for c in color]
 
     _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
+
+    # Anisotropy (Blender Principled: "Anisotropic" + "Anisotropic Rotation").
+    for name in ("Anisotropic", "Anisotropy"):
+        if name in node.inputs:
+            a = _socket_f(node.inputs[name])
+            if a != 0.0:
+                p["anisotropy"] = a
+            break
+    for name in ("Anisotropic Rotation", "Anisotropy Rotation"):
+        if name in node.inputs:
+            r = _socket_f(node.inputs[name])
+            if r != 0.0:
+                p["tangent_rotation"] = r * 2.0 * math.pi
+            break
+
+    # Coat (Blender 4.x: "Coat Weight" / "Coat Roughness" / "Coat IOR";
+    # legacy 3.x: "Clearcoat" / "Clearcoat Roughness").
+    for name in ("Coat Weight", "Clearcoat"):
+        if name in node.inputs:
+            w = _socket_f(node.inputs[name])
+            if w > 0.0:
+                p["coat_weight"] = w
+            break
+    for name in ("Coat Roughness", "Clearcoat Roughness"):
+        if name in node.inputs:
+            r = _socket_f(node.inputs[name])
+            if r != 0.03:
+                p["coat_roughness"] = r
+            break
+    if "Coat IOR" in node.inputs:
+        ior = _socket_f(node.inputs["Coat IOR"])
+        if ior != 1.5:
+            p["coat_ior"] = ior
+
+    # Sheen (Blender 4.x: "Sheen Weight" / "Sheen Roughness" / "Sheen Tint";
+    # legacy: "Sheen" / "Sheen Tint" scalar).
+    for name in ("Sheen Weight", "Sheen"):
+        if name in node.inputs:
+            w = _socket_f(node.inputs[name])
+            if w > 0.0:
+                p["sheen_weight"] = w
+            break
+    if "Sheen Roughness" in node.inputs:
+        r = _socket_f(node.inputs["Sheen Roughness"])
+        if r != 0.5:
+            p["sheen_roughness"] = r
+    if "Sheen Tint" in node.inputs:
+        v = node.inputs["Sheen Tint"].default_value
+        if hasattr(v, "__len__") and len(v) >= 3:
+            t = [float(v[0]), float(v[1]), float(v[2])]
+            if t != [1.0, 1.0, 1.0]:
+                p["sheen_tint"] = t
+
+    alpha_sock = node.inputs.get("Alpha")
+    if alpha_sock is not None:
+        alpha_val = _socket_f(alpha_sock)
+        if alpha_sock.is_linked:
+            p["alpha_threshold"] = 0.5
+            if "base_color_tex" not in p:
+                img = _socket_linked_image(alpha_sock)
+                if img is not None:
+                    p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        elif alpha_val < 1.0:
+            p["alpha_threshold"] = alpha_val
     return p
 
 
@@ -300,6 +364,14 @@ def _from_glossy(node, buf, textures) -> dict:
         img = _socket_linked_image(node.inputs["Roughness"])
         if img is not None:
             p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
+    if "Anisotropy" in node.inputs:
+        a = _socket_f(node.inputs["Anisotropy"])
+        if a != 0.0:
+            p["anisotropy"] = a
+    if "Rotation" in node.inputs:
+        r = _socket_f(node.inputs["Rotation"])
+        if r != 0.0:
+            p["tangent_rotation"] = r * 2.0 * math.pi
     _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
     return p
 
@@ -358,7 +430,7 @@ def _from_add(node, buf, textures, mat_name: str) -> dict:
         out["roughness"] = p2["roughness"]
         for k in ("base_color_tex", "normal_tex", "roughness_tex",
                   "metallic_tex", "bump_tex", "normal_strength",
-                  "bump_strength", "uv_transform"):
+                  "bump_strength", "uv_transform", "alpha_threshold"):
             if k in p2:
                 out[k] = p2[k]
     return out
@@ -373,6 +445,7 @@ def _from_transparent(node, buf, textures) -> dict:
     img = _socket_linked_image(node.inputs["Color"])
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["alpha_threshold"] = 0.5
     return p
 
 
@@ -412,7 +485,8 @@ def _from_mix(node, buf, textures, mat_name: str) -> dict:
         out["metallic"] = 0.0
         if "roughness_tex" in gloss:
             out["roughness_tex"] = gloss["roughness_tex"]
-        for k in ("normal_tex", "normal_strength", "bump_tex", "bump_strength"):
+        for k in ("normal_tex", "normal_strength", "bump_tex",
+                  "bump_strength", "alpha_threshold"):
             if k not in out and k in gloss:
                 out[k] = gloss[k]
         return out

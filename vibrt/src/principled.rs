@@ -79,6 +79,14 @@ pub fn make_material_data(
         bump_tex_w: b_w,
         bump_tex_h: b_h,
         bump_tex_channels: b_c,
-        _pad_bump: 0,
+        alpha_threshold: mat.alpha_threshold.clamp(0.0, 1.0),
+        anisotropy: mat.anisotropy.clamp(-1.0, 1.0),
+        tangent_rotation: mat.tangent_rotation,
+        coat_weight: mat.coat_weight.clamp(0.0, 1.0),
+        coat_roughness: mat.coat_roughness.clamp(0.0, 1.0),
+        coat_ior: mat.coat_ior.max(1.0),
+        sheen_weight: mat.sheen_weight.clamp(0.0, 1.0),
+        sheen_roughness: mat.sheen_roughness.clamp(0.0, 1.0),
+        sheen_tint: mat.sheen_tint,
     }
 }

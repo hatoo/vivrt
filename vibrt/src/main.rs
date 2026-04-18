@@ -202,11 +202,13 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
         .value;
     let hit_rg_pg = ProgramGroup::hitgroup(&ctx)
         .closest_hit(&module, "__closesthit__ch")
+        .any_hit(&module, "__anyhit__ah")
         .build()
         .context("hitgroup radiance")?
         .value;
     let hit_shadow_pg = ProgramGroup::hitgroup(&ctx)
         .closest_hit(&module, "__closesthit__shadow")
+        .any_hit(&module, "__anyhit__ah")
         .build()
         .context("hitgroup shadow")?
         .value;

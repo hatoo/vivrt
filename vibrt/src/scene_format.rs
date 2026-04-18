@@ -99,6 +99,37 @@ pub struct PrincipledMaterial {
     pub bump_tex: Option<u32>,
     #[serde(default = "one_f32")]
     pub bump_strength: f32,
+    /// If > 0, any-hit discards the hit when base_color_tex.a < threshold.
+    #[serde(default)]
+    pub alpha_threshold: f32,
+    /// [0,1]; stretches GGX along tangent vs. bitangent.
+    #[serde(default)]
+    pub anisotropy: f32,
+    /// Radians; rotates the shading tangent before evaluating anisotropy.
+    #[serde(default)]
+    pub tangent_rotation: f32,
+    #[serde(default)]
+    pub coat_weight: f32,
+    #[serde(default = "default_coat_roughness")]
+    pub coat_roughness: f32,
+    #[serde(default = "default_coat_ior")]
+    pub coat_ior: f32,
+    #[serde(default)]
+    pub sheen_weight: f32,
+    #[serde(default = "half_f32")]
+    pub sheen_roughness: f32,
+    #[serde(default = "default_sheen_tint")]
+    pub sheen_tint: [f32; 3],
+}
+
+fn default_coat_roughness() -> f32 {
+    0.03
+}
+fn default_coat_ior() -> f32 {
+    1.5
+}
+fn default_sheen_tint() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
 }
 
 fn identity_uv_transform() -> [f32; 6] {
