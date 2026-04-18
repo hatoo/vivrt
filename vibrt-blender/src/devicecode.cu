@@ -69,8 +69,8 @@ static __forceinline__ __device__ float luminance(float3 c) {
   return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
 }
 
-static __forceinline__ __device__ void
-build_frame(float3 n, float3 &t, float3 &b) {
+static __forceinline__ __device__ void build_frame(float3 n, float3 &t,
+                                                   float3 &b) {
   float s = n.z >= 0.0f ? 1.0f : -1.0f;
   float a = -1.0f / (s + n.z);
   float bb = n.x * n.y * a;
@@ -170,15 +170,15 @@ static __device__ float3 sample_ggx_vndf(float3 V, float alpha, float u1,
   float t2 = r * sinf(phi);
   float s = 0.5f * (1.0f + Vh.z);
   t2 = (1.0f - s) * sqrtf(fmaxf(0.0f, 1.0f - t1 * t1)) + s * t2;
-  float3 Nh = T1 * t1 + T2 * t2 +
-              Vh * sqrtf(fmaxf(0.0f, 1.0f - t1 * t1 - t2 * t2));
+  float3 Nh =
+      T1 * t1 + T2 * t2 + Vh * sqrtf(fmaxf(0.0f, 1.0f - t1 * t1 - t2 * t2));
   float3 H =
       normalize3(make_float3(alpha * Nh.x, alpha * Nh.y, fmaxf(0.0f, Nh.z)));
   return H;
 }
 
-// PDF of GGX VNDF sample for reflection: D(H) * G1(V) * |V.H| / |V.N| / (4 |V.H|)
-// = D(H) * G1(V) / (4 |V.N|)
+// PDF of GGX VNDF sample for reflection: D(H) * G1(V) * |V.H| / |V.N| / (4
+// |V.H|) = D(H) * G1(V) / (4 |V.N|)
 static __forceinline__ __device__ float ggx_vndf_pdf(float NoV, float NoH,
                                                      float alpha) {
   return ggx_D(NoH, alpha) * smith_G1(NoV, alpha) / fmaxf(4.0f * NoV, 1e-12f);
@@ -186,13 +186,13 @@ static __forceinline__ __device__ float ggx_vndf_pdf(float NoV, float NoH,
 
 // ---------- Path tracing payload ----------
 struct PathVertex {
-  float3 P;          // hit position
-  float3 Ng;         // geometric normal (world)
-  float3 Ns;         // shading normal (world)
-  float3 T;          // tangent (world)
-  float2 uv;         // mesh UVs (0,0 if absent)
+  float3 P;  // hit position
+  float3 Ng; // geometric normal (world)
+  float3 Ns; // shading normal (world)
+  float3 T;  // tangent (world)
+  float2 uv; // mesh UVs (0,0 if absent)
   PrincipledGpu *mat;
-  int hit;           // 1 if hit, 0 if miss
+  int hit; // 1 if hit, 0 if miss
 };
 
 static __forceinline__ __device__ void *unpack_ptr(unsigned int hi,
@@ -255,6 +255,42 @@ struct EnvSample {
   float pdf; // solid-angle PDF
 };
 
+// Power heuristic (β = 2) for two-strategy MIS.
+static __forceinline__ __device__ float power_heuristic(float pa, float pb) {
+  float a = pa * pa;
+  float b = pb * pb;
+  return a / fmaxf(a + b, 1e-20f);
+}
+
+// Solid-angle PDF of the envmap importance sampler for a given world-space dir.
+// Inverse of sample_envmap: maps (theta, phi) back to the texel and reads the
+// luminance, normalised by envmap_integral.
+static __device__ float envmap_pdf(float3 dir) {
+  if (params.world_type != 1 || params.envmap_integral <= 0.0f)
+    return 0.0f;
+  float c = cosf(-params.envmap_rotation_z_rad);
+  float s = sinf(-params.envmap_rotation_z_rad);
+  float3 d = make_float3(dir.x * c - dir.y * s, dir.x * s + dir.y * c, dir.z);
+  float theta = acosf(fminf(fmaxf(d.z, -1.0f), 1.0f));
+  float phi = atan2f(d.y, d.x);
+  float u = phi * (0.5f * INV_PIf);
+  if (u < 0.0f)
+    u += 1.0f;
+  float v = theta * INV_PIf;
+  int w = params.envmap_width;
+  int h = params.envmap_height;
+  int x = min((int)(u * w), w - 1);
+  int y = min((int)(v * h), h - 1);
+  const float *px = &params.envmap_data[(y * w + x) * 3];
+  float3 L = make_float3(px[0], px[1], px[2]) * params.world_strength;
+  float lum = luminance(L);
+  float sin_t = sinf(theta);
+  if (sin_t <= 0.0f)
+    return 0.0f;
+  return lum * (float)(w * h) /
+         (2.0f * M_PIf * M_PIf * sin_t * params.envmap_integral);
+}
+
 static __device__ EnvSample sample_envmap(RNG &rng) {
   EnvSample s;
   s.dir = make_float3(0, 0, 1);
@@ -310,11 +346,11 @@ struct MaterialEval {
   float3 base_color;
   float metallic;
   float roughness;
-  float alpha;   // roughness^2, clamped
+  float alpha; // roughness^2, clamped
   float ior;
   float transmission;
   float3 emission;
-  float3 Ns;     // shading normal
+  float3 Ns; // shading normal
   float3 T;
   float3 B;
 };
@@ -329,21 +365,19 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
   e.transmission = m->transmission;
   e.emission = make_f3(m->emission);
   if (m->base_color_tex != nullptr) {
-    float3 t = sample_rgba(m->base_color_tex, m->base_color_tex_w,
-                           m->base_color_tex_h, m->base_color_tex_channels,
-                           v.uv);
+    float3 t =
+        sample_rgba(m->base_color_tex, m->base_color_tex_w, m->base_color_tex_h,
+                    m->base_color_tex_channels, v.uv);
     e.base_color = e.base_color * t;
   }
   if (m->roughness_tex != nullptr) {
-    float3 t =
-        sample_rgba(m->roughness_tex, m->roughness_tex_w, m->roughness_tex_h,
-                    m->roughness_tex_channels, v.uv);
+    float3 t = sample_rgba(m->roughness_tex, m->roughness_tex_w,
+                           m->roughness_tex_h, m->roughness_tex_channels, v.uv);
     e.roughness = e.roughness * t.x;
   }
   if (m->metallic_tex != nullptr) {
-    float3 t =
-        sample_rgba(m->metallic_tex, m->metallic_tex_w, m->metallic_tex_h,
-                    m->metallic_tex_channels, v.uv);
+    float3 t = sample_rgba(m->metallic_tex, m->metallic_tex_w,
+                           m->metallic_tex_h, m->metallic_tex_channels, v.uv);
     e.metallic = e.metallic * t.x;
   }
   e.metallic = fminf(fmaxf(e.metallic, 0.0f), 1.0f);
@@ -417,12 +451,10 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
     float3 F_metal = schlick_rgb(VoH, e.base_color);
     float F_dielec = schlick_scalar(VoH, F0_d);
     float3 f_metal = F_metal * (D * G / fmaxf(4.0f * NoV * NoL, 1e-8f));
-    float3 f_dielec =
-        make_float3(F_dielec, F_dielec, F_dielec) *
-        (D * G / fmaxf(4.0f * NoV * NoL, 1e-8f));
-    float3 f_spec =
-        e.metallic * f_metal + (1.0f - e.metallic) * (1.0f - e.transmission) *
-                                   f_dielec;
+    float3 f_dielec = make_float3(F_dielec, F_dielec, F_dielec) *
+                      (D * G / fmaxf(4.0f * NoV * NoL, 1e-8f));
+    float3 f_spec = e.metallic * f_metal +
+                    (1.0f - e.metallic) * (1.0f - e.transmission) * f_dielec;
     r.f = r.f + f_spec * NoL;
     float pdf_spec = ggx_vndf_pdf(NoV, NoH, e.alpha);
     r.pdf += p_spec * pdf_spec;
@@ -440,12 +472,11 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
     float NoH = dot3(e.Ns, H);
     float F = fresnel_dielectric(VoH, eta);
     float D = ggx_D(fmaxf(NoH, 0.0f), e.alpha);
-    float G = smith_G1(fabsf(NoV), e.alpha) *
-              smith_G1(fabsf(NoL), e.alpha);
+    float G = smith_G1(fabsf(NoV), e.alpha) * smith_G1(fabsf(NoL), e.alpha);
     float denom =
         (eta * VoH + LoH) * (eta * VoH + LoH) * fabsf(NoV) * fabsf(NoL);
-    float btdf = (fabsf(VoH) * fabsf(LoH) * (1.0f - F) * D * G) /
-                 fmaxf(denom, 1e-8f);
+    float btdf =
+        (fabsf(VoH) * fabsf(LoH) * (1.0f - F) * D * G) / fmaxf(denom, 1e-8f);
     float3 tint = e.base_color;
     r.f = tint * btdf * fabsf(NoL) * w_trans;
     // Approximate pdf: Jacobian of half-vector to wi
@@ -576,8 +607,8 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
     float phi = 2.0f * M_PIf * u2;
     float3 T, B;
     build_frame(dir, T, B);
-    float3 wi = normalize3(T * (st * cosf(phi)) + B * (st * sinf(phi)) +
-                           dir * ct);
+    float3 wi =
+        normalize3(T * (st * cosf(phi)) + B * (st * sinf(phi)) + dir * ct);
     if (!shadow_visible(P, wi, 1e20f))
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi);
@@ -598,8 +629,8 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
       continue;
     float falloff = 1.0f;
     if (cos_a < sp.cos_inner) {
-      float t = (cos_a - sp.cos_outer) /
-                fmaxf(sp.cos_inner - sp.cos_outer, 1e-4f);
+      float t =
+          (cos_a - sp.cos_outer) / fmaxf(sp.cos_inner - sp.cos_outer, 1e-4f);
       falloff = t * t * (3.0f - 2.0f * t);
     }
     if (!shadow_visible(P, wi, d))
@@ -613,8 +644,8 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
     float u = rng.next();
     int idx = cdf_search(params.rect_light_cdf, params.num_rect_lights, u);
     AreaRectLight &ar = params.rect_lights[idx];
-    float pmf_light = (params.rect_light_cdf[idx + 1] -
-                       params.rect_light_cdf[idx]);
+    float pmf_light =
+        (params.rect_light_cdf[idx + 1] - params.rect_light_cdf[idx]);
     if (pmf_light > 0.0f) {
       float su = rng.next();
       float sv = rng.next();
@@ -640,13 +671,14 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
     }
   }
 
-  // Envmap: one importance sample
+  // Envmap: one importance sample, MIS-weighted against BSDF sampling.
   if (params.world_type == 1 && params.envmap_integral > 0.0f) {
     EnvSample es = sample_envmap(rng);
     if (es.pdf > 0.0f && shadow_visible(P, es.dir, 1e20f)) {
       BsdfEval b = eval_bsdf(e, wo, es.dir);
       if (b.pdf > 0.0f) {
-        L = L + b.f * es.L / es.pdf;
+        float w = power_heuristic(es.pdf, b.pdf);
+        L = L + b.f * es.L * (w / es.pdf);
       }
     }
   }
@@ -678,8 +710,7 @@ extern "C" __global__ void __closesthit__ch() {
   float3 e1 = p1 - p0;
   float3 e2 = p2 - p0;
   float3 Ng_local = normalize3(cross3(e1, e2));
-  float3 Ng =
-      normalize3(optixTransformNormalFromObjectToWorldSpace(Ng_local));
+  float3 Ng = normalize3(optixTransformNormalFromObjectToWorldSpace(Ng_local));
 
   float3 Ns = Ng;
   if (hg->normals != nullptr) {
@@ -724,14 +755,13 @@ extern "C" __global__ void __miss__ms() {
   v->hit = 0;
 }
 
-extern "C" __global__ void __miss__shadow() {
-  optixSetPayload_0(1u);
-}
+extern "C" __global__ void __miss__shadow() { optixSetPayload_0(1u); }
 
 static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
   float3 throughput = make_float3(1, 1, 1);
   float3 L = make_float3(0, 0, 0);
   bool last_specular = true;
+  float prev_bsdf_pdf = 0.0f;
 
   for (unsigned int bounce = 0; bounce < params.max_depth; bounce++) {
     PathVertex v;
@@ -746,7 +776,13 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
                hi, lo);
 
     if (v.hit == 0) {
-      L = L + throughput * world_background(dir);
+      float3 bg = world_background(dir);
+      float w = 1.0f;
+      if (bounce > 0 && !last_specular && params.world_type == 1) {
+        float p_env = envmap_pdf(dir);
+        w = power_heuristic(prev_bsdf_pdf, p_env);
+      }
+      L = L + throughput * bg * w;
       break;
     }
 
@@ -773,6 +809,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
     float3 contrib = bs.f / bs.pdf;
     throughput = throughput * contrib;
     last_specular = bs.specular;
+    prev_bsdf_pdf = bs.pdf;
 
     // Russian roulette after a few bounces
     if (bounce >= 3) {
