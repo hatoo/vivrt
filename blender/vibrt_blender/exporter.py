@@ -206,9 +206,73 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
     }
 
 
+def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
+    """Return (strength, color) contributed by an Emission shader driving the
+    Light Output, as a multiplier on top of `light.energy`/`light.color`.
+
+    Cycles evaluates the light's shader tree and multiplies its output with
+    `light.energy * light.color`, so an Emission node whose Strength was edited
+    directly on the node (rather than via the UI's Power field) still influences
+    the render. classroom.blend's `blackBoard_light` and `sun` both rely on
+    this: their `light.energy` is leftover UI value, and the node's Strength is
+    the real source of truth.
+
+    Returns (1.0, (1, 1, 1)) when there's no usable Emission — callers then see
+    `light.energy`/`light.color` unchanged.
+    """
+    if not light.use_nodes or light.node_tree is None:
+        return 1.0, (1.0, 1.0, 1.0)
+    out = next(
+        (n for n in light.node_tree.nodes
+         if n.bl_idname == "ShaderNodeOutputLight" and n.is_active_output),
+        None,
+    )
+    if out is None:
+        out = next(
+            (n for n in light.node_tree.nodes
+             if n.bl_idname == "ShaderNodeOutputLight"),
+            None,
+        )
+    if out is None:
+        return 1.0, (1.0, 1.0, 1.0)
+    surf = out.inputs.get("Surface")
+    if surf is None or not surf.is_linked:
+        return 1.0, (1.0, 1.0, 1.0)
+    src = surf.links[0].from_node
+    if src.bl_idname != "ShaderNodeEmission":
+        return 1.0, (1.0, 1.0, 1.0)
+    s_sock = src.inputs.get("Strength")
+    c_sock = src.inputs.get("Color")
+    if s_sock is None:
+        strength = 1.0
+    elif s_sock.is_linked:
+        # Light Falloff drives Emission.Strength on classroom's blackBoard_light:
+        # its own Strength input is the pre-falloff multiplier. Our renderer
+        # already does physical inverse-square on area/point lights, so we use
+        # that raw value and ignore which falloff output was picked.
+        up = s_sock.links[0].from_node
+        if up.bl_idname == "ShaderNodeLightFalloff":
+            inner = up.inputs.get("Strength")
+            strength = float(inner.default_value) if inner is not None and not inner.is_linked else 1.0
+        else:
+            strength = 1.0
+    else:
+        strength = float(s_sock.default_value)
+    if c_sock is not None and not c_sock.is_linked:
+        cv = c_sock.default_value
+        color = (float(cv[0]), float(cv[1]), float(cv[2]))
+    else:
+        color = (1.0, 1.0, 1.0)
+    return strength, color
+
+
 def _export_light(obj, buf: bytearray, textures: list) -> dict | None:
     light = obj.data
-    col = list(light.color)
+    node_strength, node_color = _light_node_emission(light)
+    energy = float(light.energy) * node_strength
+    col = [light.color[0] * node_color[0],
+           light.color[1] * node_color[1],
+           light.color[2] * node_color[2]]
     mw = _matrix_to_row_major(obj.matrix_world)
     if light.type == "POINT":
         position = [obj.matrix_world[i][3] for i in range(3)]
@@ -216,7 +280,7 @@ def _export_light(obj, buf: bytearray, textures: list) -> dict | None:
             "type": "point",
             "position": position,
             "color": col,
-            "power": float(light.energy),
+            "power": energy,
             "radius": max(light.shadow_soft_size, 0.005),
         }
     if light.type == "SUN":
@@ -226,7 +290,7 @@ def _export_light(obj, buf: bytearray, textures: list) -> dict | None:
             "type": "sun",
             "direction": direction,
             "color": col,
-            "strength": float(light.energy),
+            "strength": energy,
             "angle_rad": float(light.angle),
         }
     if light.type == "SPOT":
@@ -234,7 +298,7 @@ def _export_light(obj, buf: bytearray, textures: list) -> dict | None:
             "type": "spot",
             "transform": mw,
             "color": col,
-            "power": float(light.energy),
+            "power": energy,
             "cone_rad": float(light.spot_size) * 0.5,
             "blend": float(light.spot_blend),
         }
@@ -245,12 +309,20 @@ def _export_light(obj, buf: bytearray, textures: list) -> dict | None:
             size = [float(light.size), float(light.size_y)]
         else:
             size = [float(light.size), float(light.size)]
+        # Blender area lights emit along local -Z; vibrt's area_rect expects
+        # emission along local +Z (see cornell/make_scene.py). Flip the Z axis
+        # (third column) so the emission direction survives the round trip.
+        mw_flipz = list(mw)
+        mw_flipz[2] = -mw_flipz[2]
+        mw_flipz[6] = -mw_flipz[6]
+        mw_flipz[10] = -mw_flipz[10]
+        mw_flipz[14] = -mw_flipz[14]
         return {
             "type": "area_rect",
-            "transform": mw,
+            "transform": mw_flipz,
             "size": size,
             "color": col,
-            "power": float(light.energy),
+            "power": energy,
         }
     return None
 

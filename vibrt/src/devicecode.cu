@@ -1114,6 +1114,43 @@ static __forceinline__ __device__ float3 clamp_indirect(float3 c,
   return (l > max_lum) ? c * (max_lum / l) : c;
 }
 
+// Ray/rect-light intersection: returns closest one-sided front-face hit inside
+// [t_min, t_max). Rect-light planes are invisible from behind (Cycles default:
+// emission on one side, backside doesn't render). We match NEE's sign
+// convention where `ar.normal` points along emission direction.
+static __device__ int intersect_rect_lights(float3 origin, float3 dir,
+                                            float t_min, float t_max,
+                                            float &t_out) {
+  int best = -1;
+  float t_best = t_max;
+  for (int i = 0; i < params.num_rect_lights; i++) {
+    AreaRectLight &ar = params.rect_lights[i];
+    float3 normal = make_f3(ar.normal);
+    float3 corner = make_f3(ar.corner);
+    float3 u_axis = make_f3(ar.u_axis);
+    float3 v_axis = make_f3(ar.v_axis);
+    float denom = dot3(normal, dir);
+    // Hit the emissive face when the ray is heading against the normal.
+    if (denom >= -1e-6f)
+      continue;
+    float t = dot3(corner - origin, normal) / denom;
+    if (t <= t_min || t >= t_best)
+      continue;
+    float3 Ph = origin + dir * t;
+    float3 d = Ph - corner;
+    float su = dot3(d, u_axis);
+    float sv = dot3(d, v_axis);
+    if (su < 0.0f || su > ar.size_u)
+      continue;
+    if (sv < 0.0f || sv > ar.size_v)
+      continue;
+    t_best = t;
+    best = i;
+  }
+  t_out = t_best;
+  return best;
+}
+
 static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
   float3 throughput = make_float3(1, 1, 1);
   float3 L = make_float3(0, 0, 0);
@@ -1131,6 +1168,28 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
                2, // SBT stride (2 ray types: radiance + shadow)
                0, // miss index (radiance miss)
                hi, lo);
+
+    // Geometry hit distance (∞ on miss). Needed so a rect light only counts
+    // when it occludes geometry rather than being behind a wall.
+    float t_geom = 1e20f;
+    if (v.hit != 0) {
+      float3 delta = v.P - origin;
+      t_geom = sqrtf(dot3(delta, delta));
+    }
+    float t_rect;
+    int rect_idx = intersect_rect_lights(origin, dir, 1e-4f, t_geom, t_rect);
+    if (rect_idx >= 0) {
+      // Hit an area light in front of any geometry. Add emission on primary
+      // rays and after specular bounces; NEE covers it for diffuse paths.
+      if (bounce == 0 || last_specular) {
+        float3 em =
+            throughput * make_f3(params.rect_lights[rect_idx].emission);
+        if (bounce > 0)
+          em = clamp_indirect(em, params.clamp_indirect);
+        L = L + em;
+      }
+      break;
+    }
 
     if (v.hit == 0) {
       float3 bg = world_background(dir);
