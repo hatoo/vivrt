@@ -30,12 +30,18 @@ def export_image_texture(
     buf: bytearray,
     textures: list,
     colorspace: str | None = None,
+    chain: tuple = (),
 ) -> int:
     """Serialize an image into scene.bin and register a TextureDesc entry.
 
-    Returns the texture index. Reuses existing entries by image name.
+    `chain` is a sequence of `(id_tuple, apply_fn)` color transforms (typically
+    from `_socket_linked_image_with_chain`) to bake into the pixels. When
+    non-empty, pixels are linearised, transformed, and stored as linear.
+
+    Returns the texture index. Reuses existing entries by (image, chain) key.
     """
-    key = f"__image__{image.name}"
+    chain_key = "" if not chain else "|" + repr(tuple(x[0] for x in chain))
+    key = f"__image__{image.name}{chain_key}"
     for i, t in enumerate(textures):
         if t.get("_key") == key:
             return i
@@ -53,6 +59,8 @@ def export_image_texture(
             if image.colorspace_settings.name.lower().startswith("srgb")
             else "linear"
         )
+    if chain:
+        pixels, colorspace = _bake_chain(pixels, width, height, colorspace, chain)
     desc = {
         "width": int(width),
         "height": int(height),
@@ -63,6 +71,30 @@ def export_image_texture(
     }
     textures.append(desc)
     return len(textures) - 1
+
+
+def _srgb_to_linear_np(x):
+    import numpy as np
+    return np.where(x <= 0.04045, x / 12.92, np.power((x + 0.055) / 1.055, 2.4))
+
+
+def _bake_chain(pixels, w, h, colorspace, chain):
+    """Apply `chain` color transforms to RGBA f32 pixels.
+
+    Transforms operate in linear space (matching Cycles' shader semantics: the
+    TexImage node converts sRGB→linear before its Color output). If the source
+    is sRGB, we linearise before applying. Returns the new pixel list and the
+    output colorspace string ("linear" once anything is baked in).
+    """
+    import numpy as np
+    arr = np.asarray(pixels, dtype=np.float32).reshape((h, w, 4))
+    rgb = arr[..., :3].copy()
+    if colorspace.lower() == "srgb":
+        rgb = _srgb_to_linear_np(rgb).astype(np.float32)
+    for _id, apply_fn in chain:
+        rgb = apply_fn(rgb)
+    arr[..., :3] = rgb
+    return arr.reshape(-1).tolist(), "linear"
 
 
 def _socket_rgb(sock) -> list[float]:
@@ -143,28 +175,98 @@ def _socket_linked_image(sock, depth: int = 0) -> bpy.types.Image | None:
     """Return the image feeding a socket.
 
     Sees through common colour-math / UV-transform / scalar-math intermediates
-    listed in `_PASSTHROUGH_INPUTS`. The actual node behaviour is discarded —
-    the renderer can't replicate it — but picking up the underlying image is
-    still better than exporting a flat default colour.
+    listed in `_PASSTHROUGH_INPUTS`. Most node behaviour is discarded; for
+    base-color inputs use `_socket_linked_image_with_chain` instead so RGBCurve
+    transforms can be baked into the texture pixels.
+    """
+    img, _ = _socket_linked_image_with_chain(sock, depth)
+    return img
+
+
+def _socket_linked_image_with_chain(sock, depth: int = 0):
+    """Return (image, transforms_chain) feeding a color socket.
+
+    `transforms_chain` is a tuple of (id_tuple, apply_fn) pairs that should be
+    applied to the texture's pixels in order (texture-first, BSDF-last) to
+    reproduce the effect of any RGBCurve / similar nodes between the texture
+    and `sock`. Other pass-through nodes (Mix, Hue, Gamma, ...) are still
+    ignored — same approximation as before.
     """
     if not sock.is_linked or depth > 6:
-        return None
+        return None, ()
     src = sock.links[0].from_node
     if src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
-        return src.image
-    if src.bl_idname in _PASSTHROUGH_INPUTS:
-        preferred = _PASSTHROUGH_INPUTS[src.bl_idname]
-        if preferred is None:
-            candidates = list(src.inputs)
-        else:
-            candidates = [src.inputs[n] for n in preferred if n in src.inputs]
-        for inp in candidates:
-            if not inp.is_linked:
-                continue
-            img = _socket_linked_image(inp, depth + 1)
-            if img is not None:
-                return img
+        return src.image, ()
+    if src.bl_idname not in _PASSTHROUGH_INPUTS:
+        return None, ()
+    preferred = _PASSTHROUGH_INPUTS[src.bl_idname]
+    if preferred is None:
+        candidates = list(src.inputs)
+    else:
+        candidates = [src.inputs[n] for n in preferred if n in src.inputs]
+    for inp in candidates:
+        if not inp.is_linked:
+            continue
+        img, sub_chain = _socket_linked_image_with_chain(inp, depth + 1)
+        if img is None:
+            continue
+        xform = _node_color_transform(src)
+        # Inner (closer to texture) first, then outer.
+        chain = sub_chain + ((xform,) if xform is not None else ())
+        return img, chain
+    return None, ()
+
+
+def _node_color_transform(node):
+    """Return (id_tuple, apply_fn) for a colour-modifying node, or None.
+
+    `id_tuple` is a hashable identifier used in the texture cache key so that
+    the same image with two different transforms gets two cache entries.
+    `apply_fn(rgb)` takes a numpy float32 array of shape (..., 3) in linear
+    space and returns the transformed array.
+    """
+    if node.bl_idname == "ShaderNodeRGBCurve":
+        return _rgbcurve_transform(node)
     return None
+
+
+def _rgbcurve_transform(node):
+    import numpy as np
+    cm = node.mapping
+    cm.update()
+    pts_id = tuple(
+        tuple((round(p.location[0], 6), round(p.location[1], 6))
+              for p in cm.curves[ci].points)
+        for ci in range(4)
+    )
+    bw_min, bw_max = float(cm.black_level[0]), float(cm.white_level[0])
+    id_tuple = ("RGBCurve", pts_id, round(bw_min, 6), round(bw_max, 6))
+    # Build a 1024-entry LUT per channel that includes the composite (C) curve
+    # applied first, then the per-channel R/G/B curve (matches Blender).
+    N = 1024
+    luts = []
+    composite = cm.curves[3]
+    for ci in range(3):
+        channel = cm.curves[ci]
+        lut = np.array(
+            [cm.evaluate(channel, cm.evaluate(composite, i / (N - 1)))
+             for i in range(N)],
+            dtype=np.float32,
+        )
+        luts.append(lut)
+
+    def apply(rgb):
+        out = np.empty_like(rgb)
+        for ch in range(3):
+            lut = luts[ch]
+            v = np.clip(rgb[..., ch], 0.0, 1.0) * (N - 1)
+            i0 = v.astype(np.int32)
+            i1 = np.minimum(i0 + 1, N - 1)
+            f = v - i0
+            out[..., ch] = lut[i0] * (1.0 - f) + lut[i1] * f
+        return out
+
+    return id_tuple, apply
 
 
 def _normal_perturbation(normal_sock):
@@ -255,12 +357,12 @@ def _resolve_shader(node, buf, textures, mat_name: str) -> dict:
 def _from_principled(node, buf, textures) -> dict:
     p = _default_params()
     bc = node.inputs["Base Color"]
-    img = _socket_linked_image(bc)
+    img, chain = _socket_linked_image_with_chain(bc)
     if img is not None:
         # Linked socket: the link drives the colour, the default RGB is unused
         # in Cycles. The renderer multiplies base_color × texture, so neutralise
         # the factor to avoid tinting the texture.
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(bc)
@@ -390,9 +492,9 @@ def _from_diffuse(node, buf, textures) -> dict:
     p = _default_params()
     p["roughness"] = 1.0
     p["metallic"] = 0.0
-    img = _socket_linked_image(node.inputs["Color"])
+    img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
@@ -403,9 +505,9 @@ def _from_diffuse(node, buf, textures) -> dict:
 def _from_glossy(node, buf, textures) -> dict:
     p = _default_params()
     p["metallic"] = 1.0
-    img = _socket_linked_image(node.inputs["Color"])
+    img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
@@ -433,9 +535,9 @@ def _from_glass(node, buf, textures) -> dict:
     p["transmission"] = 1.0
     if "IOR" in node.inputs:
         p["ior"] = _socket_f(node.inputs["IOR"])
-    img = _socket_linked_image(node.inputs["Color"])
+    img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
@@ -455,9 +557,9 @@ def _from_refraction(node, buf, textures) -> dict:
     p["metallic"] = 0.0
     if "IOR" in node.inputs:
         p["ior"] = _socket_f(node.inputs["IOR"])
-    img = _socket_linked_image(node.inputs["Color"])
+    img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
@@ -499,9 +601,9 @@ def _from_transparent(node, buf, textures) -> dict:
     p["transmission"] = 1.0
     p["ior"] = 1.0  # no refraction
     p["roughness"] = 0.0
-    img = _socket_linked_image(node.inputs["Color"])
+    img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
         p["alpha_threshold"] = 0.5
     else:
