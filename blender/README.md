@@ -55,7 +55,7 @@ creates a junction/symlink from `blender/vibrt_blender/` into Blender's user add
 
 - Camera: perspective only (no DoF yet).
 - Meshes: triangulated, per-corner normals and UVs, multi-material slots (per-triangle material index).
-- Materials: Principled BSDF — base color, metallic, roughness, IOR, transmission, emission, anisotropy (+ rotation), coat (weight / roughness / IOR), sheen (weight / roughness / tint), subsurface (weight / radius / anisotropy), alpha cutout, normal map (with strength), bump, displacement. Image textures on base color / normal / roughness / metallic. Colour- and scalar-math node chains between TexImage and the BSDF are traversed.
+- Materials: Principled BSDF — base color, metallic, roughness, IOR, transmission, emission, anisotropy (+ rotation), coat (weight / roughness / IOR), sheen (weight / roughness / tint), subsurface (weight / radius / anisotropy), alpha cutout, normal map (with strength), bump, displacement. Image textures on base color / normal / roughness / metallic. Colour- and scalar-math node chains between TexImage and the BSDF are traversed; the effect of RGBCurve, Gamma, BrightContrast, Invert, HueSaturation, ColorRamp, Clamp and Mix/MixRGB (MIX / MULTIPLY / ADD / SUBTRACT, when the non-texture side is constant) is baked into the exported texture pixels. Other node effects are approximated by pass-through.
 - Lights: Point, Sun, Spot, Area (square/rectangle).
 - World: constant colour background or Environment Texture (importance-sampled).
 - Transparent shadows through transmissive / alpha-cutout surfaces.
