@@ -1,0 +1,281 @@
+{
+  "version": 1,
+  "binary": "scene.bin",
+  "render": {
+    "width": 800,
+    "height": 500,
+    "spp": 128,
+    "max_depth": 6
+  },
+  "camera": {
+    "transform": [
+      1.0,
+      0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      0.1520571842539411,
+      -0.9883716976506172,
+      -4.5,
+      0.0,
+      0.9883716976506172,
+      0.1520571842539411,
+      1.8,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "fov_y_rad": 0.6632251157578453
+  },
+  "meshes": [
+    {
+      "vertices": {
+        "offset": 0,
+        "len": 48
+      },
+      "normals": {
+        "offset": 48,
+        "len": 48
+      },
+      "indices": {
+        "offset": 96,
+        "len": 24
+      }
+    },
+    {
+      "vertices": {
+        "offset": 128,
+        "len": 48
+      },
+      "normals": {
+        "offset": 176,
+        "len": 48
+      },
+      "indices": {
+        "offset": 224,
+        "len": 24
+      }
+    },
+    {
+      "vertices": {
+        "offset": 256,
+        "len": 48
+      },
+      "normals": {
+        "offset": 304,
+        "len": 48
+      },
+      "indices": {
+        "offset": 352,
+        "len": 24
+      }
+    },
+    {
+      "vertices": {
+        "offset": 384,
+        "len": 48
+      },
+      "normals": {
+        "offset": 432,
+        "len": 48
+      },
+      "indices": {
+        "offset": 480,
+        "len": 24
+      }
+    },
+    {
+      "vertices": {
+        "offset": 512,
+        "len": 48
+      },
+      "normals": {
+        "offset": 560,
+        "len": 48
+      },
+      "indices": {
+        "offset": 608,
+        "len": 24
+      }
+    }
+  ],
+  "materials": [
+    {
+      "base_color": [
+        0.58,
+        0.55,
+        0.5
+      ],
+      "metallic": 0.0,
+      "roughness": 0.9
+    },
+    {
+      "base_color": [
+        0.95,
+        0.93,
+        0.88
+      ],
+      "metallic": 1.0,
+      "roughness": 0.005
+    },
+    {
+      "base_color": [
+        0.95,
+        0.93,
+        0.88
+      ],
+      "metallic": 1.0,
+      "roughness": 0.03
+    },
+    {
+      "base_color": [
+        0.95,
+        0.93,
+        0.88
+      ],
+      "metallic": 1.0,
+      "roughness": 0.1
+    },
+    {
+      "base_color": [
+        0.95,
+        0.93,
+        0.88
+      ],
+      "metallic": 1.0,
+      "roughness": 0.35
+    }
+  ],
+  "textures": [
+    {
+      "width": 512,
+      "height": 256,
+      "channels": 3,
+      "colorspace": "linear",
+      "pixels": {
+        "offset": 640,
+        "len": 1572864
+      }
+    }
+  ],
+  "objects": [
+    {
+      "mesh": 0,
+      "material": 0,
+      "transform": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "mesh": 1,
+      "material": 1,
+      "transform": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "mesh": 2,
+      "material": 2,
+      "transform": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "mesh": 3,
+      "material": 3,
+      "transform": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "mesh": 4,
+      "material": 4,
+      "transform": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    }
+  ],
+  "lights": [],
+  "world": {
+    "type": "envmap",
+    "texture": 0,
+    "strength": 1.0,
+    "rotation_z_rad": 0.0
+  }
+}
