@@ -2001,22 +2001,15 @@ def _from_mix(node, buf, textures, mat_name: str) -> dict:
     if (t1 in diffuse_like and t2 in glossy_like) or (t2 in diffuse_like and t1 in glossy_like):
         diff = p1 if t1 in diffuse_like else p2
         gloss = p1 if t1 in glossy_like else p2
-        fac_sock = node.inputs[0]
-        fac = _socket_f(fac_sock) if not fac_sock.is_linked else 0.5
-        fac = max(0.0, min(1.0, fac))
-        # fac below 0.5 means "mostly diffuse, dash of gloss" (classroom's
-        # ceilingAirVent uses fac=0.1). Our Principled approximation can't
-        # model a partial glossy weight, so keep it fully matte and drop the
-        # gloss — otherwise the dielectric specular lobe shows up as sun
-        # highlights that don't exist in Cycles.
-        if fac < 0.5:
-            return diff
-        out = dict(gloss)
+        out = dict(diff)
+        out["roughness"] = gloss["roughness"]
         out["metallic"] = 0.0
+        if "roughness_tex" in gloss:
+            out["roughness_tex"] = gloss["roughness_tex"]
         for k in ("normal_tex", "normal_strength", "bump_tex",
                   "bump_strength", "alpha_threshold"):
-            if k not in out and k in diff:
-                out[k] = diff[k]
+            if k not in out and k in gloss:
+                out[k] = gloss[k]
         return out
 
     fac_sock = node.inputs[0]
