@@ -116,30 +116,49 @@ def _mapping_to_affine(node) -> list[float]:
             sx * s,  sy * c, ty]
 
 
-# Node types that pass a TexImage through unchanged in semantic terms: Mapping
-# only transforms the Vector side, so seeing through it is safe. MixRGB /
-# ColorRamp / Gamma / etc. change colour values; treating them as passthrough
-# visibly darkens or tints the result, so they're omitted.
-_PASSTHROUGH_NODES = {
-    "ShaderNodeMapping",
+# Node types we traverse to reach an underlying TexImage, mapped to the input
+# socket names that carry the dominant colour data (in priority order). We
+# accept the tinting / remapping these nodes apply as the price for not losing
+# the texture entirely — a flat default colour is usually worse than an
+# approximately-correct texture. `None` means "any linked input, in order".
+_PASSTHROUGH_INPUTS: dict[str, tuple[str, ...] | None] = {
+    "ShaderNodeMapping": None,             # vector-side only, safe
+    "ShaderNodeMix": ("A", "B"),           # new-style universal Mix
+    "ShaderNodeMixRGB": ("Color1", "Color2"),
+    "ShaderNodeRGBCurve": ("Color",),
+    "ShaderNodeGamma": ("Color",),
+    "ShaderNodeHueSaturation": ("Color",),
+    "ShaderNodeBrightContrast": ("Color",),
+    "ShaderNodeInvert": ("Color",),
+    "ShaderNodeValToRGB": ("Fac",),        # ColorRamp: scalar-in, colour-out
+    "ShaderNodeMath": None,                # scalar ops (Invert, Multiply, ...)
+    "ShaderNodeClamp": ("Value",),
+    "ShaderNodeSeparateColor": ("Color",), # packed ORM: Color -> R/G/B channels
+    "ShaderNodeSeparateRGB": ("Image",),   # legacy pre-3.3 variant
+    "ShaderNodeSeparateXYZ": ("Vector",),
 }
 
 
 def _socket_linked_image(sock, depth: int = 0) -> bpy.types.Image | None:
     """Return the image feeding a socket.
 
-    Sees through color-math / UV-transform intermediates (MixRGB, ColorRamp,
-    Mapping, etc.). The actual color math or UV transform is discarded — the
-    renderer can't replicate it — but picking up the underlying image is still
-    better than exporting a flat default colour.
+    Sees through common colour-math / UV-transform / scalar-math intermediates
+    listed in `_PASSTHROUGH_INPUTS`. The actual node behaviour is discarded —
+    the renderer can't replicate it — but picking up the underlying image is
+    still better than exporting a flat default colour.
     """
     if not sock.is_linked or depth > 6:
         return None
     src = sock.links[0].from_node
     if src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
         return src.image
-    if src.bl_idname in _PASSTHROUGH_NODES:
-        for inp in src.inputs:
+    if src.bl_idname in _PASSTHROUGH_INPUTS:
+        preferred = _PASSTHROUGH_INPUTS[src.bl_idname]
+        if preferred is None:
+            candidates = list(src.inputs)
+        else:
+            candidates = [src.inputs[n] for n in preferred if n in src.inputs]
+        for inp in candidates:
             if not inp.is_linked:
                 continue
             img = _socket_linked_image(inp, depth + 1)
