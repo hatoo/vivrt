@@ -469,6 +469,213 @@ def _resolve_constant_socket(sock, depth: int = 0):
     return None
 
 
+# Representative scalar values for VALUE outputs that have no fold-able
+# definition — per-object random, procedural noise, vertex attributes etc.
+# 0.5 is the mean of a uniform [0, 1] so boolean Math ops around random
+# sources land on their threshold in a sensible spot. Used only when a Mix's
+# Factor can't be baked into a texture and we'd otherwise drop the Mix's
+# contribution entirely.
+_SCALAR_LEAF_DEFAULTS: dict[tuple[str, str], float] = {
+    ("ShaderNodeObjectInfo", "Random"): 0.5,
+    ("ShaderNodeObjectInfo", "Object Index"): 0.0,
+    ("ShaderNodeObjectInfo", "Material Index"): 0.0,
+    ("ShaderNodeParticleInfo", "Random"): 0.5,
+    ("ShaderNodeParticleInfo", "Index"): 0.0,
+    ("ShaderNodeParticleInfo", "Age"): 0.0,
+    ("ShaderNodeParticleInfo", "Lifetime"): 1.0,
+    ("ShaderNodeAttribute", "Fac"): 1.0,
+    ("ShaderNodeTexNoise", "Fac"): 0.5,
+    ("ShaderNodeTexNoise", "Factor"): 0.5,
+    ("ShaderNodeTexVoronoi", "Distance"): 0.5,
+    ("ShaderNodeTexWave", "Fac"): 0.5,
+    ("ShaderNodeTexWave", "Factor"): 0.5,
+    ("ShaderNodeTexMagic", "Fac"): 0.5,
+    ("ShaderNodeTexMagic", "Factor"): 0.5,
+    ("ShaderNodeTexChecker", "Fac"): 0.5,
+    ("ShaderNodeTexChecker", "Factor"): 0.5,
+    ("ShaderNodeTexGradient", "Fac"): 0.5,
+    ("ShaderNodeTexGradient", "Factor"): 0.5,
+    ("ShaderNodeTexMusgrave", "Fac"): 0.5,
+    ("ShaderNodeTexMusgrave", "Height"): 0.5,
+}
+
+
+def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
+    """Fold a VALUE socket to a single float, walking Math/Clamp/Value and
+    substituting non-foldable leaves (Random, procedural noise) with their
+    representative means in `_SCALAR_LEAF_DEFAULTS`.
+
+    Returns None when we hit a node we can't evaluate — callers that need a
+    strict constant (no approximation) should inspect the socket themselves.
+    """
+    if depth > 8:
+        return None
+    if not sock.is_linked:
+        dv = getattr(sock, "default_value", None)
+        if dv is None:
+            return None
+        try:
+            return float(dv)
+        except TypeError:
+            return None
+    link = sock.links[0]
+    src = link.from_node
+    out_name = link.from_socket.name
+    if src.bl_idname == "ShaderNodeValue":
+        return float(src.outputs[0].default_value)
+    leaf = _SCALAR_LEAF_DEFAULTS.get((src.bl_idname, out_name))
+    if leaf is not None:
+        return leaf
+    # Colour-leaf used as a scalar: Blender would luminance-convert. Match the
+    # socket's expected range by using the leaf's procedural default.
+    if src.bl_idname in _PROCEDURAL_LEAF_DEFAULTS:
+        col = _PROCEDURAL_LEAF_DEFAULTS[src.bl_idname]
+        return 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2]
+    if src.bl_idname == "ShaderNodeMath":
+        return _eval_math_constant(src, depth + 1)
+    if src.bl_idname == "ShaderNodeClamp":
+        v = _resolve_constant_scalar(src.inputs["Value"], depth + 1)
+        if v is None:
+            return None
+        mn = _resolve_constant_scalar(src.inputs["Min"], depth + 1)
+        mx = _resolve_constant_scalar(src.inputs["Max"], depth + 1)
+        if mn is None or mx is None:
+            return None
+        mode = getattr(src, "clamp_type", "MINMAX")
+        if mode == "RANGE" and mn > mx:
+            mn, mx = mx, mn
+        return max(mn, min(mx, v))
+    return None
+
+
+def _eval_math_constant(node, depth: int) -> float | None:
+    """Evaluate a ShaderNodeMath with constant-foldable inputs. Returns None
+    when any needed input is non-foldable or the op is unsupported.
+    """
+    op = getattr(node, "operation", "ADD")
+    inputs = node.inputs
+    a = _resolve_constant_scalar(inputs[0], depth) if len(inputs) > 0 else None
+    b = _resolve_constant_scalar(inputs[1], depth) if len(inputs) > 1 else None
+    c = _resolve_constant_scalar(inputs[2], depth) if len(inputs) > 2 else None
+    if a is None:
+        return None
+    try:
+        if op == "ADD":
+            if b is None:
+                return None
+            r = a + b
+        elif op == "SUBTRACT":
+            if b is None:
+                return None
+            r = a - b
+        elif op == "MULTIPLY":
+            if b is None:
+                return None
+            r = a * b
+        elif op == "DIVIDE":
+            if b is None:
+                return None
+            r = a / b if b != 0 else 0.0
+        elif op == "MULTIPLY_ADD":
+            if b is None or c is None:
+                return None
+            r = a * b + c
+        elif op == "POWER":
+            if b is None:
+                return None
+            r = a ** b if a >= 0 or float(b).is_integer() else 0.0
+        elif op == "LOGARITHM":
+            if b is None or a <= 0 or b <= 0 or b == 1:
+                return None
+            r = math.log(a, b)
+        elif op == "MINIMUM":
+            if b is None:
+                return None
+            r = min(a, b)
+        elif op == "MAXIMUM":
+            if b is None:
+                return None
+            r = max(a, b)
+        elif op == "LESS_THAN":
+            if b is None:
+                return None
+            r = 1.0 if a < b else 0.0
+        elif op == "GREATER_THAN":
+            if b is None:
+                return None
+            r = 1.0 if a > b else 0.0
+        elif op == "COMPARE":
+            if b is None:
+                return None
+            eps = c if c is not None else 0.0
+            r = 1.0 if abs(a - b) <= eps else 0.0
+        elif op == "MODULO":
+            if b is None:
+                return None
+            r = math.fmod(a, b) if b != 0 else 0.0
+        elif op == "SMOOTH_MIN":
+            if b is None:
+                return None
+            r = min(a, b)
+        elif op == "SMOOTH_MAX":
+            if b is None:
+                return None
+            r = max(a, b)
+        elif op == "ARCTAN2":
+            if b is None:
+                return None
+            r = math.atan2(a, b)
+        elif op == "SQRT":
+            r = math.sqrt(max(a, 0.0))
+        elif op == "INVERSE_SQRT":
+            r = 1.0 / math.sqrt(a) if a > 0 else 0.0
+        elif op == "ABSOLUTE":
+            r = abs(a)
+        elif op == "EXPONENT":
+            r = math.exp(a)
+        elif op == "SIGN":
+            r = float((a > 0) - (a < 0))
+        elif op == "ROUND":
+            r = float(round(a))
+        elif op == "FLOOR":
+            r = math.floor(a)
+        elif op == "CEIL":
+            r = math.ceil(a)
+        elif op == "FRACT":
+            r = a - math.floor(a)
+        elif op == "TRUNC":
+            r = math.trunc(a)
+        elif op == "SINE":
+            r = math.sin(a)
+        elif op == "COSINE":
+            r = math.cos(a)
+        elif op == "TANGENT":
+            r = math.tan(a)
+        elif op == "ARCSINE":
+            r = math.asin(max(-1.0, min(1.0, a)))
+        elif op == "ARCCOSINE":
+            r = math.acos(max(-1.0, min(1.0, a)))
+        elif op == "ARCTANGENT":
+            r = math.atan(a)
+        elif op == "HYPERBOLIC_SINE":
+            r = math.sinh(a)
+        elif op == "HYPERBOLIC_COSINE":
+            r = math.cosh(a)
+        elif op == "HYPERBOLIC_TANGENT":
+            r = math.tanh(a)
+        elif op == "RADIANS":
+            r = math.radians(a)
+        elif op == "DEGREES":
+            r = math.degrees(a)
+        else:
+            return None
+    except (ValueError, OverflowError, ZeroDivisionError):
+        return None
+    if getattr(node, "use_clamp", False):
+        r = max(0.0, min(1.0, r))
+    return float(r)
+
+
 def _blackbody_to_linear_rgb(kelvin: float) -> list[float]:
     """Tanner-Helland blackbody → sRGB approximation, then sRGB→linear.
 
@@ -1148,11 +1355,16 @@ def _mix_transform(node, chain_input_name):
         )
         return None
     if fac_sock.is_linked:
-        _warn(
-            f"mix-fac-linked:{node.as_pointer()}",
-            f"{_node_tag(node)}: Factor is linked — effect not baked",
-        )
-        return None
+        fac = _resolve_constant_scalar(fac_sock)
+        if fac is None:
+            _warn(
+                f"mix-fac-linked:{node.as_pointer()}",
+                f"{_node_tag(node)}: Factor is linked and not foldable to a "
+                f"constant — effect not baked",
+            )
+            return None
+    else:
+        fac = _socket_f(fac_sock)
     other_sock = b_sock if is_a_chain else a_sock
     other_const = _socket_constant_rgb(other_sock)
     if other_const is None:
@@ -1162,8 +1374,6 @@ def _mix_transform(node, chain_input_name):
             f"driven by another chain (two-texture mix) — effect not baked",
         )
         return None
-
-    fac = _socket_f(fac_sock)
     other_rgb = np.array(other_const, dtype=np.float32)
     id_tuple = (
         "Mix", blend, is_a_chain, round(fac, 6),
@@ -1207,17 +1417,27 @@ def _try_premix_two_textures(mix_node, group_stack):
         img_f, chain_f = _socket_linked_image_with_chain(
             fac_sock, group_stack=group_stack
         )
-        if img_f is None:
-            return None
-        fac_const = None
-        # A textured factor forces a full premix, so it's fine if one colour
-        # side is only a resolvable constant.
-        const_a = None if img_a is not None else _socket_constant_rgb(a_sock)
-        const_b = None if img_b is not None else _socket_constant_rgb(b_sock)
-        if img_a is None and const_a is None:
-            return None
-        if img_b is None and const_b is None:
-            return None
+        if img_f is not None:
+            fac_const = None
+            # A textured factor forces a full premix, so it's fine if one
+            # colour side is only a resolvable constant.
+            const_a = None if img_a is not None else _socket_constant_rgb(a_sock)
+            const_b = None if img_b is not None else _socket_constant_rgb(b_sock)
+            if img_a is None and const_a is None:
+                return None
+            if img_b is None and const_b is None:
+                return None
+        else:
+            # No texture behind the factor chain; try folding Math / data
+            # leaves (Random, procedural noise) to a representative scalar.
+            # `_mix_transform` picks this up for tex-vs-const shapes, so only
+            # claim the premix when both colour sides are textures.
+            chain_f = ()
+            fac_scalar = _resolve_constant_scalar(fac_sock)
+            if fac_scalar is None or img_a is None or img_b is None:
+                return None
+            fac_const = fac_scalar
+            const_a = const_b = None
     else:
         img_f, chain_f = None, ()
         fac_const = _socket_f(fac_sock)
