@@ -134,6 +134,12 @@ def _add_ui_compatibility():
         properties_data_light,
     )
 
+    # Panels whose class name contains these tokens are engine-specific sampling
+    # controls we provide ourselves (see properties.VIBRT_PT_sampling). Letting
+    # e.g. EEVEE's sampling panel appear for VIBRT caused the exported spp to
+    # silently disagree with the visible "Samples" field.
+    exclude_tokens = ("sampling",)
+
     for module in (
         properties_render,
         properties_output,
@@ -146,6 +152,8 @@ def _add_ui_compatibility():
         for clsname in dir(module):
             cls = getattr(module, clsname)
             if not hasattr(cls, "COMPAT_ENGINES"):
+                continue
+            if any(tok in clsname.lower() for tok in exclude_tokens):
                 continue
             compat = getattr(cls, "COMPAT_ENGINES")
             if isinstance(compat, set):

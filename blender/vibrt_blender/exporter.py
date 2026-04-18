@@ -328,16 +328,8 @@ def export_scene(
 
     world = _export_world(scene.world, buf, textures)
 
-    # samples-per-pixel: prefer a custom scene prop if set, else fall back to Cycles if present, else 64
-    spp = 64
-    vibrt_sp = scene.get("vibrt_spp")
-    if vibrt_sp is not None:
-        spp = max(1, int(vibrt_sp))
-    elif hasattr(scene, "cycles"):
-        try:
-            spp = max(1, int(scene.cycles.samples))
-        except AttributeError:
-            pass
+    spp = max(1, int(scene.vibrt_spp))
+    print(f"[vibrt] spp={spp}")
     scene_json = {
         "version": 1,
         "binary": bin_path.name,
