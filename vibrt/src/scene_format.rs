@@ -70,6 +70,13 @@ pub struct MeshDesc {
     /// When absent, the whole mesh uses ObjectDesc::material.
     #[serde(default)]
     pub material_indices: Option<BlobRef>,
+    /// Grayscale heightmap (texture index). Sampled at vertex UVs; offsets
+    /// each vertex along its normal by `sampled * displacement_strength`.
+    /// Applied once at scene-load before BLAS construction.
+    #[serde(default)]
+    pub displacement_tex: Option<u32>,
+    #[serde(default)]
+    pub displacement_strength: f32,
 }
 
 #[derive(Deserialize)]
@@ -124,6 +131,16 @@ pub struct PrincipledMaterial {
     pub sheen_roughness: f32,
     #[serde(default = "default_sheen_tint")]
     pub sheen_tint: [f32; 3],
+    #[serde(default)]
+    pub sss_weight: f32,
+    #[serde(default = "default_sss_radius")]
+    pub sss_radius: [f32; 3],
+    #[serde(default)]
+    pub sss_anisotropy: f32,
+}
+
+fn default_sss_radius() -> [f32; 3] {
+    [1.0, 0.2, 0.1]
 }
 
 fn default_coat_roughness() -> f32 {

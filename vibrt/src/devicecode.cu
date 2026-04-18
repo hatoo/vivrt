@@ -586,6 +586,9 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
   float NoL = dot3(e.Ns, wi);
   bool reflect = NoL > 0.0f;
   bool transmit = !reflect && e.transmission > 0.0f;
+  // SSS can also contribute diffusely when the light is slightly behind the
+  // surface (wraparound lobe).
+  bool sss_backlit = !reflect && e.mat->sss_weight > 0.0f && NoL > -1.0f;
   if (NoV <= 0.0f)
     return r;
 
@@ -603,11 +606,30 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
   float p_spec = w_spec / w_sum;
   float p_trans = w_trans / w_sum;
 
+  // Subsurface (approximate): wraparound Lambert + radius-weighted tint.
+  // Not a true random-walk SSS but captures the characteristic "wax / skin /
+  // paper" behaviour where light wraps past the terminator and shifts hue by
+  // channel-dependent mean-free-path.
+  float sss_w = e.mat->sss_weight;
+  float3 sss_tint = make_float3(1, 1, 1);
+  if (sss_w > 0.0f) {
+    float3 rr = make_f3(e.mat->sss_radius);
+    float rmax = fmaxf(fmaxf(rr.x, rr.y), fmaxf(rr.z, 1e-4f));
+    sss_tint = make_float3(rr.x / rmax, rr.y / rmax, rr.z / rmax);
+  }
+
+  // Wraparound brightness for SSS: allows a bit of back-lit contribution.
+  float NoL_std = fmaxf(NoL, 0.0f);
+  float NoL_wrap = 0.5f * (1.0f + NoL);
+
   if (reflect) {
-    // Diffuse (Lambert)
+    // Diffuse (Lambert, possibly wrap-shifted by SSS)
     if (w_diffuse > 0.0f) {
-      r.f = r.f + e.base_color * (INV_PIf * w_diffuse * NoL);
-      r.pdf += p_diff * NoL * INV_PIf;
+      float effective = (1.0f - sss_w) * NoL_std + sss_w * NoL_wrap;
+      float3 bc_sss = e.base_color * (make_float3(1, 1, 1) * (1.0f - sss_w) +
+                                      sss_tint * sss_w);
+      r.f = r.f + bc_sss * (INV_PIf * w_diffuse * effective);
+      r.pdf += p_diff * fmaxf(effective, 0.0f) * INV_PIf;
     }
     // Specular (metallic + dielectric spec layer)
     float3 H = normalize3(wo + wi);
@@ -686,6 +708,15 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
       float sf = powf(fmaxf(1.0f - NoV, 0.0f), 1.0f / sr) * sheen_w;
       float3 tint = make_f3(mc->sheen_tint);
       r.f = r.f + tint * sf * NoL;
+    }
+  } else if (sss_backlit) {
+    // Back-lit diffuse via SSS wrap lobe only.
+    float w_wrap = fmaxf(NoL_wrap, 0.0f);
+    if (w_wrap > 0.0f && w_diffuse > 0.0f) {
+      float3 bc_sss = e.base_color * (make_float3(1, 1, 1) * (1.0f - sss_w) +
+                                      sss_tint * sss_w);
+      r.f = r.f + bc_sss * (INV_PIf * w_diffuse * sss_w * w_wrap);
+      r.pdf += p_diff * w_wrap * INV_PIf * sss_w;
     }
   } else if (transmit) {
     // Rough dielectric transmission: evaluate using Walter et al. BTDF.

@@ -43,6 +43,9 @@ pub struct PrincipledGpu {
     pub sheen_weight: f32,
     pub sheen_roughness: f32,
     pub sheen_tint: [f32; 3],
+    pub sss_weight: f32,
+    pub sss_radius: [f32; 3],
+    pub sss_anisotropy: f32,
 }
 
 #[repr(C)]

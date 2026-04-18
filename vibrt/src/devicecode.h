@@ -41,6 +41,9 @@ struct PrincipledGpu {
   float sheen_weight;
   float sheen_roughness;
   float sheen_tint[3];
+  float sss_weight;
+  float sss_radius[3];
+  float sss_anisotropy;
 };
 
 struct HitGroupData {

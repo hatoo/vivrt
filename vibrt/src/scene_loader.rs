@@ -58,16 +58,26 @@ pub fn load_scene(json_path: &Path) -> Result<LoadedScene> {
     let mmap = unsafe { memmap2::Mmap::map(&binary_file) }.context("mmap of scene.bin failed")?;
     let bin: &[u8] = &mmap;
 
-    let meshes = file
-        .meshes
-        .iter()
-        .map(|m| load_mesh(m, bin))
-        .collect::<Result<Vec<_>>>()?;
     let textures = file
         .textures
         .iter()
         .map(|t| load_texture(t, bin))
         .collect::<Result<Vec<_>>>()?;
+    let mut meshes = file
+        .meshes
+        .iter()
+        .map(|m| load_mesh(m, bin))
+        .collect::<Result<Vec<_>>>()?;
+    for (mi, mdesc) in file.meshes.iter().enumerate() {
+        if let (Some(tex_id), s) = (mdesc.displacement_tex, mdesc.displacement_strength) {
+            if s != 0.0 {
+                let tex = textures.get(tex_id as usize).ok_or_else(|| {
+                    anyhow!("mesh {} displacement_tex index out of range", mi)
+                })?;
+                apply_displacement(&mut meshes[mi], tex, s);
+            }
+        }
+    }
 
     let objects = file
         .objects
@@ -259,6 +269,56 @@ fn read_u32_vec(bytes: &[u8]) -> Vec<u32> {
         ]));
     }
     out
+}
+
+fn sample_heightmap(tex: &LoadedTexture, u: f32, v: f32) -> f32 {
+    if tex.width == 0 || tex.height == 0 {
+        return 0.0;
+    }
+    let w = tex.width as i32;
+    let h = tex.height as i32;
+    let uu = u - u.floor();
+    let vv = v - v.floor();
+    let fx = uu * w as f32 - 0.5;
+    let fy = (1.0 - vv) * h as f32 - 0.5;
+    let x0 = fx.floor() as i32;
+    let y0 = fy.floor() as i32;
+    let dx = fx - x0 as f32;
+    let dy = fy - y0 as f32;
+    let wrap = |v: i32, m: i32| -> i32 {
+        let r = v.rem_euclid(m);
+        r
+    };
+    let x0w = wrap(x0, w);
+    let y0w = wrap(y0, h);
+    let x1w = wrap(x0 + 1, w);
+    let y1w = wrap(y0 + 1, h);
+    let at = |x: i32, y: i32| -> f32 {
+        let base = ((y as u32 * tex.width + x as u32) * 4) as usize;
+        tex.data[base] // R channel
+    };
+    let c00 = at(x0w, y0w);
+    let c10 = at(x1w, y0w);
+    let c01 = at(x0w, y1w);
+    let c11 = at(x1w, y1w);
+    let c0 = c00 * (1.0 - dx) + c10 * dx;
+    let c1 = c01 * (1.0 - dx) + c11 * dx;
+    c0 * (1.0 - dy) + c1 * dy
+}
+
+fn apply_displacement(mesh: &mut LoadedMesh, tex: &LoadedTexture, strength: f32) {
+    if mesh.uvs.is_empty() || mesh.normals.is_empty() {
+        return;
+    }
+    let nv = mesh.vertices.len() / 3;
+    for i in 0..nv {
+        let u = mesh.uvs[i * 2 + 0];
+        let v = mesh.uvs[i * 2 + 1];
+        let h = sample_heightmap(tex, u, v) * strength;
+        mesh.vertices[i * 3 + 0] += mesh.normals[i * 3 + 0] * h;
+        mesh.vertices[i * 3 + 1] += mesh.normals[i * 3 + 1] * h;
+        mesh.vertices[i * 3 + 2] += mesh.normals[i * 3 + 2] * h;
+    }
 }
 
 fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {

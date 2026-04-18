@@ -36,7 +36,50 @@ def _write_blob(buf: bytearray, data: bytes) -> dict:
     return {"offset": off, "len": len(data)}
 
 
-def _export_mesh(obj_eval, buf: bytearray) -> dict | None:
+def _find_displacement(obj_eval, buf, textures):
+    """Return (tex_id, strength) for the first material slot's Displacement
+    output that drives a single TexImage; (None, 0.0) otherwise.
+    """
+    for slot in obj_eval.material_slots:
+        mat = slot.material
+        if mat is None or not mat.use_nodes:
+            continue
+        out = next(
+            (n for n in mat.node_tree.nodes
+             if n.bl_idname == "ShaderNodeOutputMaterial"
+             and n.is_active_output),
+            None,
+        )
+        if out is None:
+            continue
+        disp = out.inputs.get("Displacement")
+        if disp is None or not disp.is_linked:
+            continue
+        src = disp.links[0].from_node
+        strength = 1.0
+        if src.bl_idname == "ShaderNodeDisplacement":
+            if "Scale" in src.inputs:
+                strength = float(src.inputs["Scale"].default_value)
+            height_sock = src.inputs.get("Height")
+            if height_sock is None or not height_sock.is_linked:
+                continue
+            upstream = height_sock.links[0].from_node
+            if upstream.bl_idname == "ShaderNodeTexImage" and upstream.image is not None:
+                from . import material_export
+                tex_id = material_export.export_image_texture(
+                    upstream.image, buf, textures, "linear"
+                )
+                return tex_id, strength
+        elif src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
+            from . import material_export
+            tex_id = material_export.export_image_texture(
+                src.image, buf, textures, "linear"
+            )
+            return tex_id, strength
+    return None, 0.0
+
+
+def _export_mesh(obj_eval, buf: bytearray, textures: list) -> dict | None:
     """Export a mesh + per-triangle material indices.
 
     Returns a dict suitable for a `MeshDesc` — always includes `material_indices`
@@ -80,6 +123,10 @@ def _export_mesh(obj_eval, buf: bytearray) -> dict | None:
         }
         if num_slots > 1:
             desc["material_indices"] = _write_blob(buf, _pack_u32(mat_indices))
+        disp_tex, disp_strength = _find_displacement(obj_eval, buf, textures)
+        if disp_tex is not None and disp_strength != 0.0:
+            desc["displacement_tex"] = disp_tex
+            desc["displacement_strength"] = disp_strength
         return desc
     finally:
         obj_eval.to_mesh_clear()
@@ -245,7 +292,7 @@ def export_scene(
             mkey = f"{obj_eval.data.name}#{obj_eval.name}"
             mesh_id = mesh_cache.get(mkey)
             if mesh_id is None:
-                mesh = _export_mesh(obj_eval, buf)
+                mesh = _export_mesh(obj_eval, buf, textures)
                 if mesh is None:
                     continue
                 mesh_id = len(meshes)

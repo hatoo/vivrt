@@ -88,5 +88,8 @@ pub fn make_material_data(
         sheen_weight: mat.sheen_weight.clamp(0.0, 1.0),
         sheen_roughness: mat.sheen_roughness.clamp(0.0, 1.0),
         sheen_tint: mat.sheen_tint,
+        sss_weight: mat.sss_weight.clamp(0.0, 1.0),
+        sss_radius: mat.sss_radius,
+        sss_anisotropy: mat.sss_anisotropy.clamp(-0.99, 0.99),
     }
 }
