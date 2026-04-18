@@ -3,7 +3,5 @@ resolver = "2"
 members = [
     "optix-sys",
     "optix",
-    "pbrt-parser",
-    "vibrt",
     "vibrt-blender",
 ]

@@ -1,8 +1,6 @@
 /target
 *.ppm
 *.png
-!crown.png
-*.pbrt
 *.raw
 __pycache__/
 *.pyc
