@@ -31,6 +31,8 @@ _STATS: dict = {
     "slow_materials": [],  # list of (name, self_seconds), only > 0.10s
     "premix_cache_hits": 0,
     "premix_cache_misses": 0,
+    "linear_rgb_cache_hits": 0,
+    "linear_rgb_cache_misses": 0,
 }
 
 
@@ -41,6 +43,14 @@ _STATS: dict = {
 # reuse the result keyed by the same identity string the function already
 # computed for `_PreBakedTexture.cache_key`. Cleared in `reset_stats()`.
 _PREMIX_CACHE: dict = {}
+
+
+# Session-scoped cache for `_image_to_linear_rgb`. The result is a pure
+# function of the image's pixels + colorspace, but every Mix-bake path
+# re-reads the pixels and re-runs the sRGB→linear conversion. Keyed by
+# `image.as_pointer()` since that's stable for the lifetime of the export.
+# Values are stored read-only so any accidental mutation fails loudly.
+_LINEAR_RGB_CACHE: dict = {}
 
 
 def reset_stats() -> None:
@@ -54,7 +64,10 @@ def reset_stats() -> None:
     _STATS["slow_materials"].clear()
     _STATS["premix_cache_hits"] = 0
     _STATS["premix_cache_misses"] = 0
+    _STATS["linear_rgb_cache_hits"] = 0
+    _STATS["linear_rgb_cache_misses"] = 0
     _PREMIX_CACHE.clear()
+    _LINEAR_RGB_CACHE.clear()
 
 
 def pop_stats() -> dict:
@@ -70,6 +83,8 @@ def pop_stats() -> dict:
         "slow_materials": list(_STATS["slow_materials"]),
         "premix_cache_hits": _STATS["premix_cache_hits"],
         "premix_cache_misses": _STATS["premix_cache_misses"],
+        "linear_rgb_cache_hits": _STATS["linear_rgb_cache_hits"],
+        "linear_rgb_cache_misses": _STATS["linear_rgb_cache_misses"],
     }
 
 
@@ -215,21 +230,36 @@ def _export_prebaked(pb: "_PreBakedTexture", buf: bytearray, textures: list) -> 
 def _image_to_linear_rgb(image):
     """Decode a `bpy.types.Image` into a (h, w, 3) numpy array in linear space."""
     import numpy as np
+    ptr = image.as_pointer()
+    hit = _LINEAR_RGB_CACHE.get(ptr)
+    if hit is not None:
+        _STATS["linear_rgb_cache_hits"] += 1
+        return hit
+    _STATS["linear_rgb_cache_misses"] += 1
     if image.size[0] == 0 or image.size[1] == 0:
         image.update()
     w, h = int(image.size[0]), int(image.size[1])
     if w == 0 or h == 0:
-        return np.ones((1, 1, 3), dtype=np.float32), 1, 1
+        rgb = np.ones((1, 1, 3), dtype=np.float32)
+        rgb.setflags(write=False)
+        result = (rgb, 1, 1)
+        _LINEAR_RGB_CACHE[ptr] = result
+        return result
     px = np.empty(w * h * 4, dtype=np.float32)
     t_px = time.perf_counter()
     image.pixels.foreach_get(px)
     _STATS["pixel_read_s"] += time.perf_counter() - t_px
     _STATS["pixel_bytes"] += px.nbytes
     px = px.reshape((h, w, 4))
-    rgb = px[..., :3].copy()
+    rgb = np.ascontiguousarray(px[..., :3], dtype=np.float32)
     if image.colorspace_settings.name.lower().startswith("srgb"):
-        rgb = _srgb_to_linear_np(rgb).astype(np.float32)
-    return rgb, w, h
+        rgb = _srgb_to_linear_np(rgb)
+    # Freeze so downstream chain / resample steps can't accidentally mutate the
+    # shared buffer. All known apply_fn/resample/mix helpers return new arrays.
+    rgb.setflags(write=False)
+    result = (rgb, w, h)
+    _LINEAR_RGB_CACHE[ptr] = result
+    return result
 
 
 def _bake_source_to_linear(source, chain):
@@ -278,8 +308,23 @@ def _resample_bilinear(rgb, target_h: int, target_w: int):
 
 
 def _srgb_to_linear_np(x):
+    """sRGB → linear conversion, kept in float32 end-to-end.
+
+    The previous `np.power(..., 2.4)` with a Python-float exponent silently
+    promoted the whole image to f64 and `np.where` over f32+f64 operands
+    produced an f64 intermediate, so a 2K image would allocate ~50MB of f64
+    it didn't need. Using an explicit `np.float32(2.4)` + `dtype=np.float32`
+    keeps memory and arithmetic at half that.
+    """
     import numpy as np
-    return np.where(x <= 0.04045, x / 12.92, np.power((x + 0.055) / 1.055, 2.4))
+    xf = x if x.dtype == np.float32 else x.astype(np.float32)
+    lin = xf * np.float32(1.0 / 12.92)
+    gamma = np.power(
+        (xf + np.float32(0.055)) * np.float32(1.0 / 1.055),
+        np.float32(2.4),
+        dtype=np.float32,
+    )
+    return np.where(xf <= np.float32(0.04045), lin, gamma)
 
 
 def _bake_chain(pixels, w, h, colorspace, chain):
