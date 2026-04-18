@@ -20,29 +20,32 @@ def _matrix_to_row_major(m) -> list[float]:
     return [m[i][j] for i in range(4) for j in range(4)]
 
 
-def _pack_f32(xs) -> bytes:
-    # numpy .tobytes() is orders of magnitude faster than struct.pack(*xs)
-    # once N crosses a few thousand — the latter splats every float as a
-    # positional argument. Meshes and textures easily hit millions.
+def _write_f32(buf: bytearray, xs) -> dict:
+    """Append a float32 blob to `buf`. Accepts numpy arrays (zero-copy view)
+    or sequences (coerced via np.asarray). Saves a full-buffer copy vs
+    `.tobytes()` — for ~1GB of textures that's ~200ms.
+    """
     import numpy as np
-    if isinstance(xs, np.ndarray):
-        return np.ascontiguousarray(xs, dtype=np.float32).tobytes()
-    return np.asarray(xs, dtype=np.float32).tobytes()
-
-
-def _pack_u32(xs) -> bytes:
-    import numpy as np
-    if isinstance(xs, np.ndarray):
-        return np.ascontiguousarray(xs, dtype=np.uint32).tobytes()
-    return np.asarray(xs, dtype=np.uint32).tobytes()
-
-
-def _write_blob(buf: bytearray, data: bytes) -> dict:
+    arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.float32)
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
     off = len(buf)
-    buf.extend(data)
+    buf.extend(memoryview(arr).cast("B"))
     pad = (-len(buf)) & 15
-    buf.extend(b"\x00" * pad)
-    return {"offset": off, "len": len(data)}
+    if pad:
+        buf.extend(b"\x00" * pad)
+    return {"offset": off, "len": int(arr.nbytes)}
+
+
+def _write_u32(buf: bytearray, xs) -> dict:
+    import numpy as np
+    arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.uint32)
+    arr = np.ascontiguousarray(arr, dtype=np.uint32)
+    off = len(buf)
+    buf.extend(memoryview(arr).cast("B"))
+    pad = (-len(buf)) & 15
+    if pad:
+        buf.extend(b"\x00" * pad)
+    return {"offset": off, "len": int(arr.nbytes)}
 
 
 def _find_displacement(obj_eval, buf, textures):
@@ -141,15 +144,15 @@ def _export_mesh(obj_eval, buf: bytearray, textures: list) -> dict | None:
         indices = np.arange(ntri * 3, dtype=np.uint32)
 
         desc = {
-            "vertices": _write_blob(buf, _pack_f32(positions)),
-            "normals": _write_blob(buf, _pack_f32(split_normals)),
-            "uvs": _write_blob(buf, _pack_f32(uvs)) if uvs is not None else None,
-            "indices": _write_blob(buf, _pack_u32(indices)),
+            "vertices": _write_f32(buf, positions),
+            "normals": _write_f32(buf, split_normals),
+            "uvs": _write_f32(buf, uvs) if uvs is not None else None,
+            "indices": _write_u32(buf, indices),
         }
         if num_slots > 1:
             tri_mat_idx = np.empty(ntri, dtype=np.int32)
             mesh.loop_triangles.foreach_get("material_index", tri_mat_idx)
-            desc["material_indices"] = _write_blob(buf, _pack_u32(tri_mat_idx))
+            desc["material_indices"] = _write_u32(buf, tri_mat_idx)
         disp_tex, disp_strength = _find_displacement(obj_eval, buf, textures)
         if disp_tex is not None and disp_strength != 0.0:
             desc["displacement_tex"] = disp_tex
@@ -271,6 +274,9 @@ def export_scene(
     bin_path: Path,
 ):
     t0 = time.perf_counter()
+    material_export.reset_stats()
+    mesh_s = 0.0
+    slow_meshes: list[tuple] = []
     scene = depsgraph.scene_eval
     rd = scene.render
     width = int(rd.resolution_x * rd.resolution_percentage / 100.0)
@@ -320,9 +326,17 @@ def export_scene(
             mkey = f"{obj_eval.data.name}#{obj_eval.name}"
             mesh_id = mesh_cache.get(mkey)
             if mesh_id is None:
+                t_mesh = time.perf_counter()
                 mesh = _export_mesh(obj_eval, buf, textures)
+                dt_mesh = time.perf_counter() - t_mesh
+                mesh_s += dt_mesh
                 if mesh is None:
                     continue
+                if dt_mesh > 0.25:
+                    ntri = mesh["indices"]["len"] // 12  # 4 bytes/u32, 3 per tri
+                    slow_meshes.append((obj_eval.name, ntri, dt_mesh))
+                    slow_meshes.sort(key=lambda e: e[2], reverse=True)
+                    del slow_meshes[5:]
                 mesh_id = len(meshes)
                 meshes.append(mesh)
                 mesh_cache[mkey] = mesh_id
@@ -354,7 +368,9 @@ def export_scene(
     if cam_obj is None:
         raise RuntimeError("No active camera in scene")
 
+    t_world = time.perf_counter()
     world = _export_world(scene.world, buf, textures)
+    world_s = time.perf_counter() - t_world
 
     spp = max(1, int(scene.vibrt_spp))
     print(f"[vibrt] spp={spp}")
@@ -377,11 +393,57 @@ def export_scene(
         "world": world,
     }
 
-    bin_path.write_bytes(bytes(buf))
-    json_path.write_text(json.dumps(scene_json, indent=2))
+    t_bin = time.perf_counter()
+    # `write_bytes(bytes(buf))` would copy the whole bytearray once more before
+    # hitting the OS write; for ~1GB scenes that's ~200ms of pure memcpy.
+    with bin_path.open("wb") as f:
+        f.write(buf)
+    bin_write_s = time.perf_counter() - t_bin
+
+    t_dump = time.perf_counter()
+    json_blob = json.dumps(scene_json, indent=2)
+    json_dump_s = time.perf_counter() - t_dump
+
+    t_jw = time.perf_counter()
+    json_path.write_text(json_blob)
+    json_write_s = time.perf_counter() - t_jw
+
     dt = time.perf_counter() - t0
-    print(
-        f"[vibrt] exported {len(meshes)} mesh(es), {len(objects)} obj, "
-        f"{len(textures)} tex, {len(materials)} mat, "
-        f"{len(buf)/1024/1024:.1f}MB bin in {dt:.2f}s"
+    stats = material_export.pop_stats()
+    material_s = stats["material_self_s"]
+    texture_s = stats["texture_self_s"]
+    pixel_read_s = stats["pixel_read_s"]
+    bake_chain_s = stats["bake_chain_s"]
+    accounted = (
+        mesh_s + material_s + texture_s + pixel_read_s + bake_chain_s
+        + world_s + json_dump_s + bin_write_s + json_write_s
     )
+    other_s = max(0.0, dt - accounted)
+    print(
+        f"[vibrt] export {dt:.2f}s "
+        f"({len(meshes)} mesh, {len(objects)} obj, "
+        f"{len(textures)} tex, {len(materials)} mat, "
+        f"{len(buf)/1024/1024:.1f}MB bin, {stats['pixel_bytes']/1024/1024:.1f}MB px)"
+    )
+    print(
+        f"[vibrt]   mesh={mesh_s:.2f}s  material={material_s:.2f}s  "
+        f"texture={texture_s:.2f}s  pixel_read={pixel_read_s:.2f}s  "
+        f"bake_chain={bake_chain_s:.2f}s"
+    )
+    print(
+        f"[vibrt]   world={world_s:.2f}s  json_dump={json_dump_s:.2f}s  "
+        f"bin_write={bin_write_s:.2f}s  json_write={json_write_s:.2f}s  "
+        f"other={other_s:.2f}s"
+    )
+    if slow_meshes:
+        desc = ", ".join(f"{n}({t:.0f}k tri, {d:.2f}s)" for n, t, d in
+                         ((nm, ntri / 1000.0, dd) for nm, ntri, dd in slow_meshes))
+        print(f"[vibrt]   slow meshes: {desc}")
+    if stats["slow_textures"]:
+        desc = ", ".join(
+            f"{n}({w}x{h}, {d:.2f}s)" for n, w, h, d in stats["slow_textures"]
+        )
+        print(f"[vibrt]   slow textures: {desc}")
+    if stats["slow_materials"]:
+        desc = ", ".join(f"{n}({d:.2f}s)" for n, d in stats["slow_materials"])
+        print(f"[vibrt]   slow materials: {desc}")

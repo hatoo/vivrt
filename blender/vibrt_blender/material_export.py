@@ -8,13 +8,69 @@ All collapsed onto the renderer's Principled-only parameter set.
 from __future__ import annotations
 
 import math
-import struct
+import time
 
 import bpy
 
 
 _LOGGED_WARNINGS: set = set()
 _CURRENT_MATERIAL: str = ""
+
+
+# Phase timing accumulators — populated by the hot paths in this module and
+# drained by exporter.py after each `export_scene` call. Self-times subtract
+# nested child timings so the breakdown in the summary log is additive.
+_STATS: dict = {
+    "material_self_s": 0.0,
+    "texture_self_s": 0.0,
+    "pixel_read_s": 0.0,
+    "bake_chain_s": 0.0,
+    "texture_count": 0,
+    "pixel_bytes": 0,
+    "slow_textures": [],  # list of (name, w, h, seconds), only > 0.25s
+    "slow_materials": [],  # list of (name, self_seconds), only > 0.10s
+    "premix_cache_hits": 0,
+    "premix_cache_misses": 0,
+}
+
+
+# Session-scoped cache for `_try_premix_two_textures`. Same Mix(TexA, TexB,
+# fac, blend) may be reached repeatedly from different sockets on the same
+# material (profile showed 2× per material on classroom.blend), and sometimes
+# across materials that reuse textures. The bake is deterministic, so we can
+# reuse the result keyed by the same identity string the function already
+# computed for `_PreBakedTexture.cache_key`. Cleared in `reset_stats()`.
+_PREMIX_CACHE: dict = {}
+
+
+def reset_stats() -> None:
+    _STATS["material_self_s"] = 0.0
+    _STATS["texture_self_s"] = 0.0
+    _STATS["pixel_read_s"] = 0.0
+    _STATS["bake_chain_s"] = 0.0
+    _STATS["texture_count"] = 0
+    _STATS["pixel_bytes"] = 0
+    _STATS["slow_textures"].clear()
+    _STATS["slow_materials"].clear()
+    _STATS["premix_cache_hits"] = 0
+    _STATS["premix_cache_misses"] = 0
+    _PREMIX_CACHE.clear()
+
+
+def pop_stats() -> dict:
+    """Snapshot the current stats — caller is expected to `reset_stats()` first."""
+    return {
+        "material_self_s": _STATS["material_self_s"],
+        "texture_self_s": _STATS["texture_self_s"],
+        "pixel_read_s": _STATS["pixel_read_s"],
+        "bake_chain_s": _STATS["bake_chain_s"],
+        "texture_count": _STATS["texture_count"],
+        "pixel_bytes": _STATS["pixel_bytes"],
+        "slow_textures": list(_STATS["slow_textures"]),
+        "slow_materials": list(_STATS["slow_materials"]),
+        "premix_cache_hits": _STATS["premix_cache_hits"],
+        "premix_cache_misses": _STATS["premix_cache_misses"],
+    }
 
 
 def _warn(key: str, msg: str) -> None:
@@ -37,22 +93,19 @@ def _node_tag(node) -> str:
     return f"{node.name!r} ({node.bl_idname})"
 
 
-def _pack_f32(xs) -> bytes:
-    # numpy .tobytes() is orders of magnitude faster than struct.pack(*xs)
-    # for megapixel-sized textures (the latter splats every float as a
-    # positional argument).
+def _write_f32(buf: bytearray, xs) -> dict:
+    """Append a float32 blob to `buf` using a memoryview — no intermediate
+    `bytes()` copy. Saves ~200ms on a ~1GB texture set vs `.tobytes()`.
+    """
     import numpy as np
-    if isinstance(xs, np.ndarray):
-        return np.ascontiguousarray(xs, dtype=np.float32).tobytes()
-    return np.asarray(xs, dtype=np.float32).tobytes()
-
-
-def _write_blob(buf: bytearray, data: bytes) -> dict:
+    arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.float32)
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
     off = len(buf)
-    buf.extend(data)
+    buf.extend(memoryview(arr).cast("B"))
     pad = (-len(buf)) & 15
-    buf.extend(b"\x00" * pad)
-    return {"offset": off, "len": len(data)}
+    if pad:
+        buf.extend(b"\x00" * pad)
+    return {"offset": off, "len": int(arr.nbytes)}
 
 
 class _PreBakedTexture:
@@ -92,6 +145,9 @@ def export_image_texture(
     for i, t in enumerate(textures):
         if t.get("_key") == key:
             return i
+    t_enter = time.perf_counter()
+    pixel_before = _STATS["pixel_read_s"]
+    bake_before = _STATS["bake_chain_s"]
     if image.size[0] == 0 or image.size[1] == 0:
         image.update()
     width, height = image.size[0], image.size[1]
@@ -102,7 +158,10 @@ def export_image_texture(
         # `list(image.pixels[:])` iterates one Python float at a time; foreach_get
         # drops the whole buffer into a numpy array at C speed.
         pixels = np.empty(width * height * 4, dtype=np.float32)
+        t_px = time.perf_counter()
         image.pixels.foreach_get(pixels)
+        _STATS["pixel_read_s"] += time.perf_counter() - t_px
+        _STATS["pixel_bytes"] += pixels.nbytes
     if colorspace is None:
         colorspace = (
             "srgb"
@@ -116,10 +175,19 @@ def export_image_texture(
         "height": int(height),
         "channels": 4,
         "colorspace": colorspace,
-        "pixels": _write_blob(buf, _pack_f32(pixels)),
+        "pixels": _write_f32(buf, pixels),
         "_key": key,
     }
     textures.append(desc)
+    dt = time.perf_counter() - t_enter
+    children = (_STATS["pixel_read_s"] - pixel_before) + (_STATS["bake_chain_s"] - bake_before)
+    _STATS["texture_self_s"] += max(0.0, dt - children)
+    _STATS["texture_count"] += 1
+    if dt > 0.25:
+        slow = _STATS["slow_textures"]
+        slow.append((image.name, int(width), int(height), dt))
+        slow.sort(key=lambda e: e[3], reverse=True)
+        del slow[5:]
     return len(textures) - 1
 
 
@@ -137,7 +205,7 @@ def _export_prebaked(pb: "_PreBakedTexture", buf: bytearray, textures: list) -> 
         "height": int(pb.h),
         "channels": 4,
         "colorspace": "linear",
-        "pixels": _write_blob(buf, _pack_f32(pixels)),
+        "pixels": _write_f32(buf, pixels),
         "_key": pb.cache_key,
     }
     textures.append(desc)
@@ -153,7 +221,10 @@ def _image_to_linear_rgb(image):
     if w == 0 or h == 0:
         return np.ones((1, 1, 3), dtype=np.float32), 1, 1
     px = np.empty(w * h * 4, dtype=np.float32)
+    t_px = time.perf_counter()
     image.pixels.foreach_get(px)
+    _STATS["pixel_read_s"] += time.perf_counter() - t_px
+    _STATS["pixel_bytes"] += px.nbytes
     px = px.reshape((h, w, 4))
     rgb = px[..., :3].copy()
     if image.colorspace_settings.name.lower().startswith("srgb"):
@@ -178,26 +249,32 @@ def _bake_source_to_linear(source, chain):
 
 
 def _resample_bilinear(rgb, target_h: int, target_w: int):
+    """Separable bilinear resample — X pass first, then Y. The 4-corner form
+    allocated 4 × (target_h, target_w, c) intermediates per call; classroom's
+    700 → 2048 upsample made that ~200MB and ~300ms. Separable drops the
+    heaviest pass to (h, target_w, c).
+    """
     import numpy as np
     h, w, _ = rgb.shape
     if h == target_h and w == target_w:
         return rgb
-    ys = np.linspace(0.0, h - 1, target_h, dtype=np.float32)
+    # X pass: interpolate columns, shape (h, target_w, c).
     xs = np.linspace(0.0, w - 1, target_w, dtype=np.float32)
-    y0 = np.floor(ys).astype(np.int32)
-    y1 = np.minimum(y0 + 1, h - 1)
     x0 = np.floor(xs).astype(np.int32)
     x1 = np.minimum(x0 + 1, w - 1)
-    fy = (ys - y0)[:, None, None]
     fx = (xs - x0)[None, :, None]
-    a00 = rgb[y0[:, None], x0[None, :]]
-    a01 = rgb[y0[:, None], x1[None, :]]
-    a10 = rgb[y1[:, None], x0[None, :]]
-    a11 = rgb[y1[:, None], x1[None, :]]
-    return (a00 * (1 - fy) * (1 - fx)
-            + a01 * (1 - fy) * fx
-            + a10 * fy * (1 - fx)
-            + a11 * fy * fx).astype(np.float32)
+    a = rgb[:, x0, :]
+    b = rgb[:, x1, :]
+    row_interp = a + (b - a) * fx
+    # Y pass: interpolate rows, shape (target_h, target_w, c).
+    ys = np.linspace(0.0, h - 1, target_h, dtype=np.float32)
+    y0 = np.floor(ys).astype(np.int32)
+    y1 = np.minimum(y0 + 1, h - 1)
+    fy = (ys - y0)[:, None, None]
+    c0 = row_interp[y0]
+    c1 = row_interp[y1]
+    out = c0 + (c1 - c0) * fy
+    return out.astype(np.float32, copy=False)
 
 
 def _srgb_to_linear_np(x):
@@ -214,15 +291,19 @@ def _bake_chain(pixels, w, h, colorspace, chain):
     output colorspace string ("linear" once anything is baked in).
     """
     import numpy as np
-    arr = np.asarray(pixels, dtype=np.float32).reshape((h, w, 4)).copy()
-    rgb = arr[..., :3].copy()
-    if colorspace.lower() == "srgb":
-        rgb = _srgb_to_linear_np(rgb).astype(np.float32)
-    for _id, apply_fn in chain:
-        rgb = apply_fn(rgb)
-    arr[..., :3] = rgb
-    # Return numpy directly — _pack_f32 handles it without a list round-trip.
-    return arr.reshape(-1), "linear"
+    t_enter = time.perf_counter()
+    try:
+        arr = np.asarray(pixels, dtype=np.float32).reshape((h, w, 4)).copy()
+        rgb = arr[..., :3].copy()
+        if colorspace.lower() == "srgb":
+            rgb = _srgb_to_linear_np(rgb).astype(np.float32)
+        for _id, apply_fn in chain:
+            rgb = apply_fn(rgb)
+        arr[..., :3] = rgb
+        # Return numpy directly — _pack_f32 handles it without a list round-trip.
+        return arr.reshape(-1), "linear"
+    finally:
+        _STATS["bake_chain_s"] += time.perf_counter() - t_enter
 
 
 def _socket_rgb(sock) -> list[float]:
@@ -1077,6 +1158,11 @@ def _try_premix_two_textures(mix_node, group_stack):
         f"__mix2tex__|{_src_id(img_a)}|{chain_a_id!r}|{_src_id(img_b)}|"
         f"{chain_b_id!r}|{blend}|{round(fac, 6)}|{use_clamp}"
     )
+    hit = _PREMIX_CACHE.get(cache_key)
+    if hit is not None:
+        _STATS["premix_cache_hits"] += 1
+        return hit
+    _STATS["premix_cache_misses"] += 1
     rgb_a, wa, ha = _bake_source_to_linear(img_a, chain_a)
     rgb_b, wb, hb = _bake_source_to_linear(img_b, chain_b)
     out_h = max(ha, hb)
@@ -1084,7 +1170,9 @@ def _try_premix_two_textures(mix_node, group_stack):
     rgb_a = _resample_bilinear(rgb_a, out_h, out_w)
     rgb_b = _resample_bilinear(rgb_b, out_h, out_w)
     mixed = _apply_mix_blend(rgb_a, rgb_b, fac, blend, use_clamp)
-    return _PreBakedTexture(mixed, out_w, out_h, cache_key)
+    result = _PreBakedTexture(mixed, out_w, out_h, cache_key)
+    _PREMIX_CACHE[cache_key] = result
+    return result
 
 
 def _normal_perturbation(normal_sock):
@@ -1531,6 +1619,12 @@ def export_material(
     # Reset dedup state so each material emits its own set of warnings.
     _LOGGED_WARNINGS.clear()
     _CURRENT_MATERIAL = mat.name
+    # Exclude nested texture/bake children so material_self_s is additive with
+    # texture_self_s + pixel_read_s + bake_chain_s in the summary log.
+    t_enter = time.perf_counter()
+    tex_before = _STATS["texture_self_s"]
+    pixel_before = _STATS["pixel_read_s"]
+    bake_before = _STATS["bake_chain_s"]
     try:
         if not mat.use_nodes:
             p = _default_params()
@@ -1578,3 +1672,16 @@ def export_material(
         return params
     finally:
         _CURRENT_MATERIAL = ""
+        dt = time.perf_counter() - t_enter
+        children = (
+            (_STATS["texture_self_s"] - tex_before)
+            + (_STATS["pixel_read_s"] - pixel_before)
+            + (_STATS["bake_chain_s"] - bake_before)
+        )
+        self_s = max(0.0, dt - children)
+        _STATS["material_self_s"] += self_s
+        if self_s > 0.10:
+            slow = _STATS["slow_materials"]
+            slow.append((mat.name, self_s))
+            slow.sort(key=lambda e: e[1], reverse=True)
+            del slow[5:]
