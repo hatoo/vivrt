@@ -8,6 +8,7 @@
 #   make veach_mis-preview    # render preview for one scene
 #   make classroom-preview    # export + render a .blend-based scene
 #   make addon                # rebuild blender/vibrt_blender.zip
+#   make dev-install          # junction the addon into Blender's user addons dir
 #   make clean                # remove generated scene.json, scene.bin, preview.png
 #
 # Overridable:
@@ -42,7 +43,7 @@ PCT_FLAG := $(if $(strip $(PCT)),--percentage $(PCT))
 ADDON_ZIP     := blender/vibrt_blender.zip
 ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
 
-.PHONY: all scenes previews addon clean $(SCENES) $(PREVIEW_TARGETS) $(BLEND_PREVIEW_TARGETS)
+.PHONY: all scenes previews addon dev-install clean $(SCENES) $(PREVIEW_TARGETS) $(BLEND_PREVIEW_TARGETS)
 
 all: scenes
 
@@ -74,6 +75,9 @@ $(foreach s,$(BLEND_SCENES),$(eval $(call BLEND_PREVIEW_RULE,$(s))))
 
 $(ADDON_ZIP): $(ADDON_SOURCES) blender/build_addon.py
 	$(PYTHON) blender/build_addon.py
+
+dev-install:
+	$(PYTHON) blender/dev_install.py
 
 clean:
 	rm -f $(SCENE_JSONS) $(SCENE_BINS) $(PREVIEW_PNGS) $(BLEND_PREVIEW_PNGS) $(ADDON_ZIP)
