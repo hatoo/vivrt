@@ -14,7 +14,20 @@ import bpy
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "blender"))
 
+# An installed addon of the same name may already be in sys.modules — evict it
+# so the repo source is loaded instead.
+for mod_name in list(sys.modules):
+    if mod_name == "vibrt_blender" or mod_name.startswith("vibrt_blender."):
+        del sys.modules[mod_name]
+
 from vibrt_blender import exporter  # noqa: E402
+
+expected = str(REPO / "blender")
+actual = Path(exporter.__file__).resolve().parent.parent
+if str(actual) != expected:
+    raise SystemExit(
+        f"[vibrt] exporter loaded from unexpected path: {actual} (expected {expected})"
+    )
 
 
 def main() -> None:
