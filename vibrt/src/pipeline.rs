@@ -46,7 +46,7 @@ pub const GGX_LUT_SIZE: usize = 32;
 /// Monte-Carlo precompute of GGX directional albedo E(cosθ, α) and E_avg(α).
 pub fn generate_ggx_energy_lut() -> (Vec<f32>, Vec<f32>) {
     let n = GGX_LUT_SIZE;
-    let num_samples = 1024u32;
+    let num_samples = 16384u32;
     let mut e_lut = vec![0.0f32; n * n];
     let mut e_avg = vec![0.0f32; n];
     for ai in 0..n {

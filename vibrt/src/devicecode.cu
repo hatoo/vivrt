@@ -184,6 +184,56 @@ static __forceinline__ __device__ float ggx_vndf_pdf(float NoV, float NoH,
   return ggx_D(NoH, alpha) * smith_G1(NoV, alpha) / fmaxf(4.0f * NoV, 1e-12f);
 }
 
+// ---------- GGX energy compensation (Kulla-Conty) ----------
+// LUT layout matches pipeline::generate_ggx_energy_lut():
+//   e_lut[ci * n + ai]  with  cos_theta = (ci+0.5)/n,  alpha = (ai+0.5)/n
+//   e_avg[ai]           with  alpha     = (ai+0.5)/n
+#define GGX_LUT_N 32
+
+static __forceinline__ __device__ float ggx_lut_coord(float x) {
+  // Map x ∈ [0,1] to fractional texel index for center-pixel-convention LUT.
+  float t = x * (float)GGX_LUT_N - 0.5f;
+  return fminf(fmaxf(t, 0.0f), (float)(GGX_LUT_N - 1));
+}
+
+static __device__ float ggx_e_lookup(float NoV, float alpha) {
+  float fc = ggx_lut_coord(fminf(fmaxf(NoV, 0.0f), 1.0f));
+  float fa = ggx_lut_coord(fminf(fmaxf(alpha, 0.0f), 1.0f));
+  int c0 = (int)floorf(fc);
+  int a0 = (int)floorf(fa);
+  int c1 = min(c0 + 1, GGX_LUT_N - 1);
+  int a1 = min(a0 + 1, GGX_LUT_N - 1);
+  float dc = fc - (float)c0;
+  float da = fa - (float)a0;
+  const float *L = params.ggx_e_lut;
+  float v00 = L[c0 * GGX_LUT_N + a0];
+  float v10 = L[c1 * GGX_LUT_N + a0];
+  float v01 = L[c0 * GGX_LUT_N + a1];
+  float v11 = L[c1 * GGX_LUT_N + a1];
+  float v0 = v00 * (1.0f - dc) + v10 * dc;
+  float v1 = v01 * (1.0f - dc) + v11 * dc;
+  return v0 * (1.0f - da) + v1 * da;
+}
+
+static __device__ float ggx_e_avg_lookup(float alpha) {
+  float fa = ggx_lut_coord(fminf(fmaxf(alpha, 0.0f), 1.0f));
+  int a0 = (int)floorf(fa);
+  int a1 = min(a0 + 1, GGX_LUT_N - 1);
+  float da = fa - (float)a0;
+  const float *L = params.ggx_e_avg_lut;
+  return L[a0] * (1.0f - da) + L[a1] * da;
+}
+
+// Hemispherical-average Fresnel under Schlick approximation:
+//   F_avg = ∫ F_Schlick(μ) · 2μ dμ  =  (20·F0 + 1) / 21
+static __forceinline__ __device__ float f_avg_schlick(float F0) {
+  return F0 * (20.0f / 21.0f) + (1.0f / 21.0f);
+}
+static __forceinline__ __device__ float3 f_avg_schlick(float3 F0) {
+  return F0 * (20.0f / 21.0f) +
+         make_float3(1.0f / 21.0f, 1.0f / 21.0f, 1.0f / 21.0f);
+}
+
 // ---------- Path tracing payload ----------
 struct PathVertex {
   float3 P;  // hit position
@@ -455,6 +505,33 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
                       (D * G / fmaxf(4.0f * NoV * NoL, 1e-8f));
     float3 f_spec = e.metallic * f_metal +
                     (1.0f - e.metallic) * (1.0f - e.transmission) * f_dielec;
+
+    // Kulla-Conty multi-scattering compensation (reflection only).
+    float E_wo = ggx_e_lookup(NoV, e.alpha);
+    float E_wi = ggx_e_lookup(NoL, e.alpha);
+    float E_avg = ggx_e_avg_lookup(e.alpha);
+    float one_minus_Eavg = fmaxf(1.0f - E_avg, 1e-4f);
+    float f_ms_scalar =
+        (1.0f - E_wo) * (1.0f - E_wi) / fmaxf(M_PIf * one_minus_Eavg, 1e-8f);
+
+    float3 F_avg_m = f_avg_schlick(e.base_color);
+    float3 one3 = make_float3(1.0f, 1.0f, 1.0f);
+    float3 denom_m = one3 - F_avg_m * (1.0f - E_avg);
+    float3 F_ms_m = make_float3(
+        (F_avg_m.x * F_avg_m.x) * E_avg / fmaxf(denom_m.x, 1e-4f),
+        (F_avg_m.y * F_avg_m.y) * E_avg / fmaxf(denom_m.y, 1e-4f),
+        (F_avg_m.z * F_avg_m.z) * E_avg / fmaxf(denom_m.z, 1e-4f));
+    float3 f_metal_ms = F_ms_m * f_ms_scalar;
+
+    float F_avg_d = f_avg_schlick(F0_d);
+    float denom_d = fmaxf(1.0f - F_avg_d * (1.0f - E_avg), 1e-4f);
+    float F_ms_d = (F_avg_d * F_avg_d) * E_avg / denom_d;
+    float f_dielec_ms = F_ms_d * f_ms_scalar;
+
+    f_spec = f_spec + e.metallic * f_metal_ms +
+             (1.0f - e.metallic) * (1.0f - e.transmission) *
+                 make_float3(f_dielec_ms, f_dielec_ms, f_dielec_ms);
+
     r.f = r.f + f_spec * NoL;
     float pdf_spec = ggx_vndf_pdf(NoV, NoH, e.alpha);
     r.pdf += p_spec * pdf_spec;
