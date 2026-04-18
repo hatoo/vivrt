@@ -1016,7 +1016,8 @@ extern "C" __global__ void __closesthit__shadow() {
   // Not used when TERMINATE_ON_FIRST_HIT is set — kept to satisfy SBT.
 }
 
-// Shared by radiance and shadow ray types: alpha-mask cutout.
+// Shared by radiance and shadow ray types: alpha-mask cutout, plus
+// transparent-shadow pass-through for transmissive materials on shadow rays.
 extern "C" __global__ void __anyhit__ah() {
   HitGroupData *hg = (HitGroupData *)optixGetSbtDataPointer();
   unsigned int prim = optixGetPrimitiveIndex();
@@ -1025,6 +1026,13 @@ extern "C" __global__ void __anyhit__ah() {
     unsigned int mi = hg->material_indices[prim];
     if ((int)mi < hg->num_materials)
       m = hg->materials[mi];
+  }
+  // Shadow rays pass through transmissive surfaces (approximation of
+  // Cycles' transparent shadows — no color attenuation for now).
+  bool is_shadow_ray =
+      (optixGetRayFlags() & OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT) != 0;
+  if (is_shadow_ray && m->transmission > 0.5f) {
+    optixIgnoreIntersection();
   }
   if (m->alpha_threshold <= 0.0f || m->base_color_tex == nullptr)
     return;
