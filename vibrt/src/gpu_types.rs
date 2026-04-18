@@ -154,6 +154,8 @@ pub struct LaunchParams {
 
     pub ggx_e_lut: optix_sys::CUdeviceptr,
     pub ggx_e_avg_lut: optix_sys::CUdeviceptr,
+
+    pub clamp_indirect: f32,
 }
 
 #[repr(C)]

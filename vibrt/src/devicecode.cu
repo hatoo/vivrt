@@ -1093,6 +1093,14 @@ extern "C" __global__ void __miss__ms() {
 
 extern "C" __global__ void __miss__shadow() { optixSetPayload_0(1u); }
 
+static __forceinline__ __device__ float3 clamp_indirect(float3 c,
+                                                         float max_lum) {
+  if (max_lum <= 0.0f)
+    return c;
+  float l = luminance(c);
+  return (l > max_lum) ? c * (max_lum / l) : c;
+}
+
 static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
   float3 throughput = make_float3(1, 1, 1);
   float3 L = make_float3(0, 0, 0);
@@ -1118,7 +1126,10 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
         float p_env = envmap_pdf(dir);
         w = power_heuristic(prev_bsdf_pdf, p_env);
       }
-      L = L + throughput * bg * w;
+      float3 bg_contrib = throughput * bg * w;
+      if (bounce > 0)
+        bg_contrib = clamp_indirect(bg_contrib, params.clamp_indirect);
+      L = L + bg_contrib;
       break;
     }
 
@@ -1131,12 +1142,18 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
 
     // Emission (add on primary or after specular bounce)
     if (bounce == 0 || last_specular) {
-      L = L + throughput * e.emission;
+      float3 e_contrib = throughput * e.emission;
+      if (bounce > 0)
+        e_contrib = clamp_indirect(e_contrib, params.clamp_indirect);
+      L = L + e_contrib;
     }
 
     // NEE
     float3 wo = -dir;
-    L = L + throughput * direct_light(e, v.P, wo, rng);
+    float3 nee = throughput * direct_light(e, v.P, wo, rng);
+    if (bounce > 0)
+      nee = clamp_indirect(nee, params.clamp_indirect);
+    L = L + nee;
 
     // Sample BSDF for next bounce
     BsdfSample bs = sample_bsdf(e, wo, rng);

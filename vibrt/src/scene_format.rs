@@ -31,6 +31,9 @@ pub struct RenderSettings {
     pub height: u32,
     pub spp: u32,
     pub max_depth: u32,
+    /// Clamp for indirect (bounce>=1) contribution luminance. 0 disables.
+    #[serde(default)]
+    pub clamp_indirect: f32,
 }
 
 #[derive(Deserialize)]

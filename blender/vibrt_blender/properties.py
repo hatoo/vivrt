@@ -16,6 +16,7 @@ class VIBRT_PT_sampling(bpy.types.Panel):
         layout = self.layout
         layout.use_property_split = True
         layout.prop(context.scene, "vibrt_spp")
+        layout.prop(context.scene, "vibrt_clamp_indirect")
 
 
 def register():
@@ -26,9 +27,17 @@ def register():
         min=1,
         soft_max=4096,
     )
+    bpy.types.Scene.vibrt_clamp_indirect = bpy.props.FloatProperty(
+        name="Clamp Indirect",
+        description="Clamp indirect (bounce>=1) contribution luminance. 0 disables",
+        default=10.0,
+        min=0.0,
+        soft_max=100.0,
+    )
     bpy.utils.register_class(VIBRT_PT_sampling)
 
 
 def unregister():
     bpy.utils.unregister_class(VIBRT_PT_sampling)
     del bpy.types.Scene.vibrt_spp
+    del bpy.types.Scene.vibrt_clamp_indirect

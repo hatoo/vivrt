@@ -338,6 +338,7 @@ def export_scene(
             "height": height,
             "spp": spp,
             "max_depth": 8,
+            "clamp_indirect": float(scene.vibrt_clamp_indirect),
         },
         "camera": _export_camera(scene, cam_obj, aspect),
         "meshes": meshes,

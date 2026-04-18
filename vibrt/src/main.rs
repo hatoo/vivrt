@@ -38,6 +38,10 @@ struct Args {
     #[arg(short, long)]
     depth: Option<u32>,
 
+    /// Override indirect-contribution luminance clamp. 0 disables.
+    #[arg(long = "clamp-indirect")]
+    clamp_indirect: Option<f32>,
+
     /// Override image width.
     #[arg(long)]
     width: Option<u32>,
@@ -132,6 +136,9 @@ fn main() -> Result<()> {
     }
     if let Some(v) = args.depth {
         scene.file.render.max_depth = v;
+    }
+    if let Some(v) = args.clamp_indirect {
+        scene.file.render.clamp_indirect = v;
     }
     if let Some(v) = args.width {
         scene.file.render.width = v;
@@ -545,6 +552,7 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
         envmap_rotation_z_rad: envmap_rot,
         ggx_e_lut: d_ggx_e,
         ggx_e_avg_lut: d_ggx_e_avg,
+        clamp_indirect: scene.file.render.clamp_indirect,
     };
     let d_params = alloc_and_copy(&stream, &lp)?;
 
