@@ -37,25 +37,26 @@ def _write_blob(buf: bytearray, data: bytes) -> dict:
 
 
 def _export_mesh(obj_eval, buf: bytearray) -> dict | None:
+    """Export a mesh + per-triangle material indices.
+
+    Returns a dict suitable for a `MeshDesc` — always includes `material_indices`
+    when there's more than one slot, otherwise the entry is omitted.
+    """
     mesh = obj_eval.to_mesh()
     try:
         mesh.calc_loop_triangles()
         if not mesh.loop_triangles:
             return None
-        # Build indexed triangle mesh by deduplicating (vertex_index, loop UV, split-normal)
-        # Simpler: emit per-loop vertices (one vertex per triangle corner) to avoid
-        # split-normal headaches. This triples vertex count but guarantees correct
-        # shading.
         verts: list[float] = []
         normals: list[float] = []
         uvs: list[float] = []
         indices: list[int] = []
+        mat_indices: list[int] = []
         uv_layer = mesh.uv_layers.active
         uv_data = uv_layer.data if uv_layer is not None else None
-        # Blender 4.0: calc_normals_split() populates loop_triangles[*].split_normals.
-        # Blender 4.1+: auto-computed on access; the call was removed.
         if hasattr(mesh, "calc_normals_split"):
             mesh.calc_normals_split()
+        num_slots = len(obj_eval.material_slots)
         for tri in mesh.loop_triangles:
             for k in range(3):
                 li = tri.loops[k]
@@ -70,12 +71,16 @@ def _export_mesh(obj_eval, buf: bytearray) -> dict | None:
                 else:
                     uvs.extend((0.0, 0.0))
                 indices.append(len(indices))
-        return {
+            mat_indices.append(int(tri.material_index) if num_slots > 1 else 0)
+        desc = {
             "vertices": _write_blob(buf, _pack_f32(verts)),
             "normals": _write_blob(buf, _pack_f32(normals)),
             "uvs": _write_blob(buf, _pack_f32(uvs)) if uv_data else None,
             "indices": _write_blob(buf, _pack_u32(indices)),
         }
+        if num_slots > 1:
+            desc["material_indices"] = _write_blob(buf, _pack_u32(mat_indices))
+        return desc
     finally:
         obj_eval.to_mesh_clear()
 
@@ -246,18 +251,20 @@ def export_scene(
                 mesh_id = len(meshes)
                 meshes.append(mesh)
                 mesh_cache[mkey] = mesh_id
-            # Pick material slot 0 (simplest). Multi-material meshes → future work.
-            mat = None
+            slot_mat_ids: list[int] = []
             if obj_eval.material_slots:
-                mat = obj_eval.material_slots[0].material
-            mat_id = resolve_material(mat)
-            objects.append(
-                {
-                    "mesh": mesh_id,
-                    "material": mat_id,
-                    "transform": _matrix_to_row_major(inst.matrix_world),
-                }
-            )
+                for slot in obj_eval.material_slots:
+                    slot_mat_ids.append(resolve_material(slot.material))
+            if not slot_mat_ids:
+                slot_mat_ids = [resolve_material(None)]
+            obj_desc = {
+                "mesh": mesh_id,
+                "material": slot_mat_ids[0],
+                "transform": _matrix_to_row_major(inst.matrix_world),
+            }
+            if len(slot_mat_ids) > 1:
+                obj_desc["materials"] = slot_mat_ids
+            objects.append(obj_desc)
         elif obj_eval.type == "LIGHT":
             light = _export_light(obj_eval, buf, textures)
             if light is not None:

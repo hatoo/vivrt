@@ -55,6 +55,12 @@ pub struct HitGroupData {
     pub uvs: optix_sys::CUdeviceptr,
     pub num_vertices: i32,
     pub area_light_group: i32,
+    /// u32 per triangle — index into `materials[]`. 0 if null.
+    pub material_indices: optix_sys::CUdeviceptr,
+    /// PrincipledGpu* per slot. Used when `material_indices` != 0.
+    pub materials: optix_sys::CUdeviceptr,
+    pub num_materials: i32,
+    pub _pad_hg: i32,
 }
 
 #[repr(C)]

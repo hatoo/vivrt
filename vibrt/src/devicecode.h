@@ -51,6 +51,10 @@ struct HitGroupData {
   float *uvs;
   int num_vertices;
   int area_light_group;
+  unsigned int *material_indices; // nullptr => use `mat`
+  PrincipledGpu **materials;
+  int num_materials;
+  int _pad_hg;
 };
 
 struct PointLight {

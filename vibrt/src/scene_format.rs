@@ -66,6 +66,10 @@ pub struct MeshDesc {
     pub uvs: Option<BlobRef>,
     /// u32 x 3 per triangle
     pub indices: BlobRef,
+    /// u32 per triangle — index into ObjectDesc::materials.
+    /// When absent, the whole mesh uses ObjectDesc::material.
+    #[serde(default)]
+    pub material_indices: Option<BlobRef>,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +164,9 @@ pub struct TextureDesc {
 pub struct ObjectDesc {
     pub mesh: u32,
     pub material: u32,
+    /// Per-slot material IDs; used together with `MeshDesc::material_indices`.
+    #[serde(default)]
+    pub materials: Vec<u32>,
     /// 4x4 row-major matrix_world
     pub transform: [f32; 16],
 }

@@ -253,6 +253,7 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
         d_normals: optix_sys::CUdeviceptr,
         d_indices: optix_sys::CUdeviceptr,
         d_uvs: optix_sys::CUdeviceptr,
+        d_mat_indices: optix_sys::CUdeviceptr,
         num_verts: i32,
     }
     let mut _buffers: Vec<CudaSlice<u8>> = Vec::new();
@@ -319,6 +320,14 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
         } else {
             0
         };
+        let d_mat_indices = if !m.material_indices.is_empty() {
+            let s = stream.clone_htod(&m.material_indices).cuda()?;
+            let p = dptr_u32(&s, &stream);
+            _u32_buffers.push(s);
+            p
+        } else {
+            0
+        };
 
         meshes_gpu.push(MeshGpu {
             handle,
@@ -326,6 +335,7 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
             d_normals,
             d_indices: idx_ptr,
             d_uvs,
+            d_mat_indices,
             num_verts: num_verts as i32,
         });
 
@@ -339,11 +349,31 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
     // --- Build per-object SBT records (2 per object: radiance + shadow) ---
     let mut tri_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
     let mut gas_entries: Vec<GasEntry> = Vec::new();
+    let mut _mat_table_bufs: Vec<CudaSlice<u64>> = Vec::new();
     for (obj_idx, obj) in scene.objects.iter().enumerate() {
         let m = &meshes_gpu[obj.mesh as usize];
         let mat_ptr = *mat_device_ptrs
             .get(obj.material as usize)
             .ok_or_else(|| anyhow::anyhow!("object {} material index out of range", obj_idx))?;
+
+        // Per-object material table (used when the mesh has per-triangle IDs).
+        let obj_materials = &scene.file.objects[obj_idx].materials;
+        let (materials_ptr, num_materials) = if !obj_materials.is_empty() {
+            let ptrs: Vec<u64> = obj_materials
+                .iter()
+                .map(|mi| {
+                    mat_device_ptrs.get(*mi as usize).copied().unwrap_or(mat_ptr)
+                        as u64
+                })
+                .collect();
+            let slice = stream.clone_htod(&ptrs).cuda()?;
+            let (p, _) = slice.device_ptr(&stream);
+            _mat_table_bufs.push(slice);
+            (p as optix_sys::CUdeviceptr, ptrs.len() as i32)
+        } else {
+            (0, 0)
+        };
+
         let hg = HitGroupData {
             mat: mat_ptr,
             vertices: m.d_verts,
@@ -352,6 +382,10 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
             uvs: m.d_uvs,
             num_vertices: m.num_verts,
             area_light_group: -1,
+            material_indices: m.d_mat_indices,
+            materials: materials_ptr,
+            num_materials,
+            _pad_hg: 0,
         };
         tri_hg_records.push(SbtRecord::new(&hit_rg_pg, hg)?);
         tri_hg_records.push(SbtRecord::new(&hit_shadow_pg, hg)?);

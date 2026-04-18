@@ -11,6 +11,8 @@ pub struct LoadedMesh {
     pub normals: Vec<f32>,
     pub uvs: Vec<f32>,
     pub indices: Vec<u32>,
+    /// u32 per triangle; empty when the mesh is single-material.
+    pub material_indices: Vec<u32>,
 }
 
 pub struct LoadedTexture {
@@ -270,6 +272,10 @@ fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
         None => Vec::new(),
     };
     let indices = read_u32_vec(slice_bin(bin, desc.indices)?);
+    let material_indices = match desc.material_indices {
+        Some(b) => read_u32_vec(slice_bin(bin, b)?),
+        None => Vec::new(),
+    };
 
     if indices.len() % 3 != 0 {
         return Err(anyhow!("mesh index count is not a multiple of 3"));
@@ -277,12 +283,21 @@ fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
     if vertices.len() % 3 != 0 {
         return Err(anyhow!("mesh vertex count is not a multiple of 3"));
     }
+    let num_tris = indices.len() / 3;
+    if !material_indices.is_empty() && material_indices.len() != num_tris {
+        return Err(anyhow!(
+            "mesh material_indices count {} != triangle count {}",
+            material_indices.len(),
+            num_tris
+        ));
+    }
 
     Ok(LoadedMesh {
         vertices,
         normals,
         uvs,
         indices,
+        material_indices,
     })
 }
 

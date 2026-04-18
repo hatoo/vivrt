@@ -973,6 +973,11 @@ extern "C" __global__ void __closesthit__ch() {
   v->T = T;
   v->uv = uv;
   v->mat = hg->mat;
+  if (hg->material_indices != nullptr && hg->num_materials > 0) {
+    unsigned int mi = hg->material_indices[prim];
+    if ((int)mi < hg->num_materials)
+      v->mat = hg->materials[mi];
+  }
   v->hit = 1;
 }
 
@@ -983,13 +988,18 @@ extern "C" __global__ void __closesthit__shadow() {
 // Shared by radiance and shadow ray types: alpha-mask cutout.
 extern "C" __global__ void __anyhit__ah() {
   HitGroupData *hg = (HitGroupData *)optixGetSbtDataPointer();
+  unsigned int prim = optixGetPrimitiveIndex();
   PrincipledGpu *m = hg->mat;
+  if (hg->material_indices != nullptr && hg->num_materials > 0) {
+    unsigned int mi = hg->material_indices[prim];
+    if ((int)mi < hg->num_materials)
+      m = hg->materials[mi];
+  }
   if (m->alpha_threshold <= 0.0f || m->base_color_tex == nullptr)
     return;
   // Recompute UV from barycentrics.
   if (hg->uvs == nullptr)
     return;
-  unsigned int prim = optixGetPrimitiveIndex();
   int i0 = hg->indices[prim * 3 + 0];
   int i1 = hg->indices[prim * 3 + 1];
   int i2 = hg->indices[prim * 3 + 2];
