@@ -440,6 +440,198 @@ static __device__ bool shadow_visible(float3 P, float3 dir, float tmax) {
   return miss_flag != 0;
 }
 
+// ---------- Colour graph evaluator ----------
+// Register-sized cap — classroom's paintedCeiling only needs 6 nodes today.
+#define COLOR_GRAPH_MAX_NODES 32
+
+static __forceinline__ __device__ float3 mix_blend_rgb(
+    float3 a, float3 b, float fac, unsigned int blend, bool clamp_out) {
+  float facm = 1.0f - fac;
+  float3 out;
+  switch (blend) {
+    default:
+    case 0: // MIX
+      out = a * facm + b * fac;
+      break;
+    case 1: // MULTIPLY
+      out = make_float3(a.x * (facm + b.x * fac),
+                        a.y * (facm + b.y * fac),
+                        a.z * (facm + b.z * fac));
+      break;
+    case 2: // ADD
+      out = a + b * fac;
+      break;
+    case 3: // SUBTRACT
+      out = a - b * fac;
+      break;
+    case 4: // SCREEN
+      out = make_float3(1.0f, 1.0f, 1.0f) -
+            (make_float3(facm, facm, facm) + (make_float3(1.0f, 1.0f, 1.0f) - b) * fac) *
+                (make_float3(1.0f, 1.0f, 1.0f) - a);
+      break;
+    case 5: // DIVIDE — per-channel, guard against div-by-zero
+      out.x = b.x == 0.0f ? a.x : a.x * facm + a.x / b.x * fac;
+      out.y = b.y == 0.0f ? a.y : a.y * facm + a.y / b.y * fac;
+      out.z = b.z == 0.0f ? a.z : a.z * facm + a.z / b.z * fac;
+      break;
+    case 6: { // DIFFERENCE
+      float3 d = make_float3(fabsf(a.x - b.x), fabsf(a.y - b.y), fabsf(a.z - b.z));
+      out = a * facm + d * fac;
+      break;
+    }
+    case 7: // DARKEN
+      out.x = a.x * facm + fminf(a.x, b.x) * fac;
+      out.y = a.y * facm + fminf(a.y, b.y) * fac;
+      out.z = a.z * facm + fminf(a.z, b.z) * fac;
+      break;
+    case 8: // LIGHTEN (Blender's asymmetric form)
+      out.x = fmaxf(a.x, b.x * fac);
+      out.y = fmaxf(a.y, b.y * fac);
+      out.z = fmaxf(a.z, b.z * fac);
+      break;
+    case 9: { // OVERLAY per-channel
+      auto ov = [&](float ax, float bx) {
+        return ax < 0.5f ? ax * (facm + 2.0f * fac * bx)
+                         : 1.0f - (facm + 2.0f * fac * (1.0f - bx)) * (1.0f - ax);
+      };
+      out.x = ov(a.x, b.x);
+      out.y = ov(a.y, b.y);
+      out.z = ov(a.z, b.z);
+      break;
+    }
+    case 10: { // SOFT_LIGHT
+      float3 scr = make_float3(1.0f - (1.0f - b.x) * (1.0f - a.x),
+                               1.0f - (1.0f - b.y) * (1.0f - a.y),
+                               1.0f - (1.0f - b.z) * (1.0f - a.z));
+      float3 inner = make_float3(
+          (1.0f - a.x) * b.x * a.x + a.x * scr.x,
+          (1.0f - a.y) * b.y * a.y + a.y * scr.y,
+          (1.0f - a.z) * b.z * a.z + a.z * scr.z);
+      out = a * facm + inner * fac;
+      break;
+    }
+    case 11: // LINEAR_LIGHT
+      out = a + (b * 2.0f - make_float3(1.0f, 1.0f, 1.0f)) * fac;
+      break;
+  }
+  if (clamp_out) {
+    out.x = fmaxf(0.0f, fminf(1.0f, out.x));
+    out.y = fmaxf(0.0f, fminf(1.0f, out.y));
+    out.z = fmaxf(0.0f, fminf(1.0f, out.z));
+  }
+  return out;
+}
+
+static __forceinline__ __device__ float3 math_apply_rgb(
+    float3 inp, unsigned int op, float b, float c) {
+  float3 o;
+  switch (op) {
+    default:
+    case 0: // ADD
+      o = make_float3(inp.x + b, inp.y + b, inp.z + b);
+      break;
+    case 1: // SUBTRACT
+      o = make_float3(inp.x - b, inp.y - b, inp.z - b);
+      break;
+    case 2: // MULTIPLY
+      o = make_float3(inp.x * b, inp.y * b, inp.z * b);
+      break;
+    case 3: // DIVIDE
+      o = make_float3(b == 0.0f ? 0.0f : inp.x / b,
+                      b == 0.0f ? 0.0f : inp.y / b,
+                      b == 0.0f ? 0.0f : inp.z / b);
+      break;
+    case 4: // POWER
+      o = make_float3(powf(fmaxf(inp.x, 0.0f), b),
+                      powf(fmaxf(inp.y, 0.0f), b),
+                      powf(fmaxf(inp.z, 0.0f), b));
+      break;
+    case 5: // MULTIPLY_ADD
+      o = make_float3(inp.x * b + c, inp.y * b + c, inp.z * b + c);
+      break;
+    case 6: // MINIMUM
+      o = make_float3(fminf(inp.x, b), fminf(inp.y, b), fminf(inp.z, b));
+      break;
+    case 7: // MAXIMUM
+      o = make_float3(fmaxf(inp.x, b), fmaxf(inp.y, b), fmaxf(inp.z, b));
+      break;
+  }
+  return o;
+}
+
+static __device__ float3 eval_color_graph(
+    ColorGraphNode *nodes, int n_nodes, int output, float2 base_uv) {
+  float3 slots[COLOR_GRAPH_MAX_NODES];
+  int n = n_nodes < COLOR_GRAPH_MAX_NODES ? n_nodes : COLOR_GRAPH_MAX_NODES;
+  for (int i = 0; i < n; i++) {
+    ColorGraphNode nd = nodes[i];
+    unsigned int tag = nd.tag;
+    const unsigned int *pp = nd.payload;
+    if (tag == COLOR_NODE_CONST) {
+      slots[i] = make_float3(__uint_as_float(pp[0]),
+                             __uint_as_float(pp[1]),
+                             __uint_as_float(pp[2]));
+    } else if (tag == COLOR_NODE_IMAGE_TEX) {
+      unsigned long long ptr =
+          ((unsigned long long)pp[1] << 32) | (unsigned long long)pp[0];
+      const float *tex = (const float *)ptr;
+      int w = (int)pp[2];
+      int h = (int)pp[3];
+      int ch = (int)pp[4];
+      float m0 = __uint_as_float(pp[5]);
+      float m1 = __uint_as_float(pp[6]);
+      float m2 = __uint_as_float(pp[7]);
+      float m3 = __uint_as_float(pp[8]);
+      float m4 = __uint_as_float(pp[9]);
+      float m5 = __uint_as_float(pp[10]);
+      float2 uv = make_float2(m0 * base_uv.x + m1 * base_uv.y + m2,
+                              m3 * base_uv.x + m4 * base_uv.y + m5);
+      slots[i] = sample_rgba(tex, w, h, ch, uv);
+    } else if (tag == COLOR_NODE_MIX) {
+      int ia = (int)pp[0];
+      int ib = (int)pp[1];
+      unsigned int blend = pp[2];
+      unsigned int fac_src = pp[3];
+      float fac;
+      if (fac_src == 0u) {
+        fac = __uint_as_float(pp[6]);
+      } else {
+        int ifac = (int)pp[4];
+        float3 fv = slots[ifac];
+        fac = 0.2126f * fv.x + 0.7152f * fv.y + 0.0722f * fv.z;
+      }
+      bool clamp_out = pp[5] != 0u;
+      slots[i] = mix_blend_rgb(slots[ia], slots[ib], fac, blend, clamp_out);
+    } else if (tag == COLOR_NODE_INVERT) {
+      int iin = (int)pp[0];
+      float fac = __uint_as_float(pp[1]);
+      float3 cc = slots[iin];
+      float facm = 1.0f - fac;
+      slots[i] = make_float3(cc.x * facm + (1.0f - cc.x) * fac,
+                             cc.y * facm + (1.0f - cc.y) * fac,
+                             cc.z * facm + (1.0f - cc.z) * fac);
+    } else if (tag == COLOR_NODE_MATH) {
+      int iin = (int)pp[0];
+      unsigned int op = pp[1];
+      bool clamp_out = pp[2] != 0u;
+      float b = __uint_as_float(pp[3]);
+      float c = __uint_as_float(pp[4]);
+      float3 o = math_apply_rgb(slots[iin], op, b, c);
+      if (clamp_out) {
+        o.x = fmaxf(0.0f, fminf(1.0f, o.x));
+        o.y = fmaxf(0.0f, fminf(1.0f, o.y));
+        o.z = fmaxf(0.0f, fminf(1.0f, o.z));
+      }
+      slots[i] = o;
+    } else {
+      slots[i] = make_float3(1.0f, 1.0f, 1.0f);
+    }
+  }
+  if (output < 0 || output >= n)
+    return make_float3(1.0f, 1.0f, 1.0f);
+  return slots[output];
+}
+
 // ---------- Principled BSDF ----------
 struct MaterialEval {
   float3 base_color;
@@ -473,7 +665,14 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
       make_float2(M[0] * v.uv.x + M[1] * v.uv.y + M[2],
                   M[3] * v.uv.x + M[4] * v.uv.y + M[5]);
 
-  if (m->base_color_tex != nullptr) {
+  if (m->color_graph_nodes != nullptr && m->color_graph_len > 0) {
+    // Graph evaluation reads the raw mesh UV; each ImageTex node carries
+    // its own uv_transform so sources with different Mapping nodes don't
+    // get jammed into one global scale.
+    float3 g = eval_color_graph(m->color_graph_nodes, m->color_graph_len,
+                                m->color_graph_output, v.uv);
+    e.base_color = e.base_color * g;
+  } else if (m->base_color_tex != nullptr) {
     float3 t =
         sample_rgba(m->base_color_tex, m->base_color_tex_w, m->base_color_tex_h,
                     m->base_color_tex_channels, uv);
