@@ -798,13 +798,21 @@ def _blackbody_to_linear_rgb(kelvin: float) -> list[float]:
 _IDENTITY_UV = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
-def _first_mapping_node(node_tree) -> "bpy.types.Node | None":
-    """Find any ShaderNodeMapping feeding a TexImage inside this node tree."""
+def _first_teximage_uv_transform(node_tree) -> list[float] | None:
+    """Return the first non-identity UV affine attached to a TexImage's Vector
+    input in the tree, or None. Scanning the TexImage nodes directly avoids
+    picking up Mapping nodes that only drive procedurals (e.g. Noise Texture
+    for bump) — applying such a Mapping to an unlinked TexImage would stretch
+    it spuriously.
+    """
     if node_tree is None:
         return None
     for n in node_tree.nodes:
-        if n.bl_idname == "ShaderNodeMapping":
-            return n
+        if n.bl_idname != "ShaderNodeTexImage":
+            continue
+        affine = _tex_node_uv_transform(n)
+        if affine != list(_IDENTITY_UV):
+            return affine
     return None
 
 
@@ -2497,12 +2505,12 @@ def export_material(
         surface = out_node.inputs["Surface"].links[0].from_node
         params = _resolve_shader(surface, buf, textures, mat.name)
 
-        # Per-material UV transform: take the first Mapping node found.
-        mapping = _first_mapping_node(mat.node_tree)
-        if mapping is not None:
-            affine = _mapping_to_affine(mapping)
-            if affine != _IDENTITY_UV:
-                params["uv_transform"] = affine
+        # Per-material UV transform: read it off the TexImage nodes rather
+        # than picking up any Mapping node (which may drive a Noise procedural,
+        # not the actual image sample).
+        affine = _first_teximage_uv_transform(mat.node_tree)
+        if affine is not None:
+            params["uv_transform"] = affine
         return params
     finally:
         _CURRENT_MATERIAL = ""
