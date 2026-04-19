@@ -7,3 +7,4 @@ __pycache__/
 blender/vibrt_blender.zip
 .claude/
 test_scenes/classroom/
+test_scenes/uv_probe/

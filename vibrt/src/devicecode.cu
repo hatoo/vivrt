@@ -86,7 +86,10 @@ static __device__ float3 sample_rgba(const float *data, int w, int h,
   float u = uv.x - floorf(uv.x);
   float v = uv.y - floorf(uv.y);
   float fx = u * (float)w - 0.5f;
-  float fy = (1.0f - v) * (float)h - 0.5f;
+  // Blender's image.pixels (and what the exporter writes to the bin) is
+  // bottom-up: buffer row 0 is the bottom of the image. Blender UV v=0 is
+  // also the bottom, so no flip on the y axis.
+  float fy = v * (float)h - 0.5f;
   int x0 = (int)floorf(fx);
   int y0 = (int)floorf(fy);
   float dx = fx - (float)x0;
@@ -1362,7 +1365,10 @@ extern "C" __global__ void __anyhit__ah() {
   float u = uv.x - floorf(uv.x);
   float v = uv.y - floorf(uv.y);
   float fx = u * (float)w - 0.5f;
-  float fy = (1.0f - v) * (float)h - 0.5f;
+  // Blender's image.pixels (and what the exporter writes to the bin) is
+  // bottom-up: buffer row 0 is the bottom of the image. Blender UV v=0 is
+  // also the bottom, so no flip on the y axis.
+  float fy = v * (float)h - 0.5f;
   int x0 = (int)floorf(fx);
   int y0 = (int)floorf(fy);
   float dx = fx - (float)x0;
