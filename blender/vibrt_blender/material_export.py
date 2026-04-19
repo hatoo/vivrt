@@ -265,6 +265,21 @@ def _image_to_linear_rgb(image):
     _STATS["pixel_bytes"] += px.nbytes
     px = px.reshape((h, w, 4))
     rgb = np.ascontiguousarray(px[..., :3], dtype=np.float32)
+    # UV-atlas masks (classroom ceiling_AO is the canonical case) pad the
+    # unused region with RGB=0, alpha=0. In Cycles the mesh never samples
+    # these pixels, but our bake sweeps the whole texture and treats the
+    # zero-RGB padding as full occlusion — ends up as a dark patch on the
+    # ceiling. Blender's own texture node discards alpha<0.5 as holes, so
+    # match that: swap in 1.0 for neutralised pixels before any chain runs,
+    # keeping them out of MULTIPLY / bump bakes. Guarded on a real alpha
+    # hole existing to avoid perturbing opaque textures that happen to have
+    # a 4th channel.
+    alpha = px[..., 3]
+    if alpha.size > 0 and float(alpha.min()) < 0.5:
+        mask = alpha < 0.5
+        if mask.any():
+            rgb = rgb.copy()
+            rgb[mask] = 1.0
     if image.colorspace_settings.name.lower().startswith("srgb"):
         rgb = _srgb_to_linear_np(rgb)
     # Freeze so downstream chain / resample steps can't accidentally mutate the
@@ -353,6 +368,15 @@ def _bake_chain(pixels, w, h, colorspace, chain):
     try:
         arr = np.asarray(pixels, dtype=np.float32).reshape((h, w, 4)).copy()
         rgb = arr[..., :3].copy()
+        # See _image_to_linear_rgb: alpha<0.5 pixels in a UV-atlas map (e.g.
+        # ceiling_AO.png) store RGB=0 padding that Cycles never samples but
+        # our bake folds into the output. Neutralise them before any chain
+        # runs.
+        alpha = arr[..., 3]
+        if alpha.size > 0 and float(alpha.min()) < 0.5:
+            mask = alpha < 0.5
+            if mask.any():
+                rgb[mask] = 1.0
         if colorspace.lower() == "srgb":
             rgb = _srgb_to_linear_np(rgb).astype(np.float32)
         for _id, apply_fn in chain:
