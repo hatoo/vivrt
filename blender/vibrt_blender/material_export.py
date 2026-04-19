@@ -1875,8 +1875,32 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
                 memo[key] = result
             return result
 
-        # Anything else (ColorRamp, Noise, RGBCurve, Gamma, BrightContrast,
-        # NodeGroup, ...) — bail out so the caller falls back to baking.
+        if bl == "ShaderNodeValToRGB":
+            # ColorRamp: scalar in, RGB out. We fold it to a Const node when
+            # the Fac chain reduces to a constant (noise / procedural leaves
+            # fold to their mean, Math/Clamp fold through
+            # `_resolve_constant_scalar`, Mix(RGBA) folds through
+            # `_socket_constant_rgb`). Non-foldable inputs (live textures
+            # driving the ramp) would need a per-pixel LUT eval node,
+            # deferred until the GPU grows one.
+            in_sock = src.inputs.get("Fac")
+            if in_sock is None:
+                return None
+            scalar = _resolve_constant_scalar(in_sock)
+            if scalar is None:
+                rgb = _socket_constant_rgb(in_sock)
+                if rgb is None:
+                    return None
+                scalar = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+            scalar = max(0.0, min(1.0, float(scalar)))
+            color = list(src.color_ramp.evaluate(scalar))[:3]
+            idx = len(nodes)
+            nodes.append({"type": "const", "rgb": color})
+            memo[key] = idx
+            return idx
+
+        # Anything else (Noise, RGBCurve, Gamma, BrightContrast, NodeGroup,
+        # ...) — bail out so the caller falls back to baking.
         return None
 
     out_idx = emit(sock)
