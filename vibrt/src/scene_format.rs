@@ -152,6 +152,96 @@ pub struct PrincipledMaterial {
     /// the Attribute folds to a single mean, losing rim darkening.
     #[serde(default)]
     pub use_vertex_color: bool,
+    /// Optional per-pixel colour graph that replaces `base_color_tex` when
+    /// present. Lets complex Cycles shader setups (classroom's paintedCeiling
+    /// is the canonical case — Mix of two textures under different UV
+    /// mappings, then multiplied by an AO map through an Invert / Math
+    /// chain) survive the exporter without getting collapsed into a single
+    /// baked texture.
+    #[serde(default)]
+    pub color_graph: Option<ColorGraph>,
+}
+
+/// Sequential list of colour-producing nodes. Each node reads either from
+/// earlier nodes (by index) or from constants/textures; the last node's
+/// value is the material's base colour. Input indices must be strictly
+/// less than the owning node's index so the graph stays a DAG in
+/// topological order.
+#[derive(Deserialize)]
+pub struct ColorGraph {
+    pub nodes: Vec<ColorNode>,
+    /// Index of the output node. Default: last node.
+    #[serde(default)]
+    pub output: Option<u32>,
+}
+
+/// Factor input for a Mix node: either a constant scalar or a reference to
+/// another node's value (converted to luminance at evaluation time).
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum ColorFactor {
+    Const(f32),
+    Node { node: u32 },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ColorNode {
+    /// Literal RGB.
+    Const { rgb: [f32; 3] },
+    /// Sample a texture (by index into `SceneFile::textures`) with its own
+    /// UV transform applied on top of the mesh UV.
+    ImageTex {
+        tex: u32,
+        #[serde(default = "identity_uv_transform")]
+        uv: [f32; 6],
+    },
+    /// Mix two inputs with the given blend and factor. `blend` follows
+    /// Blender's naming: "mix" / "multiply" / "add" / "subtract" / "screen"
+    /// / "divide" / "difference" / "darken" / "lighten" / "overlay" /
+    /// "soft_light" / "linear_light".
+    Mix {
+        a: u32,
+        b: u32,
+        #[serde(default = "default_mix_fac")]
+        fac: ColorFactor,
+        #[serde(default = "default_blend")]
+        blend: String,
+        #[serde(default)]
+        clamp: bool,
+    },
+    /// Per-channel RGB invert with mix factor (`out = lerp(rgb, 1-rgb, fac)`).
+    Invert {
+        input: u32,
+        #[serde(default = "one_f32")]
+        fac: f32,
+    },
+    /// Scalar math on the input treated per-channel. Ops mirror
+    /// ShaderNodeMath: "add" / "subtract" / "multiply" / "divide" /
+    /// "power" / "multiply_add" / "minimum" / "maximum".
+    Math {
+        input: u32,
+        #[serde(default = "default_math_op")]
+        op: String,
+        #[serde(default)]
+        b: f32,
+        #[serde(default)]
+        c: f32,
+        #[serde(default)]
+        clamp: bool,
+    },
+}
+
+fn default_mix_fac() -> ColorFactor {
+    ColorFactor::Const(0.5)
+}
+
+fn default_blend() -> String {
+    "mix".to_string()
+}
+
+fn default_math_op() -> String {
+    "multiply".to_string()
 }
 
 fn default_sss_radius() -> [f32; 3] {
