@@ -1,8 +1,8 @@
 //! Host-side material upload for Principled BSDF.
 
 use crate::gpu_types::{
-    ColorGraphNode, PrincipledGpu, COLOR_NODE_CONST, COLOR_NODE_IMAGE_TEX, COLOR_NODE_INVERT,
-    COLOR_NODE_MATH, COLOR_NODE_MIX,
+    ColorGraphNode, PrincipledGpu, COLOR_NODE_CONST, COLOR_NODE_HUE_SAT, COLOR_NODE_IMAGE_TEX,
+    COLOR_NODE_INVERT, COLOR_NODE_MATH, COLOR_NODE_MIX,
 };
 use crate::scene_format::{ColorFactor, ColorGraph, ColorNode, PrincipledMaterial};
 use crate::scene_loader::LoadedTexture;
@@ -187,6 +187,21 @@ fn flatten_one(
             out[3] = if *clamp { 1 } else { 0 };
             out[4] = b.to_bits();
             out[5] = c.to_bits();
+        }
+        ColorNode::HueSat {
+            input,
+            hue,
+            saturation,
+            value,
+            fac,
+        } => {
+            check_ref(*input, "input")?;
+            out[0] = COLOR_NODE_HUE_SAT;
+            out[1] = *input;
+            out[2] = hue.to_bits();
+            out[3] = saturation.to_bits();
+            out[4] = value.to_bits();
+            out[5] = fac.to_bits();
         }
     }
     Ok(())

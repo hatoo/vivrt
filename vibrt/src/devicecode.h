@@ -14,6 +14,7 @@ struct ColorGraphNode {
 #define COLOR_NODE_MIX 2u
 #define COLOR_NODE_INVERT 3u
 #define COLOR_NODE_MATH 4u
+#define COLOR_NODE_HUE_SAT 5u
 
 struct PrincipledGpu {
   float base_color[3];

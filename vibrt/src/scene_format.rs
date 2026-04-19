@@ -230,6 +230,20 @@ pub enum ColorNode {
         #[serde(default)]
         clamp: bool,
     },
+    /// Blender HueSaturation: shift hue, scale saturation/value, then blend
+    /// with the original by `fac`. All scalars are constants (Blender
+    /// interprets linked ones here too but very rare).
+    HueSat {
+        input: u32,
+        #[serde(default = "half_f32")]
+        hue: f32,
+        #[serde(default = "one_f32")]
+        saturation: f32,
+        #[serde(default = "one_f32")]
+        value: f32,
+        #[serde(default = "one_f32")]
+        fac: f32,
+    },
 }
 
 fn default_mix_fac() -> ColorFactor {

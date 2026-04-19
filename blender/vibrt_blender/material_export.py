@@ -1865,15 +1865,29 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
             return idx
 
         if bl == "ShaderNodeHueSaturation":
-            # No HSV node on the GPU yet — pass the Color input through so
-            # the rest of the graph survives. Saturation tweaks are lost.
             col_sock = src.inputs.get("Color")
             if col_sock is None:
                 return None
-            result = emit(col_sock)
-            if result is not None:
-                memo[key] = result
-            return result
+            # Constants only for Hue/Sat/Val/Fac — matches Blender's common
+            # use where these are UI-tweaked sliders rather than driven.
+            for n in ("Hue", "Saturation", "Value", "Fac"):
+                s = src.inputs.get(n)
+                if s is not None and s.is_linked:
+                    return None
+            ci = emit(col_sock)
+            if ci is None:
+                return None
+            hue = _socket_f(src.inputs["Hue"]) if "Hue" in src.inputs else 0.5
+            sat = _socket_f(src.inputs["Saturation"]) if "Saturation" in src.inputs else 1.0
+            val = _socket_f(src.inputs["Value"]) if "Value" in src.inputs else 1.0
+            fac = _socket_f(src.inputs["Fac"]) if "Fac" in src.inputs else 1.0
+            idx = len(nodes)
+            nodes.append({
+                "type": "hue_sat", "input": ci,
+                "hue": hue, "saturation": sat, "value": val, "fac": fac,
+            })
+            memo[key] = idx
+            return idx
 
         if bl == "ShaderNodeValToRGB":
             # ColorRamp: scalar in, RGB out. We fold it to a Const node when

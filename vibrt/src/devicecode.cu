@@ -559,6 +559,48 @@ static __forceinline__ __device__ float3 math_apply_rgb(
   return o;
 }
 
+// RGB ↔ HSV helpers in the shape Blender uses (HSV channels in [0,1]).
+static __forceinline__ __device__ float3 rgb_to_hsv_bl(float3 c) {
+  float cmax = fmaxf(c.x, fmaxf(c.y, c.z));
+  float cmin = fminf(c.x, fminf(c.y, c.z));
+  float v = cmax;
+  float d = cmax - cmin;
+  float s = cmax > 0.0f ? d / cmax : 0.0f;
+  float h = 0.0f;
+  if (d > 0.0f) {
+    if (cmax == c.x) {
+      h = (c.y - c.z) / d + (c.y < c.z ? 6.0f : 0.0f);
+    } else if (cmax == c.y) {
+      h = (c.z - c.x) / d + 2.0f;
+    } else {
+      h = (c.x - c.y) / d + 4.0f;
+    }
+    h *= (1.0f / 6.0f);
+  }
+  return make_float3(h, s, v);
+}
+
+static __forceinline__ __device__ float3 hsv_to_rgb_bl(float3 c) {
+  float h = c.x - floorf(c.x); // wrap to [0,1)
+  float s = fmaxf(0.0f, fminf(1.0f, c.y));
+  float v = c.z;
+  float i = floorf(h * 6.0f);
+  float f = h * 6.0f - i;
+  float p = v * (1.0f - s);
+  float q = v * (1.0f - f * s);
+  float t = v * (1.0f - (1.0f - f) * s);
+  int ii = ((int)i) % 6;
+  if (ii < 0) ii += 6;
+  switch (ii) {
+    case 0: return make_float3(v, t, p);
+    case 1: return make_float3(q, v, p);
+    case 2: return make_float3(p, v, t);
+    case 3: return make_float3(p, q, v);
+    case 4: return make_float3(t, p, v);
+    default: return make_float3(v, p, q);
+  }
+}
+
 static __device__ float3 eval_color_graph(
     ColorGraphNode *nodes, int n_nodes, int output, float2 base_uv) {
   float3 slots[COLOR_GRAPH_MAX_NODES];
@@ -623,6 +665,24 @@ static __device__ float3 eval_color_graph(
         o.z = fmaxf(0.0f, fminf(1.0f, o.z));
       }
       slots[i] = o;
+    } else if (tag == COLOR_NODE_HUE_SAT) {
+      int iin = (int)pp[0];
+      float hue = __uint_as_float(pp[1]);
+      float sat = __uint_as_float(pp[2]);
+      float val = __uint_as_float(pp[3]);
+      float fac = __uint_as_float(pp[4]);
+      float3 src = slots[iin];
+      float3 hsv = rgb_to_hsv_bl(src);
+      // Blender's HueSaturation subtracts 0.5 from Hue before shifting so
+      // the default (0.5) is identity.
+      hsv.x = hsv.x + (hue - 0.5f);
+      hsv.y = fmaxf(0.0f, fminf(1.0f, hsv.y * sat));
+      hsv.z = hsv.z * val;
+      float3 shifted = hsv_to_rgb_bl(hsv);
+      float facm = 1.0f - fac;
+      slots[i] = make_float3(src.x * facm + shifted.x * fac,
+                             src.y * facm + shifted.y * fac,
+                             src.z * facm + shifted.z * fac);
     } else {
       slots[i] = make_float3(1.0f, 1.0f, 1.0f);
     }
