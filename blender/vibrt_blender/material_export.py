@@ -1889,6 +1889,67 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
             memo[key] = idx
             return idx
 
+        if bl == "ShaderNodeRGBCurve":
+            col_sock = src.inputs.get("Color")
+            fac_sock = src.inputs.get("Fac")
+            if col_sock is None:
+                return None
+            # Fac blending is rare in practice; require constant to avoid a
+            # per-pixel scalar lookup on the GPU for now.
+            if fac_sock is not None and fac_sock.is_linked:
+                return None
+            fac_val = _socket_f(fac_sock) if fac_sock is not None else 1.0
+            if abs(fac_val - 1.0) > 1e-4:
+                # Non-identity fac means we'd need to lerp with the input.
+                # Supported by reading the input twice in the graph; keep
+                # things simple and bail out when the artist has tuned Fac.
+                return None
+            ci = emit(col_sock)
+            if ci is None:
+                return None
+            # Bake the curves into a 256x3 LUT. Blender stacks per-channel
+            # curves and the combined curve — evaluate combined(per_channel(x))
+            # per sample so the LUT captures the full effect.
+            cm = src.mapping
+            cm.update()
+            curves = cm.curves
+            if len(curves) < 4:
+                return None
+            lut: list[float] = []
+            for ch in range(3):
+                for i in range(256):
+                    x = i / 255.0
+                    # CurveMap is evaluated via the parent CurveMapping.
+                    y = cm.evaluate(curves[ch], x)
+                    y = cm.evaluate(curves[3], y)
+                    lut.append(max(0.0, min(1.0, float(y))))
+            idx = len(nodes)
+            nodes.append({"type": "rgb_curve", "input": ci, "lut": lut})
+            memo[key] = idx
+            return idx
+
+        if bl == "ShaderNodeBrightContrast":
+            col_sock = src.inputs.get("Color")
+            br_sock = src.inputs.get("Bright")
+            co_sock = src.inputs.get("Contrast")
+            if col_sock is None:
+                return None
+            if (br_sock is not None and br_sock.is_linked) or (
+                co_sock is not None and co_sock.is_linked):
+                return None
+            ci = emit(col_sock)
+            if ci is None:
+                return None
+            bright = _socket_f(br_sock) if br_sock is not None else 0.0
+            contrast = _socket_f(co_sock) if co_sock is not None else 0.0
+            idx = len(nodes)
+            nodes.append({
+                "type": "bright_contrast", "input": ci,
+                "bright": bright, "contrast": contrast,
+            })
+            memo[key] = idx
+            return idx
+
         if bl == "ShaderNodeValToRGB":
             # ColorRamp: scalar in, RGB out. We fold it to a Const node when
             # the Fac chain reduces to a constant (noise / procedural leaves

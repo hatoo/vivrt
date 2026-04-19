@@ -242,15 +242,21 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
     let tex_slots = principled::upload_textures(&scene.textures, &stream, &mut _tex_buffers)?;
 
     // --- Upload materials ---
-    // Colour-graph buffers live for the lifetime of the render; stash them
-    // so their CudaSlice drops are deferred.
+    // Colour-graph buffers (node records + per-node LUT data) live for the
+    // lifetime of the render; stash them so their CudaSlice drops are
+    // deferred. Separate u32 / f32 vectors because RGBCurve LUTs are float.
     let mut _color_graph_buffers: Vec<CudaSlice<u32>> = Vec::new();
+    let mut _color_graph_lut_buffers: Vec<CudaSlice<f32>> = Vec::new();
     let mut mat_device_ptrs: Vec<optix_sys::CUdeviceptr> = Vec::new();
     for mat in &scene.file.materials {
         let graph = match &mat.color_graph {
-            Some(g) => {
-                principled::upload_color_graph(g, &tex_slots, &stream, &mut _color_graph_buffers)?
-            }
+            Some(g) => principled::upload_color_graph(
+                g,
+                &tex_slots,
+                &stream,
+                &mut _color_graph_buffers,
+                &mut _color_graph_lut_buffers,
+            )?,
             None => principled::ColorGraphGpu::default(),
         };
         let gpu = principled::make_material_data(mat, &tex_slots, graph);

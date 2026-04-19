@@ -665,6 +665,33 @@ static __device__ float3 eval_color_graph(
         o.z = fmaxf(0.0f, fminf(1.0f, o.z));
       }
       slots[i] = o;
+    } else if (tag == COLOR_NODE_RGB_CURVE) {
+      int iin = (int)pp[0];
+      unsigned long long ptr =
+          ((unsigned long long)pp[2] << 32) | (unsigned long long)pp[1];
+      const float *lut = (const float *)ptr;
+      float3 src = slots[iin];
+      auto fetch = [&](int channel, float x) {
+        float xc = fmaxf(0.0f, fminf(1.0f, x));
+        float fx = xc * 255.0f;
+        int i0 = (int)floorf(fx);
+        int i1 = i0 < 255 ? i0 + 1 : 255;
+        float t = fx - (float)i0;
+        int base = channel * 256;
+        return lut[base + i0] * (1.0f - t) + lut[base + i1] * t;
+      };
+      slots[i] = make_float3(fetch(0, src.x), fetch(1, src.y), fetch(2, src.z));
+    } else if (tag == COLOR_NODE_BRIGHT_CONTRAST) {
+      int iin = (int)pp[0];
+      float bright = __uint_as_float(pp[1]);
+      float contrast = __uint_as_float(pp[2]);
+      // Cycles: a = 1 + contrast; b = bright - contrast/2.
+      float a = 1.0f + contrast;
+      float b = bright - 0.5f * contrast;
+      float3 s = slots[iin];
+      slots[i] = make_float3(fmaxf(0.0f, a * s.x + b),
+                             fmaxf(0.0f, a * s.y + b),
+                             fmaxf(0.0f, a * s.z + b));
     } else if (tag == COLOR_NODE_HUE_SAT) {
       int iin = (int)pp[0];
       float hue = __uint_as_float(pp[1]);

@@ -1,8 +1,9 @@
 //! Host-side material upload for Principled BSDF.
 
 use crate::gpu_types::{
-    ColorGraphNode, PrincipledGpu, COLOR_NODE_CONST, COLOR_NODE_HUE_SAT, COLOR_NODE_IMAGE_TEX,
-    COLOR_NODE_INVERT, COLOR_NODE_MATH, COLOR_NODE_MIX,
+    ColorGraphNode, PrincipledGpu, COLOR_NODE_BRIGHT_CONTRAST, COLOR_NODE_CONST,
+    COLOR_NODE_HUE_SAT, COLOR_NODE_IMAGE_TEX, COLOR_NODE_INVERT, COLOR_NODE_MATH, COLOR_NODE_MIX,
+    COLOR_NODE_RGB_CURVE,
 };
 use crate::scene_format::{ColorFactor, ColorGraph, ColorNode, PrincipledMaterial};
 use crate::scene_loader::LoadedTexture;
@@ -53,6 +54,7 @@ pub fn upload_color_graph(
     textures: &[(optix_sys::CUdeviceptr, i32, i32)],
     stream: &Arc<CudaStream>,
     bufs: &mut Vec<CudaSlice<u32>>,
+    f_bufs: &mut Vec<CudaSlice<f32>>,
 ) -> Result<ColorGraphGpu> {
     if graph.nodes.len() > 255 {
         return Err(anyhow!(
@@ -60,7 +62,30 @@ pub fn upload_color_graph(
             graph.nodes.len()
         ));
     }
-    let flat = flatten_color_graph(graph, textures)?;
+    // RGBCurve nodes carry their LUT inline in JSON; allocate them per-node
+    // on the GPU so `flatten_color_graph` can splice the device pointer
+    // into the payload.
+    let mut lut_ptrs: Vec<optix_sys::CUdeviceptr> = Vec::with_capacity(graph.nodes.len());
+    for node in &graph.nodes {
+        if let ColorNode::RgbCurve { lut, .. } = node {
+            if lut.len() != 768 {
+                return Err(anyhow!(
+                    "color_graph RgbCurve.lut has {} entries (want 768)",
+                    lut.len()
+                ));
+            }
+            let slice = stream.clone_htod(lut).cuda()?;
+            let ptr = {
+                let (p, _sync) = slice.device_ptr(stream);
+                p as optix_sys::CUdeviceptr
+            };
+            f_bufs.push(slice);
+            lut_ptrs.push(ptr);
+        } else {
+            lut_ptrs.push(0);
+        }
+    }
+    let flat = flatten_color_graph(graph, textures, &lut_ptrs)?;
     // Each ColorGraphNode is 16 u32 (64 bytes). `flat` is that already, but
     // packed as a Vec<u32> for cheap htod.
     let slice = stream.clone_htod(&flat).cuda()?;
@@ -88,11 +113,12 @@ pub fn upload_color_graph(
 fn flatten_color_graph(
     graph: &ColorGraph,
     textures: &[(optix_sys::CUdeviceptr, i32, i32)],
+    lut_ptrs: &[optix_sys::CUdeviceptr],
 ) -> Result<Vec<u32>> {
     let mut out: Vec<u32> = Vec::with_capacity(graph.nodes.len() * 16);
     for (i, node) in graph.nodes.iter().enumerate() {
         let mut record = [0u32; 16];
-        flatten_one(node, i, textures, &mut record)?;
+        flatten_one(node, i, textures, lut_ptrs, &mut record)?;
         out.extend_from_slice(&record);
     }
     Ok(out)
@@ -102,6 +128,7 @@ fn flatten_one(
     node: &ColorNode,
     self_idx: usize,
     textures: &[(optix_sys::CUdeviceptr, i32, i32)],
+    lut_ptrs: &[optix_sys::CUdeviceptr],
     out: &mut [u32; 16],
 ) -> Result<()> {
     let check_ref = |r: u32, field: &str| -> Result<()> {
@@ -202,6 +229,25 @@ fn flatten_one(
             out[3] = saturation.to_bits();
             out[4] = value.to_bits();
             out[5] = fac.to_bits();
+        }
+        ColorNode::RgbCurve { input, .. } => {
+            check_ref(*input, "input")?;
+            let lut_ptr = lut_ptrs[self_idx];
+            out[0] = COLOR_NODE_RGB_CURVE;
+            out[1] = *input;
+            out[2] = lut_ptr as u32;
+            out[3] = (lut_ptr >> 32) as u32;
+        }
+        ColorNode::BrightContrast {
+            input,
+            bright,
+            contrast,
+        } => {
+            check_ref(*input, "input")?;
+            out[0] = COLOR_NODE_BRIGHT_CONTRAST;
+            out[1] = *input;
+            out[2] = bright.to_bits();
+            out[3] = contrast.to_bits();
         }
     }
     Ok(())

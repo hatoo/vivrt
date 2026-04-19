@@ -34,6 +34,8 @@ pub const COLOR_NODE_MIX: u32 = 2;
 pub const COLOR_NODE_INVERT: u32 = 3;
 pub const COLOR_NODE_MATH: u32 = 4;
 pub const COLOR_NODE_HUE_SAT: u32 = 5;
+pub const COLOR_NODE_RGB_CURVE: u32 = 6;
+pub const COLOR_NODE_BRIGHT_CONTRAST: u32 = 7;
 
 #[repr(C)]
 #[derive(Copy, Clone)]

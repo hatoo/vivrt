@@ -244,6 +244,25 @@ pub enum ColorNode {
         #[serde(default = "one_f32")]
         fac: f32,
     },
+    /// Per-channel RGB curve, pre-baked by the exporter into a `768`-entry
+    /// LUT (256 samples × 3 channels). Each channel's entry already folds
+    /// the per-channel curve through the combined curve, matching how
+    /// Blender stacks them in ShaderNodeRGBCurve.
+    RgbCurve {
+        input: u32,
+        /// 768 floats: R[0..256], G[0..256], B[0..256]. Each subarray is
+        /// the curve sampled at `i/255` and clamped to [0, 1].
+        lut: Vec<f32>,
+    },
+    /// Blender BrightContrast: `out = a * rgb + b` with Cycles' parameter
+    /// convention `a = 1 + contrast`, `b = bright - contrast/2`.
+    BrightContrast {
+        input: u32,
+        #[serde(default)]
+        bright: f32,
+        #[serde(default)]
+        contrast: f32,
+    },
 }
 
 fn default_mix_fac() -> ColorFactor {
