@@ -528,7 +528,10 @@ static __forceinline__ __device__ float3 mix_blend_rgb(
 }
 
 static __forceinline__ __device__ float3 math_apply_rgb(
-    float3 inp, unsigned int op, float b, float c) {
+    float3 inp, unsigned int op, float b, float c, bool swap) {
+  // `swap` flips operand order for non-commutative ops so the node can act as
+  // `b OP input` instead of `input OP b` — mirrors Cycles ShaderNodeMath with
+  // the texture chain on input[1]. Commutative ops ignore swap.
   float3 o;
   switch (op) {
     default:
@@ -536,20 +539,36 @@ static __forceinline__ __device__ float3 math_apply_rgb(
       o = make_float3(inp.x + b, inp.y + b, inp.z + b);
       break;
     case 1: // SUBTRACT
-      o = make_float3(inp.x - b, inp.y - b, inp.z - b);
+      if (swap) {
+        o = make_float3(b - inp.x, b - inp.y, b - inp.z);
+      } else {
+        o = make_float3(inp.x - b, inp.y - b, inp.z - b);
+      }
       break;
     case 2: // MULTIPLY
       o = make_float3(inp.x * b, inp.y * b, inp.z * b);
       break;
     case 3: // DIVIDE
-      o = make_float3(b == 0.0f ? 0.0f : inp.x / b,
-                      b == 0.0f ? 0.0f : inp.y / b,
-                      b == 0.0f ? 0.0f : inp.z / b);
+      if (swap) {
+        // b / inp, per channel. Cycles returns 0 when the denominator is 0.
+        o = make_float3(inp.x == 0.0f ? 0.0f : b / inp.x,
+                        inp.y == 0.0f ? 0.0f : b / inp.y,
+                        inp.z == 0.0f ? 0.0f : b / inp.z);
+      } else {
+        o = make_float3(b == 0.0f ? 0.0f : inp.x / b,
+                        b == 0.0f ? 0.0f : inp.y / b,
+                        b == 0.0f ? 0.0f : inp.z / b);
+      }
       break;
     case 4: // POWER
-      o = make_float3(powf(fmaxf(inp.x, 0.0f), b),
-                      powf(fmaxf(inp.y, 0.0f), b),
-                      powf(fmaxf(inp.z, 0.0f), b));
+      if (swap) {
+        float base = fmaxf(b, 0.0f);
+        o = make_float3(powf(base, inp.x), powf(base, inp.y), powf(base, inp.z));
+      } else {
+        o = make_float3(powf(fmaxf(inp.x, 0.0f), b),
+                        powf(fmaxf(inp.y, 0.0f), b),
+                        powf(fmaxf(inp.z, 0.0f), b));
+      }
       break;
     case 5: // MULTIPLY_ADD
       o = make_float3(inp.x * b + c, inp.y * b + c, inp.z * b + c);
@@ -663,7 +682,8 @@ static __device__ float3 eval_color_graph(
       bool clamp_out = pp[2] != 0u;
       float b = __uint_as_float(pp[3]);
       float c = __uint_as_float(pp[4]);
-      float3 o = math_apply_rgb(slots[iin], op, b, c);
+      bool swap = pp[5] != 0u;
+      float3 o = math_apply_rgb(slots[iin], op, b, c, swap);
       if (clamp_out) {
         o.x = fmaxf(0.0f, fminf(1.0f, o.x));
         o.y = fmaxf(0.0f, fminf(1.0f, o.y));

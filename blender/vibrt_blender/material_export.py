@@ -1858,17 +1858,18 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
                 others.append(v)
             b = others[0] if others else 0.0
             c = others[1] if len(others) > 1 else 0.0
-            # Non-commutative ops reading chain from input 1 flip operands.
-            if chain_idx == 1 and op in ("subtract", "divide", "power"):
-                # Emit as: b - chain / b / chain / b ** chain — fold via a
-                # Math-on-const plus an existing op. For now, bail out so
-                # these cases don't silently render wrong.
-                return None
+            # Non-commutative ops with the chain on input[1] swap operands
+            # on the device (so "subtract" evaluates b - rgb, matching
+            # ShaderNodeMath). Commutative ops don't care.
+            swap = chain_idx == 1 and op in ("subtract", "divide", "power")
             idx = len(nodes)
-            nodes.append({
+            node = {
                 "type": "math", "input": ci, "op": op,
                 "b": b, "c": c, "clamp": use_clamp,
-            })
+            }
+            if swap:
+                node["swap"] = True
+            nodes.append(node)
             memo[key] = idx
             return idx
 

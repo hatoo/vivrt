@@ -219,6 +219,12 @@ pub enum ColorNode {
     /// Scalar math on the input treated per-channel. Ops mirror
     /// ShaderNodeMath: "add" / "subtract" / "multiply" / "divide" /
     /// "power" / "multiply_add" / "minimum" / "maximum".
+    ///
+    /// `swap` flips operand order for non-commutative ops (subtract /
+    /// divide / power): when true the op evaluates as `b OP input` instead
+    /// of `input OP b`. Emitted when Cycles drives the second Math input
+    /// (rather than the first) with the texture chain. Ignored for
+    /// commutative ops.
     Math {
         input: u32,
         #[serde(default = "default_math_op")]
@@ -229,6 +235,8 @@ pub enum ColorNode {
         c: f32,
         #[serde(default)]
         clamp: bool,
+        #[serde(default)]
+        swap: bool,
     },
     /// Blender HueSaturation: shift hue, scale saturation/value, then blend
     /// with the original by `fac`. All scalars are constants (Blender

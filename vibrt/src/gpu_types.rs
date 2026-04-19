@@ -19,7 +19,9 @@
 ///               [6] = fac_const (float)
 ///   Invert      [0] = in, [1] = fac (float)
 ///   Math        [0] = in, [1] = op, [2] = clamp (0/1),
-///               [3] = b_const (float), [4] = c_const (float)
+///               [3] = b_const (float), [4] = c_const (float),
+///               [5] = swap (0/1) — flips operand order for non-commutative
+///                     ops (subtract/divide/power); ignored for others.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct ColorGraphNode {

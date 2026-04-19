@@ -205,6 +205,7 @@ fn flatten_one(
             b,
             c,
             clamp,
+            swap,
         } => {
             check_ref(*input, "input")?;
             let op_id = parse_math_op(op)?;
@@ -214,6 +215,7 @@ fn flatten_one(
             out[3] = if *clamp { 1 } else { 0 };
             out[4] = b.to_bits();
             out[5] = c.to_bits();
+            out[6] = if *swap { 1 } else { 0 };
         }
         ColorNode::HueSat {
             input,
