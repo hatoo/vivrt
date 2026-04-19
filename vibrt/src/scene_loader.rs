@@ -104,10 +104,14 @@ pub fn load_scene(json_path: &Path) -> Result<LoadedScene> {
                 power,
                 radius,
             } => {
-                // Blender point light: total emitted power W. Convert to radiance on sphere surface.
-                // L = power / (4π² * r²) (uniform radiance on sphere, integrates to 4π * πr² * L = 4π²r²L = power)
+                // Blender point light: total emitted power Φ W. The device samples
+                // this as a delta point, so `emission` must be intensity I = Φ/(4π)
+                // (W/sr) — the shader then computes irradiance as I/d². The old
+                // formula Φ/(4π²r²) was the outgoing radiance on the sphere
+                // surface, which only applies if we sample the surface (we don't);
+                // using it as I made pendants ~1/(πr²) times too bright.
                 let r = radius.max(1e-3);
-                let coeff = power / (4.0 * std::f32::consts::PI * std::f32::consts::PI * r * r);
+                let coeff = power / (4.0 * std::f32::consts::PI);
                 let emission = [color[0] * coeff, color[1] * coeff, color[2] * coeff];
                 point_lights.push(PointLight {
                     position,
