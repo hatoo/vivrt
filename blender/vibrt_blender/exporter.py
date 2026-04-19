@@ -536,6 +536,13 @@ def export_scene(
             }
             if len(slot_mat_ids) > 1:
                 obj_desc["materials"] = slot_mat_ids
+            # Cycles' object Ray Visibility → Shadow. The source object carries
+            # the flag (instances inherit it). Classroom's paper-lantern shades
+            # use this to let the inner point light escape the drum; without
+            # the hint the drum occludes NEE and we get characteristic
+            # rectangular shadow-cutouts on the ceiling.
+            if not getattr(obj, "visible_shadow", True):
+                obj_desc["cast_shadow"] = False
             objects.append(obj_desc)
         elif obj_eval.type == "LIGHT":
             light = _export_light(obj_eval, buf, textures)

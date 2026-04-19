@@ -324,7 +324,14 @@ pub struct ObjectDesc {
     pub materials: Vec<u32>,
     /// 4x4 row-major matrix_world
     pub transform: [f32; 16],
+    /// Cycles' object "Ray Visibility → Shadow". When false, shadow rays skip
+    /// this instance — matches Cycles' use of paper-lantern shades that are
+    /// camera-visible but transparent to NEE.
+    #[serde(default = "default_true")]
+    pub cast_shadow: bool,
 }
+
+fn default_true() -> bool { true }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

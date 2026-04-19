@@ -432,8 +432,10 @@ static __device__ EnvSample sample_envmap(RNG &rng) {
 // payload[0]=1 meaning "reached infinity = light visible".
 static __device__ bool shadow_visible(float3 P, float3 dir, float tmax) {
   unsigned int miss_flag = 0;
+  // Mask bit 1 = "blocks shadow rays"; instances with cast_shadow=false clear
+  // it (e.g. classroom's paper-lantern drum) so NEE sees through them.
   optixTrace(params.traversable, P, dir, 1e-4f, tmax - 1e-3f, 0.0f,
-             OptixVisibilityMask(255),
+             OptixVisibilityMask(0x02),
              OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT |
                  OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
              1, 2, 1, miss_flag);
@@ -1449,7 +1451,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
     unsigned int hi, lo;
     pack_ptr(&v, hi, lo);
     optixTrace(params.traversable, origin, dir, 1e-4f, 1e20f, 0.0f,
-               OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
+               OptixVisibilityMask(0x01), OPTIX_RAY_FLAG_NONE,
                0, // SBT offset (radiance ray type)
                2, // SBT stride (2 ray types: radiance + shadow)
                0, // miss index (radiance miss)

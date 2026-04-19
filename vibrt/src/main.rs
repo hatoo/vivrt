@@ -114,6 +114,7 @@ struct GasEntry {
     handle: optix_sys::OptixTraversableHandle,
     sbt_offset: u32,
     transform: [f32; 12],
+    cast_shadow: bool,
 }
 
 fn main() -> Result<()> {
@@ -425,6 +426,7 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
             handle: m.handle,
             sbt_offset: (obj_idx as u32) * 2,
             transform: obj.transform,
+            cast_shadow: scene.file.objects[obj_idx].cast_shadow,
         });
     }
 
@@ -432,6 +434,8 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
     if gas_entries.is_empty() {
         anyhow::bail!("no geometry in scene");
     }
+    // Visibility mask bits: 0x01 = visible to radiance rays (everyone),
+    // 0x02 = blocks shadow rays (default; off for objects with cast_shadow=false).
     let instances: Vec<optix_sys::OptixInstance> = gas_entries
         .iter()
         .enumerate()
@@ -439,7 +443,7 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
             transform: e.transform,
             instanceId: i as u32,
             sbtOffset: e.sbt_offset,
-            visibilityMask: 255,
+            visibilityMask: if e.cast_shadow { 0x03 } else { 0x01 },
             flags: optix_sys::OptixInstanceFlags::OPTIX_INSTANCE_FLAG_NONE.0 as u32,
             traversableHandle: e.handle,
             pad: [0; 2],
