@@ -1007,13 +1007,14 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
       float cD = ggx_D(NoH, coat_alpha);
       float cG = smith_G1(NoV, coat_alpha) * smith_G1(NoL, coat_alpha);
       float coat_f = coat_w * Fc * cD * cG / fmaxf(4.0f * NoV * NoL, 1e-8f);
-      // Attenuate existing lobes by the coat "loss" at view+light directions.
-      float loss = coat_w * 0.5f * (schlick_scalar(NoV, cF0) +
-                                    schlick_scalar(NoL, cF0));
-      r.f = r.f * (1.0f - loss);
+      // Round-trip coat transmission attenuates base lobes: (1-F) on entry
+      // and on exit. Coat is not a sampling lobe, so its density stays out
+      // of r.pdf (adding it there would bias MIS without the sampler ever
+      // being able to produce a coat-distributed direction).
+      float T_view = 1.0f - coat_w * schlick_scalar(NoV, cF0);
+      float T_light = 1.0f - coat_w * schlick_scalar(NoL, cF0);
+      r.f = r.f * (T_view * T_light);
       r.f = r.f + make_float3(coat_f, coat_f, coat_f) * NoL;
-      float pdf_coat = ggx_vndf_pdf(NoV, NoH, coat_alpha);
-      r.pdf += coat_w * pdf_coat; // add (unnormalised) coat sampling weight
     }
 
     // --- Sheen: soft angular cosine lobe on top of diffuse. ---
@@ -1034,31 +1035,37 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
       r.pdf += p_diff * w_wrap * INV_PIf * sss_w;
     }
   } else if (transmit) {
-    // Rough dielectric transmission: evaluate using Walter et al. BTDF.
+    // Rough dielectric transmission (Walter et al.). Half-vector
+    // h ∝ η_i·ωo + η_t·ωi → divide by η_i, so with eta = η_t/η_i the form is
+    // `wo + wi * eta`. This matches the H the VNDF sampler implicitly used
+    // in sample_bsdf, so eval's pdf can be inverted back to sampler's pdf.
     float eta = e.ior;
     float3 n_oriented = NoV > 0.0f ? e.Ns : -e.Ns;
     if (NoV < 0.0f)
       eta = 1.0f / eta;
-    float3 H = -normalize3(wo * eta + wi);
+    float3 H = -normalize3(wo + wi * eta);
     if (dot3(H, n_oriented) < 0.0f)
       H = -H;
     float VoH = dot3(wo, H);
     float LoH = dot3(wi, H);
-    float NoH = dot3(e.Ns, H);
+    float abs_VoH = fabsf(VoH);
+    float abs_LoH = fabsf(LoH);
+    float abs_NoH = fabsf(dot3(e.Ns, H));
+    float abs_NoV = fabsf(NoV);
+    float abs_NoL = fabsf(NoL);
     float F = fresnel_dielectric(VoH, eta);
-    float D = ggx_D(fmaxf(NoH, 0.0f), e.alpha);
-    float G = smith_G1(fabsf(NoV), e.alpha) * smith_G1(fabsf(NoL), e.alpha);
-    float denom =
-        (eta * VoH + LoH) * (eta * VoH + LoH) * fabsf(NoV) * fabsf(NoL);
-    float btdf =
-        (fabsf(VoH) * fabsf(LoH) * (1.0f - F) * D * G) / fmaxf(denom, 1e-8f);
-    float3 tint = e.base_color;
-    r.f = tint * btdf * fabsf(NoL) * w_trans;
-    // Approximate pdf: Jacobian of half-vector to wi
-    float jacobian =
-        fabsf(LoH) / fmaxf((eta * VoH + LoH) * (eta * VoH + LoH), 1e-8f);
-    float pdf_h = ggx_D(fmaxf(NoH, 0.0f), e.alpha) * fmaxf(NoH, 0.0f);
-    r.pdf += p_trans * pdf_h * jacobian;
+    float D = ggx_D(abs_NoH, e.alpha);
+    float G1_v = smith_G1(abs_NoV, e.alpha);
+    float G = G1_v * smith_G1(abs_NoL, e.alpha);
+    float sqrt_den = VoH + eta * LoH;
+    float den2 = fmaxf(sqrt_den * sqrt_den, 1e-8f);
+    float btdf = (1.0f - F) * D * G * eta * eta * abs_VoH * abs_LoH /
+                 (abs_NoV * abs_NoL * den2);
+    r.f = e.base_color * btdf * abs_NoL * w_trans;
+    // pdf_wi = p_trans · P(refract branch) · VNDF(H) · |dH/dwi|.
+    float pdf_h = D * G1_v * abs_VoH / fmaxf(abs_NoV, 1e-12f);
+    float jacobian = eta * eta * abs_LoH / den2;
+    r.pdf += p_trans * (1.0f - F) * pdf_h * jacobian;
   }
   return r;
 }
@@ -1114,7 +1121,10 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
     if (dot3(e.Ns, wi) <= 0.0f)
       return s;
     s.wi = wi;
-    if (e.alpha < 0.02f * 0.02f)
+    // Fires when roughness has been clamped to the minimum (author asked for
+    // a mirror); NEE can't find such a narrow lobe, so flag as specular and
+    // let trace_path add BSDF-sampled emission directly.
+    if (e.alpha <= 0.02f * 0.02f)
       s.specular = true;
   } else {
     // Rough-dielectric transmission
@@ -1141,7 +1151,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
       if (dot3(e.Ns, s.wi) >= 0.0f)
         return s;
     }
-    if (e.alpha < 0.02f * 0.02f)
+    if (e.alpha <= 0.02f * 0.02f)
       s.specular = true;
   }
 
