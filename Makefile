@@ -33,8 +33,9 @@ PREVIEW_TARGETS := $(addsuffix -preview,$(SCENES))
 # .blend-based scenes: one entry per test_scenes/<name>/ directory that is
 # driven by a .blend file. Listed explicitly so a missing entry is obvious.
 BLEND_SCENE_classroom := test_scenes/classroom/classroom/classroom.blend
+BLEND_SCENE_bmw27     := test_scenes/bmw27/bmw27/bmw27_gpu.blend
 
-BLEND_SCENES          := classroom
+BLEND_SCENES          := classroom bmw27
 BLEND_PREVIEW_PNGS    := $(foreach s,$(BLEND_SCENES),test_scenes/$(s)/preview.png)
 BLEND_PREVIEW_TARGETS := $(addsuffix -preview,$(BLEND_SCENES))
 
