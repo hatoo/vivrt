@@ -7,6 +7,8 @@
 #   make previews             # regenerate scenes and render preview.png for each
 #   make veach_mis-preview    # render preview for one scene
 #   make classroom-preview    # export + render a .blend-based scene
+#   make classroom-cycles     # render a .blend-based scene with Cycles (reference)
+#   make cycles-previews      # render every .blend scene with Cycles
 #   make addon                # rebuild blender/vibrt_blender.zip
 #   make dev-install          # junction the addon into Blender's user addons dir
 #   make clean                # remove generated scene.json, scene.bin, preview.png
@@ -38,13 +40,15 @@ BLEND_SCENE_bmw27     := test_scenes/bmw27/bmw27/bmw27_gpu.blend
 BLEND_SCENES          := classroom bmw27
 BLEND_PREVIEW_PNGS    := $(foreach s,$(BLEND_SCENES),test_scenes/$(s)/preview.png)
 BLEND_PREVIEW_TARGETS := $(addsuffix -preview,$(BLEND_SCENES))
+BLEND_CYCLES_PNGS     := $(foreach s,$(BLEND_SCENES),test_scenes/$(s)/preview_cycles.png)
+BLEND_CYCLES_TARGETS  := $(addsuffix -cycles,$(BLEND_SCENES))
 
 PCT_FLAG := $(if $(strip $(PCT)),--percentage $(PCT))
 
 ADDON_ZIP     := blender/vibrt_blender.zip
 ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
 
-.PHONY: all scenes previews addon dev-install clean FORCE $(SCENES) $(PREVIEW_TARGETS) $(BLEND_PREVIEW_TARGETS)
+.PHONY: all scenes previews cycles-previews addon dev-install clean FORCE $(SCENES) $(PREVIEW_TARGETS) $(BLEND_PREVIEW_TARGETS) $(BLEND_CYCLES_TARGETS)
 
 FORCE:
 
@@ -52,6 +56,7 @@ all: scenes
 
 scenes: $(SCENE_JSONS)
 previews: $(PREVIEW_PNGS) $(BLEND_PREVIEW_PNGS)
+cycles-previews: $(BLEND_CYCLES_PNGS)
 addon: $(ADDON_ZIP)
 
 # Shorthand: `make <scene>` regenerates scene.json;
@@ -59,6 +64,7 @@ addon: $(ADDON_ZIP)
 $(SCENES): %: test_scenes/%/scene.json
 $(PREVIEW_TARGETS): %-preview: test_scenes/%/preview.png
 $(BLEND_PREVIEW_TARGETS): %-preview: test_scenes/%/preview.png
+$(BLEND_CYCLES_TARGETS): %-cycles: test_scenes/%/preview_cycles.png
 
 # Running make_scene.py writes scene.json and scene.bin side-by-side.
 test_scenes/%/scene.json: test_scenes/%/make_scene.py
@@ -76,6 +82,13 @@ test_scenes/$(1)/preview.png: $$(BLEND_SCENE_$(1)) $$(ADDON_SOURCES) scripts/ren
 endef
 $(foreach s,$(BLEND_SCENES),$(eval $(call BLEND_PREVIEW_RULE,$(s))))
 
+# Reference render via Cycles, for side-by-side comparison with vibrt output.
+define BLEND_CYCLES_RULE
+test_scenes/$(1)/preview_cycles.png: $$(BLEND_SCENE_$(1)) scripts/render_cycles.py scripts/_blender_cycles.py FORCE
+	$$(PYTHON) scripts/render_cycles.py $$< --output $$@ --spp $$(SPP) $$(PCT_FLAG)
+endef
+$(foreach s,$(BLEND_SCENES),$(eval $(call BLEND_CYCLES_RULE,$(s))))
+
 $(ADDON_ZIP): $(ADDON_SOURCES) blender/build_addon.py
 	$(PYTHON) blender/build_addon.py
 
@@ -83,4 +96,4 @@ dev-install:
 	$(PYTHON) blender/dev_install.py
 
 clean:
-	rm -f $(SCENE_JSONS) $(SCENE_BINS) $(PREVIEW_PNGS) $(BLEND_PREVIEW_PNGS) $(ADDON_ZIP)
+	rm -f $(SCENE_JSONS) $(SCENE_BINS) $(PREVIEW_PNGS) $(BLEND_PREVIEW_PNGS) $(BLEND_CYCLES_PNGS) $(ADDON_ZIP)
