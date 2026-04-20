@@ -196,13 +196,31 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
     # FOV. Use the "vertical FOV" approximation from `angle_y`.
     fov_y = cam.angle_y
     matrix = _matrix_to_row_major(cam_obj.matrix_world)
+    if cam.dof.use_dof:
+        # Cycles convention: aperture radius [m] = (focal_length_mm / 1000) / (2 * fstop)
+        fstop = cam.dof.aperture_fstop
+        lens_radius = (cam.lens * 1e-3) / (2.0 * fstop) if fstop > 0.0 else 0.0
+        # If focus_object is set, Cycles uses the distance from the camera to the
+        # object along the camera's view axis (-Z in camera space); otherwise the
+        # numeric focus_distance field. focus_distance defaults to 0 when an
+        # object is in use, so falling back to it would collapse DOF to ~0m.
+        focus_obj = cam.dof.focus_object
+        if focus_obj is not None:
+            cam_mat = cam_obj.matrix_world
+            cam_pos = cam_mat.translation
+            forward = -cam_mat.col[2].to_3d().normalized()  # camera looks down -Z
+            delta = focus_obj.matrix_world.translation - cam_pos
+            focal_distance = max(delta.dot(forward), 0.001)
+        else:
+            focal_distance = max(cam.dof.focus_distance, 0.001)
+    else:
+        lens_radius = 0.0
+        focal_distance = 1.0
     return {
         "transform": matrix,
         "fov_y_rad": fov_y,
-        "lens_radius": 0.0,
-        "focal_distance": max(cam.dof.focus_distance, 0.001)
-        if cam.dof.use_dof
-        else 1.0,
+        "lens_radius": lens_radius,
+        "focal_distance": focal_distance,
     }
 
 
