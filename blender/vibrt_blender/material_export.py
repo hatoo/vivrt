@@ -2072,6 +2072,8 @@ def _resolve_shader(node, buf, textures, mat_name: str) -> dict:
         return _from_diffuse(node, buf, textures)
     if bl == "ShaderNodeBsdfTransparent":
         return _from_transparent(node, buf, textures)
+    if bl == "ShaderNodeBsdfSheen" or bl == "ShaderNodeBsdfVelvet":
+        return _from_sheen(node, buf, textures)
     if bl == "ShaderNodeMixShader":
         return _from_mix(node, buf, textures, mat_name)
     if bl == "ShaderNodeBsdfGlass":
@@ -2370,6 +2372,28 @@ def _from_transparent(node, buf, textures) -> dict:
         p["alpha_threshold"] = 0.5
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
+    return p
+
+
+def _from_sheen(node, buf, textures) -> dict:
+    """Velvet / Sheen BSDF → Principled with only the sheen lobe active.
+
+    base_color=0 kills the Lambert diffuse; metallic=0 keeps the spec lobe
+    dielectric and roughness=1 makes it near-Lambertian so it contributes
+    little. The grazing-angle colour lives in sheen_tint.
+    """
+    p = _default_params()
+    p["base_color"] = [0.0, 0.0, 0.0]
+    p["metallic"] = 0.0
+    p["roughness"] = 1.0
+    p["sheen_weight"] = 1.0
+    color_sock = node.inputs.get("Color")
+    if color_sock is not None:
+        p["sheen_tint"] = _socket_rgb(color_sock)
+    rough_sock = node.inputs.get("Roughness")
+    if rough_sock is not None:
+        p["sheen_roughness"] = _socket_f(rough_sock)
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
     return p
 
 
