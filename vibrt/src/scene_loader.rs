@@ -56,10 +56,9 @@ pub fn load_scene(json_path: &Path) -> Result<LoadedScene> {
 
     let scene_dir: PathBuf = json_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let binary_path = scene_dir.join(&file.binary);
-    let binary_file = std::fs::File::open(&binary_path)
-        .with_context(|| format!("opening {}", binary_path.display()))?;
-    let mmap = unsafe { memmap2::Mmap::map(&binary_file) }.context("mmap of scene.bin failed")?;
-    let bin: &[u8] = &mmap;
+    let bin = std::fs::read(&binary_path)
+        .with_context(|| format!("reading {}", binary_path.display()))?;
+    let bin: &[u8] = &bin;
 
     let textures = file
         .textures
