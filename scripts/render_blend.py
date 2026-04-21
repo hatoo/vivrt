@@ -30,6 +30,8 @@ def main() -> int:
     ap.add_argument("--output", "-o", type=Path, default=Path("render.png"))
     ap.add_argument("--spp", type=int, default=128)
     ap.add_argument("--max-depth", type=int, default=None)
+    ap.add_argument("--denoise", action="store_true",
+                    help="run the OptiX AI denoiser on the final image")
     ap.add_argument("--percentage", type=int, default=None,
                     help="override render resolution percentage (e.g. 25 for 1/4 size)")
     ap.add_argument("--scene", default=None,
@@ -77,6 +79,8 @@ def main() -> int:
                      "--output", str(args.output.resolve())]
         if args.max_depth is not None:
             vibrt_cmd += ["--depth", str(args.max_depth)]
+        if args.denoise:
+            vibrt_cmd += ["--denoise"]
         subprocess.run(vibrt_cmd, check=True)
         print(f"Done: {args.output}")
         return 0

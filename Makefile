@@ -18,11 +18,13 @@
 #   VIBRT   (default: ./target/release/vibrt.exe)
 #   SPP     (default: 128)
 #   PCT     (unset): render resolution percentage for .blend scenes, e.g. PCT=25
+#   DENOISE (unset): set to 1 to run the OptiX AI denoiser on the output
 
-PYTHON ?= py
-VIBRT  ?= ./target/release/vibrt.exe
-SPP    ?= 128
-PCT    ?=
+PYTHON  ?= py
+VIBRT   ?= ./target/release/vibrt.exe
+SPP     ?= 128
+PCT     ?=
+DENOISE ?=
 
 SCENE_SCRIPTS := $(wildcard test_scenes/*/make_scene.py)
 SCENES        := $(patsubst test_scenes/%/make_scene.py,%,$(SCENE_SCRIPTS))
@@ -43,7 +45,8 @@ BLEND_PREVIEW_TARGETS := $(addsuffix -preview,$(BLEND_SCENES))
 BLEND_CYCLES_PNGS     := $(foreach s,$(BLEND_SCENES),test_scenes/$(s)/preview_cycles.png)
 BLEND_CYCLES_TARGETS  := $(addsuffix -cycles,$(BLEND_SCENES))
 
-PCT_FLAG := $(if $(strip $(PCT)),--percentage $(PCT))
+PCT_FLAG     := $(if $(strip $(PCT)),--percentage $(PCT))
+DENOISE_FLAG := $(if $(strip $(DENOISE)),--denoise)
 
 ADDON_ZIP     := blender/vibrt_blender.zip
 ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
@@ -71,14 +74,14 @@ test_scenes/%/scene.json: test_scenes/%/make_scene.py
 	cd $(dir $<) && $(PYTHON) make_scene.py
 
 test_scenes/%/preview.png: test_scenes/%/scene.json FORCE
-	$(VIBRT) $< --spp $(SPP) --output $@
+	$(VIBRT) $< --spp $(SPP) --output $@ $(DENOISE_FLAG)
 
 # .blend scenes go via scripts/render_blend.py, which spawns Blender to export
 # then runs vibrt. Rebuilds when the .blend or the addon's Python sources
 # change (the latter because material_export.py changes the exported scene).
 define BLEND_PREVIEW_RULE
 test_scenes/$(1)/preview.png: $$(BLEND_SCENE_$(1)) $$(ADDON_SOURCES) scripts/render_blend.py scripts/_blender_export.py FORCE
-	$$(PYTHON) scripts/render_blend.py $$< --output $$@ --spp $$(SPP) --vibrt $$(VIBRT) $$(PCT_FLAG)
+	$$(PYTHON) scripts/render_blend.py $$< --output $$@ --spp $$(SPP) --vibrt $$(VIBRT) $$(PCT_FLAG) $$(DENOISE_FLAG)
 endef
 $(foreach s,$(BLEND_SCENES),$(eval $(call BLEND_PREVIEW_RULE,$(s))))
 
