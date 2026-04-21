@@ -77,7 +77,24 @@ pub fn load_scene(json_path: &Path) -> Result<LoadedScene> {
                 let tex = textures.get(tex_id as usize).ok_or_else(|| {
                     anyhow!("mesh {} displacement_tex index out of range", mi)
                 })?;
-                apply_displacement(&mut meshes[mi], tex, s);
+                let m = &mut meshes[mi];
+                if m.uvs.is_empty() {
+                    eprintln!(
+                        "[vibrt] warn: mesh {} has displacement_tex but no UVs \
+                         — displacement skipped",
+                        mi
+                    );
+                    continue;
+                }
+                if m.normals.is_empty() {
+                    eprintln!(
+                        "[vibrt] warn: mesh {} has displacement_tex but no \
+                         normals — displacement skipped",
+                        mi
+                    );
+                    continue;
+                }
+                apply_displacement(m, tex, s);
             }
         }
     }
@@ -314,6 +331,8 @@ fn sample_heightmap(tex: &LoadedTexture, u: f32, v: f32) -> f32 {
 }
 
 fn apply_displacement(mesh: &mut LoadedMesh, tex: &LoadedTexture, strength: f32) {
+    // Missing UVs/normals are caught by the caller with a warning; keep the
+    // guard as a defensive no-op in case the invariant ever changes.
     if mesh.uvs.is_empty() || mesh.normals.is_empty() {
         return;
     }

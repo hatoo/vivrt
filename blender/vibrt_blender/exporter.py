@@ -68,12 +68,22 @@ def _find_displacement(obj_eval, buf, textures):
         if disp is None or not disp.is_linked:
             continue
         src = disp.links[0].from_node
+        tag = f"{obj_eval.name!r}/{mat.name!r}"
         strength = 1.0
         if src.bl_idname == "ShaderNodeDisplacement":
             if "Scale" in src.inputs:
+                if src.inputs["Scale"].is_linked:
+                    print(
+                        f"[vibrt] warn: {tag}: Displacement Scale input is "
+                        f"linked — using constant default ({src.inputs['Scale'].default_value})"
+                    )
                 strength = float(src.inputs["Scale"].default_value)
             height_sock = src.inputs.get("Height")
             if height_sock is None or not height_sock.is_linked:
+                print(
+                    f"[vibrt] warn: {tag}: Displacement.Height is not connected "
+                    f"— displacement ignored"
+                )
                 continue
             upstream = height_sock.links[0].from_node
             if upstream.bl_idname == "ShaderNodeTexImage" and upstream.image is not None:
@@ -82,12 +92,23 @@ def _find_displacement(obj_eval, buf, textures):
                     upstream.image, buf, textures, "linear"
                 )
                 return tex_id, strength
+            print(
+                f"[vibrt] warn: {tag}: Displacement.Height driven by "
+                f"{upstream.bl_idname} (expected ShaderNodeTexImage) "
+                f"— displacement ignored"
+            )
         elif src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
             from . import material_export
             tex_id = material_export.export_image_texture(
                 src.image, buf, textures, "linear"
             )
             return tex_id, strength
+        else:
+            print(
+                f"[vibrt] warn: {tag}: Displacement output driven by "
+                f"{src.bl_idname} (expected ShaderNodeDisplacement or "
+                f"ShaderNodeTexImage) — displacement ignored"
+            )
     return None, 0.0
 
 
@@ -258,6 +279,11 @@ def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
         return 1.0, (1.0, 1.0, 1.0)
     src = surf.links[0].from_node
     if src.bl_idname != "ShaderNodeEmission":
+        print(
+            f"[vibrt] warn: light {light.name!r}: Surface driven by "
+            f"{src.bl_idname} (expected ShaderNodeEmission) — using "
+            f"light.energy × light.color unchanged"
+        )
         return 1.0, (1.0, 1.0, 1.0)
     s_sock = src.inputs.get("Strength")
     c_sock = src.inputs.get("Color")
@@ -273,9 +299,19 @@ def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
             inner = up.inputs.get("Strength")
             strength = float(inner.default_value) if inner is not None and not inner.is_linked else 1.0
         else:
+            print(
+                f"[vibrt] warn: light {light.name!r}: Emission Strength is "
+                f"driven by {up.bl_idname} (expected ShaderNodeLightFalloff) "
+                f"— using strength=1.0"
+            )
             strength = 1.0
     else:
         strength = float(s_sock.default_value)
+    if c_sock is not None and c_sock.is_linked:
+        print(
+            f"[vibrt] warn: light {light.name!r}: Emission Color is linked "
+            f"— using light.color unchanged (shader color graph ignored)"
+        )
     if c_sock is not None and not c_sock.is_linked:
         cv = c_sock.default_value
         color = (float(cv[0]), float(cv[1]), float(cv[2]))
@@ -326,6 +362,10 @@ def _export_light(obj, buf: bytearray, textures: list) -> dict | None:
         elif light.shape == "RECTANGLE":
             size = [float(light.size), float(light.size_y)]
         else:
+            print(
+                f"[vibrt] warn: area light {obj.name!r}: shape={light.shape!r} "
+                f"not supported (only SQUARE/RECTANGLE) — approximating as SQUARE"
+            )
             size = [float(light.size), float(light.size)]
         # Blender area lights emit along local -Z; vibrt's area_rect expects
         # emission along local +Z (see cornell/make_scene.py). Flip the Z axis
@@ -342,6 +382,10 @@ def _export_light(obj, buf: bytearray, textures: list) -> dict | None:
             "color": col,
             "power": energy,
         }
+    print(
+        f"[vibrt] warn: light {obj.name!r}: type={light.type!r} not supported "
+        f"(only POINT/SUN/SPOT/AREA) — light dropped"
+    )
     return None
 
 
@@ -356,29 +400,62 @@ def _export_world(world, buf: bytearray, textures: list) -> dict:
             (n for n in world.node_tree.nodes if n.bl_idname == "ShaderNodeOutputWorld"),
             None,
         )
-    if out is None or not out.inputs["Surface"].is_linked:
+    if out is None:
+        print(
+            f"[vibrt] warn: world {world.name!r}: no ShaderNodeOutputWorld — "
+            f"world treated as black"
+        )
+        return {"type": "constant", "color": [0, 0, 0], "strength": 0.0}
+    if not out.inputs["Surface"].is_linked:
+        print(
+            f"[vibrt] warn: world {world.name!r}: World Output Surface is "
+            f"not connected — world treated as black"
+        )
         return {"type": "constant", "color": [0, 0, 0], "strength": 0.0}
 
     src = out.inputs["Surface"].links[0].from_node
     if src.bl_idname == "ShaderNodeBackground":
-        strength = src.inputs["Strength"].default_value
+        strength_sock = src.inputs["Strength"]
+        if strength_sock.is_linked:
+            print(
+                f"[vibrt] warn: world {world.name!r}: Background Strength is "
+                f"linked — using constant default ({strength_sock.default_value})"
+            )
+        strength = strength_sock.default_value
         color_sock = src.inputs["Color"]
         if color_sock.is_linked:
             linked = color_sock.links[0].from_node
-            if linked.bl_idname == "ShaderNodeTexEnvironment" and linked.image is not None:
-                tex_id = material_export.export_image_texture(
-                    linked.image, buf, textures, colorspace="linear"
+            if linked.bl_idname == "ShaderNodeTexEnvironment":
+                if linked.image is None:
+                    print(
+                        f"[vibrt] warn: world {world.name!r}: "
+                        f"ShaderNodeTexEnvironment has no image assigned — "
+                        f"falling back to constant background"
+                    )
+                else:
+                    tex_id = material_export.export_image_texture(
+                        linked.image, buf, textures, colorspace="linear"
+                    )
+                    rotation_z_rad = 0.0
+                    return {
+                        "type": "envmap",
+                        "texture": tex_id,
+                        "rotation_z_rad": rotation_z_rad,
+                        "strength": float(strength),
+                    }
+            else:
+                print(
+                    f"[vibrt] warn: world {world.name!r}: Background Color "
+                    f"driven by {linked.bl_idname} (expected "
+                    f"ShaderNodeTexEnvironment) — using constant default"
                 )
-                rotation_z_rad = 0.0
-                return {
-                    "type": "envmap",
-                    "texture": tex_id,
-                    "rotation_z_rad": rotation_z_rad,
-                    "strength": float(strength),
-                }
         col = list(color_sock.default_value)[:3]
         return {"type": "constant", "color": col, "strength": float(strength)}
 
+    print(
+        f"[vibrt] warn: world {world.name!r}: World Output Surface driven by "
+        f"{src.bl_idname} (expected ShaderNodeBackground) — world treated as black"
+    )
     return {"type": "constant", "color": [0, 0, 0], "strength": 0.0}
 
 

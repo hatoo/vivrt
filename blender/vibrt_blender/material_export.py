@@ -373,6 +373,22 @@ def _socket_f(sock) -> float:
     return float(sock.default_value)
 
 
+def _warn_linked_scalar(node, input_name: str) -> None:
+    """Warn (deduped) that a scalar input is linked but will be read as a
+    constant default. Use at call sites that don't attempt to export a
+    texture for the input — so the user sees why their driver node is ignored.
+    """
+    sock = node.inputs.get(input_name)
+    if sock is None or not sock.is_linked:
+        return
+    src = sock.links[0].from_node
+    _warn(
+        f"linked-scalar:{node.as_pointer()}:{input_name}",
+        f"{_node_tag(node)}: input {input_name!r} linked to {src.bl_idname} "
+        f"but not baked — using constant default ({sock.default_value})",
+    )
+
+
 # Procedural / data-driven leaves that have no TexImage behind them. Treated
 # as approximate constants when feeding the "other" side of a Mix bake — the
 # spatial detail they would add is lost, but the resulting tint usually still
@@ -758,6 +774,11 @@ def _eval_math_constant(node, depth: int) -> float | None:
         elif op == "DEGREES":
             r = math.degrees(a)
         else:
+            _warn(
+                f"math-fold-op:{op}",
+                f"{_node_tag(node)}: op={op!r} can't be constant-folded — "
+                f"chain stopped at this node",
+            )
             return None
     except (ValueError, OverflowError, ZeroDivisionError):
         return None
@@ -2133,6 +2154,7 @@ def _from_principled(node, buf, textures) -> dict:
         p["roughness"] = _socket_f(node.inputs["Roughness"])
 
     if "IOR" in node.inputs:
+        _warn_linked_scalar(node, "IOR")
         p["ior"] = _socket_f(node.inputs["IOR"])
     trans_name = (
         "Transmission Weight" if "Transmission Weight" in node.inputs
@@ -2140,16 +2162,30 @@ def _from_principled(node, buf, textures) -> dict:
         else None
     )
     if trans_name:
+        _warn_linked_scalar(node, trans_name)
         p["transmission"] = _socket_f(node.inputs[trans_name])
 
     if "Emission" in node.inputs:
+        if node.inputs["Emission"].is_linked:
+            _warn(
+                f"emission-linked:{node.as_pointer()}",
+                f"{_node_tag(node)}: Emission input is linked but color graphs "
+                f"on emission aren't baked — using constant default",
+            )
         p["emission"] = _socket_rgb(node.inputs["Emission"])
     elif "Emission Color" in node.inputs:
+        if node.inputs["Emission Color"].is_linked:
+            _warn(
+                f"emission-col-linked:{node.as_pointer()}",
+                f"{_node_tag(node)}: Emission Color is linked but color graphs "
+                f"on emission aren't baked — using constant default",
+            )
         color = _socket_rgb(node.inputs["Emission Color"])
-        strength = (
-            _socket_f(node.inputs["Emission Strength"])
-            if "Emission Strength" in node.inputs else 1.0
-        )
+        if "Emission Strength" in node.inputs:
+            _warn_linked_scalar(node, "Emission Strength")
+            strength = _socket_f(node.inputs["Emission Strength"])
+        else:
+            strength = 1.0
         p["emission"] = [c * strength for c in color]
 
     _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
@@ -2157,12 +2193,14 @@ def _from_principled(node, buf, textures) -> dict:
     # Anisotropy (Blender Principled: "Anisotropic" + "Anisotropic Rotation").
     for name in ("Anisotropic", "Anisotropy"):
         if name in node.inputs:
+            _warn_linked_scalar(node, name)
             a = _socket_f(node.inputs[name])
             if a != 0.0:
                 p["anisotropy"] = a
             break
     for name in ("Anisotropic Rotation", "Anisotropy Rotation"):
         if name in node.inputs:
+            _warn_linked_scalar(node, name)
             r = _socket_f(node.inputs[name])
             if r != 0.0:
                 p["tangent_rotation"] = r * 2.0 * math.pi
@@ -2172,17 +2210,20 @@ def _from_principled(node, buf, textures) -> dict:
     # legacy 3.x: "Clearcoat" / "Clearcoat Roughness").
     for name in ("Coat Weight", "Clearcoat"):
         if name in node.inputs:
+            _warn_linked_scalar(node, name)
             w = _socket_f(node.inputs[name])
             if w > 0.0:
                 p["coat_weight"] = w
             break
     for name in ("Coat Roughness", "Clearcoat Roughness"):
         if name in node.inputs:
+            _warn_linked_scalar(node, name)
             r = _socket_f(node.inputs[name])
             if r != 0.03:
                 p["coat_roughness"] = r
             break
     if "Coat IOR" in node.inputs:
+        _warn_linked_scalar(node, "Coat IOR")
         ior = _socket_f(node.inputs["Coat IOR"])
         if ior != 1.5:
             p["coat_ior"] = ior
@@ -2191,16 +2232,25 @@ def _from_principled(node, buf, textures) -> dict:
     # legacy: "Sheen" / "Sheen Tint" scalar).
     for name in ("Sheen Weight", "Sheen"):
         if name in node.inputs:
+            _warn_linked_scalar(node, name)
             w = _socket_f(node.inputs[name])
             if w > 0.0:
                 p["sheen_weight"] = w
             break
     if "Sheen Roughness" in node.inputs:
+        _warn_linked_scalar(node, "Sheen Roughness")
         r = _socket_f(node.inputs["Sheen Roughness"])
         if r != 0.5:
             p["sheen_roughness"] = r
     if "Sheen Tint" in node.inputs:
-        v = node.inputs["Sheen Tint"].default_value
+        sheen_tint_sock = node.inputs["Sheen Tint"]
+        if sheen_tint_sock.is_linked:
+            _warn(
+                f"sheen-tint-linked:{node.as_pointer()}",
+                f"{_node_tag(node)}: Sheen Tint is linked but not baked — "
+                f"using constant default",
+            )
+        v = sheen_tint_sock.default_value
         if hasattr(v, "__len__") and len(v) >= 3:
             t = [float(v[0]), float(v[1]), float(v[2])]
             if t != [1.0, 1.0, 1.0]:
@@ -2210,17 +2260,26 @@ def _from_principled(node, buf, textures) -> dict:
     # / "Subsurface Anisotropy"; 3.x: "Subsurface" / "Subsurface Radius").
     for name in ("Subsurface Weight", "Subsurface"):
         if name in node.inputs:
+            _warn_linked_scalar(node, name)
             w = _socket_f(node.inputs[name])
             if w > 0.0:
                 p["sss_weight"] = w
             break
     if "Subsurface Radius" in node.inputs:
-        v = node.inputs["Subsurface Radius"].default_value
+        sss_r_sock = node.inputs["Subsurface Radius"]
+        if sss_r_sock.is_linked:
+            _warn(
+                f"sss-radius-linked:{node.as_pointer()}",
+                f"{_node_tag(node)}: Subsurface Radius is linked but not baked "
+                f"— using constant default",
+            )
+        v = sss_r_sock.default_value
         if hasattr(v, "__len__") and len(v) >= 3:
             r = [float(v[0]), float(v[1]), float(v[2])]
             if r != [1.0, 0.2, 0.1]:
                 p["sss_radius"] = r
     if "Subsurface Anisotropy" in node.inputs:
+        _warn_linked_scalar(node, "Subsurface Anisotropy")
         a = _socket_f(node.inputs["Subsurface Anisotropy"])
         if a != 0.0:
             p["sss_anisotropy"] = a
@@ -2234,6 +2293,13 @@ def _from_principled(node, buf, textures) -> dict:
                 img = _socket_linked_image(alpha_sock)
                 if img is not None:
                     p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+                else:
+                    _warn(
+                        f"alpha-noimg:{node.as_pointer()}",
+                        f"{_node_tag(node)}: Alpha is linked but no TexImage "
+                        f"found upstream — alpha threshold is effectively "
+                        f"disabled (no per-pixel alpha to compare against)",
+                    )
         elif alpha_val < 1.0:
             p["alpha_threshold"] = alpha_val
     return p
@@ -2283,10 +2349,12 @@ def _from_glossy(node, buf, textures) -> dict:
         else:
             p["roughness"] = _socket_f(node.inputs["Roughness"])
     if "Anisotropy" in node.inputs:
+        _warn_linked_scalar(node, "Anisotropy")
         a = _socket_f(node.inputs["Anisotropy"])
         if a != 0.0:
             p["anisotropy"] = a
     if "Rotation" in node.inputs:
+        _warn_linked_scalar(node, "Rotation")
         r = _socket_f(node.inputs["Rotation"])
         if r != 0.0:
             p["tangent_rotation"] = r * 2.0 * math.pi
@@ -2298,6 +2366,7 @@ def _from_glass(node, buf, textures) -> dict:
     p = _default_params()
     p["transmission"] = 1.0
     if "IOR" in node.inputs:
+        _warn_linked_scalar(node, "IOR")
         p["ior"] = _socket_f(node.inputs["IOR"])
     img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
@@ -2320,6 +2389,7 @@ def _from_refraction(node, buf, textures) -> dict:
     p["transmission"] = 1.0
     p["metallic"] = 0.0
     if "IOR" in node.inputs:
+        _warn_linked_scalar(node, "IOR")
         p["ior"] = _socket_f(node.inputs["IOR"])
     img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
@@ -2399,16 +2469,24 @@ def _from_sheen(node, buf, textures) -> dict:
 
 def _from_emission(node, buf, textures) -> dict:
     p = _default_params()
-    color = _socket_rgb(node.inputs["Color"])
-    strength = (
-        _socket_f(node.inputs["Strength"])
-        if "Strength" in node.inputs else 1.0
-    )
+    color_sock = node.inputs["Color"]
+    if color_sock.is_linked:
+        _warn(
+            f"emit-color-linked:{node.as_pointer()}",
+            f"{_node_tag(node)}: Color is linked but emission is driven by the "
+            f"constant default (texture only contributes as unlit base_color_tex)",
+        )
+    color = _socket_rgb(color_sock)
+    if "Strength" in node.inputs:
+        _warn_linked_scalar(node, "Strength")
+        strength = _socket_f(node.inputs["Strength"])
+    else:
+        strength = 1.0
     p["emission"] = [c * strength for c in color]
     p["base_color"] = [0.0, 0.0, 0.0]
     # Allow a color texture to be picked up as base_color_tex (shaded on the
     # emissive surface below the emission term).
-    img = _socket_linked_image(node.inputs["Color"])
+    img = _socket_linked_image(color_sock)
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
     return p
