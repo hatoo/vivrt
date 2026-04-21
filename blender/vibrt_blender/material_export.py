@@ -525,6 +525,51 @@ def _resolve_constant_socket(sock, depth: int = 0):
     return None
 
 
+def _view_dependent_ior(sock, depth: int = 0) -> float | None:
+    """Return the effective Fresnel IOR of a Fresnel/LayerWeight factor
+    chain, or None when the chain isn't view-angle driven.
+
+    Blender's canonical clearcoat / "Fresnel over base" idiom wires such
+    a factor into a MixShader. `_resolve_constant_scalar` would fold the
+    leaf to 0 (via `_node_mean_color`) and silently drop shader2; callers
+    use this IOR instead to route shader2 through the coat lobe with a
+    matching Fresnel curve.
+
+    - `ShaderNodeFresnel`: IOR input directly (default 1.45).
+    - `ShaderNodeLayerWeight`: Cycles uses `eta = 1/(1-Blend)` for its
+      Fresnel output, so Blend=0.5 → ior=2 (F0≈0.111).
+    Math/Clamp/Mix wrappers are passed through by searching their VALUE
+    inputs; if multiple branches are view-dependent we take the first
+    (rare enough in practice to not matter).
+    """
+    if depth > 8 or not sock.is_linked:
+        return None
+    src = sock.links[0].from_node
+    bl = src.bl_idname
+    if bl == "ShaderNodeFresnel":
+        ior_sock = src.inputs.get("IOR")
+        if ior_sock is not None and not ior_sock.is_linked:
+            return float(ior_sock.default_value)
+        return 1.45
+    if bl == "ShaderNodeLayerWeight":
+        blend_sock = src.inputs.get("Blend")
+        if blend_sock is not None and not blend_sock.is_linked:
+            blend = max(0.0, min(0.9999, float(blend_sock.default_value)))
+        else:
+            blend = 0.5
+        return 1.0 / max(1e-4, 1.0 - blend)
+    if bl in ("ShaderNodeMath", "ShaderNodeClamp", "ShaderNodeMapRange") or (
+        bl == "ShaderNodeMix" and getattr(src, "data_type", "RGBA") == "FLOAT"
+    ):
+        for i in src.inputs:
+            if i.type != "VALUE":
+                continue
+            ior = _view_dependent_ior(i, depth + 1)
+            if ior is not None:
+                return ior
+    return None
+
+
 def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
     """Fold a VALUE socket to a single float, walking Math/Clamp/Value.
 
@@ -2561,12 +2606,37 @@ def _from_mix(node, buf, textures, mat_name: str) -> dict:
     p2 = _resolve_shader(n2, buf, textures, mat_name) if n2 else _default_params()
 
     fac_sock = node.inputs[0]
+    view_ior = _view_dependent_ior(fac_sock) if fac_sock.is_linked else None
+    if view_ior is not None:
+        # Fresnel/LayerWeight-driven MixShader is Blender's clearcoat
+        # idiom: shader1 is the base lobe, shader2 dominates at grazing.
+        # Decompose shader2 onto the Principled coat lobe above shader1:
+        #   coat_ior       ← factor's Fresnel IOR (matches `fac(c)` in
+        #                    Cycles' `(1-fac)·F₁ + fac·F₂` mix shape)
+        #   coat_weight    ← luminance(shader2.base_color) — Cycles
+        #                    Glossy has F=Schlick(F₀=Color), so shader2's
+        #                    peak reflectance at normal scales the lobe
+        #   coat_roughness ← shader2.roughness
+        # Loses shader2's hue (coat is a white dielectric lobe) but
+        # captures the view-angle falloff and highlight intensity —
+        # what actually sells the metallic paint. Requires the renderer
+        # to importance-sample the coat lobe (see `sample_bsdf`); a pure
+        # eval-only coat over a broad base lobe under-samples the sharp
+        # clearcoat highlight.
+        if (p1.get("coat_weight", 0.0) == 0.0
+                and p2.get("emission", [0, 0, 0]) == [0, 0, 0]
+                and p2.get("transmission", 0.0) == 0.0):
+            bc2 = p2.get("base_color", [1.0, 1.0, 1.0])
+            lum2 = 0.2126 * bc2[0] + 0.7152 * bc2[1] + 0.0722 * bc2[2]
+            out = dict(p1)
+            out["coat_weight"] = max(0.0, min(1.0, lum2))
+            out["coat_roughness"] = p2.get("roughness", 0.03)
+            out["coat_ior"] = view_ior
+            return out
+        return dict(p1)
     if fac_sock.is_linked:
-        # Try to fold the factor to a scalar (Fresnel / LayerWeight /
-        # constant-driven Math / procedural → mean). Fresnel and LayerWeight
-        # fold to 0 at normal incidence, which picks shader1 — the body in
-        # Blender's shader1/shader2 = base/overlay convention. The renderer's
-        # Principled Fresnel handles the view-dependent blend itself.
+        # Try to fold the factor to a scalar (constant-driven Math /
+        # procedural → mean).
         fac = _resolve_constant_scalar(fac_sock)
         if fac is None:
             _warn(
