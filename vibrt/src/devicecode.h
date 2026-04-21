@@ -59,7 +59,6 @@ struct PrincipledGpu {
   float sheen_tint[3];
   float sss_weight;
   float sss_radius[3];
-  float sss_anisotropy;
   int use_vertex_color;
   ColorGraphNode *color_graph_nodes;
   int color_graph_len;

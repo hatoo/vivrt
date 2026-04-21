@@ -2135,8 +2135,9 @@ def _from_principled(node, buf, textures) -> dict:
             if t != [1.0, 1.0, 1.0]:
                 p["sheen_tint"] = t
 
-    # Subsurface (Blender 4.x: "Subsurface Weight" / "Subsurface Radius"
-    # / "Subsurface Anisotropy"; 3.x: "Subsurface" / "Subsurface Radius").
+    # Subsurface (Blender 4.x: "Subsurface Weight" / "Subsurface Radius";
+    # 3.x: "Subsurface" / "Subsurface Radius"). Anisotropy is not consumed
+    # by the simplified wrap-Lambert SSS in the renderer, so we don't emit it.
     for name in ("Subsurface Weight", "Subsurface"):
         if name in node.inputs:
             _warn_linked_scalar(node, name)
@@ -2157,11 +2158,6 @@ def _from_principled(node, buf, textures) -> dict:
             r = [float(v[0]), float(v[1]), float(v[2])]
             if r != [1.0, 0.2, 0.1]:
                 p["sss_radius"] = r
-    if "Subsurface Anisotropy" in node.inputs:
-        _warn_linked_scalar(node, "Subsurface Anisotropy")
-        a = _socket_f(node.inputs["Subsurface Anisotropy"])
-        if a != 0.0:
-            p["sss_anisotropy"] = a
 
     alpha_sock = node.inputs.get("Alpha")
     if alpha_sock is not None:

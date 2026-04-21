@@ -83,7 +83,6 @@ pub struct PrincipledGpu {
     pub sheen_tint: [f32; 3],
     pub sss_weight: f32,
     pub sss_radius: [f32; 3],
-    pub sss_anisotropy: f32,
     /// i32 used as bool — multiply base_color by interpolated vertex color.
     pub use_vertex_color: i32,
     /// Optional colour graph replacing `base_color_tex`. Non-null pointer +

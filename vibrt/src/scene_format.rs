@@ -144,12 +144,9 @@ pub struct PrincipledMaterial {
     pub sss_weight: f32,
     #[serde(default = "default_sss_radius")]
     pub sss_radius: [f32; 3],
-    #[serde(default)]
-    pub sss_anisotropy: f32,
     /// When true, multiply base_color by the mesh's interpolated vertex
     /// color (MeshDesc::vertex_colors). Set by the Blender exporter when a
-    /// material drives its base colour via a ShaderNodeAttribute — otherwise
-    /// the Attribute folds to a single mean, losing rim darkening.
+    /// material drives its base colour via a ShaderNodeAttribute.
     #[serde(default)]
     pub use_vertex_color: bool,
     /// Optional per-pixel colour graph that replaces `base_color_tex` when
