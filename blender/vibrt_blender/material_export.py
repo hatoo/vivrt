@@ -1890,7 +1890,7 @@ def _tex_node_uv_transform(tex_node) -> list[float]:
     return list(_IDENTITY_UV)
 
 
-def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
+def _try_emit_color_graph(sock, buf, textures, group_stack=None, vc_attrs=None) -> dict | None:
     """Walk the shader graph feeding `sock` and emit a `color_graph` dict that
     the GPU evaluator can run per-pixel. Returns None if the graph uses a
     node we can't yet translate (ShaderNodeValToRGB, ShaderNodeTexNoise, ...);
@@ -1901,6 +1901,11 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
     constant-RGB leaves. classroom's paintedCeiling comes out as a 7-node
     graph that mirrors the Cycles shader exactly except for the HSV
     saturation bump.
+
+    `vc_attrs`, when provided, is a list populated with the vertex colour
+    attribute names referenced by emitted `vertex_color` nodes. Callers use
+    this to set `_vertex_color_attr` on the material dict so the mesh
+    exporter ships the matching per-vertex colour blob.
     """
     if group_stack is None:
         group_stack = tuple(_GROUP_STACK)
@@ -1949,10 +1954,21 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
             if bi is None:
                 return None
             if fac_sock.is_linked:
+                # Prefer a real per-pixel node so the factor can vary with
+                # texture content. Fall back to host-side constant folding
+                # so chains like `ObjectInfo.Random → Math(GREATER_THAN, …)`
+                # (unsupported by the graph evaluator) collapse to the
+                # representative constant instead of dropping the whole
+                # graph — classroom's schoolDesk_wood picks its texture
+                # variant this way.
                 fi = emit(fac_sock)
-                if fi is None:
-                    return None
-                fac_spec: float | dict = {"node": fi}
+                if fi is not None:
+                    fac_spec: float | dict = {"node": fi}
+                else:
+                    fac_const = _resolve_constant_scalar(fac_sock)
+                    if fac_const is None:
+                        return None
+                    fac_spec = fac_const
             else:
                 fac_spec = _socket_f(fac_sock)
             idx = len(nodes)
@@ -2053,22 +2069,20 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
             fac_sock = src.inputs.get("Fac")
             if col_sock is None:
                 return None
-            # Fac blending is rare in practice; require constant to avoid a
-            # per-pixel scalar lookup on the GPU for now.
+            # Textured Fac would need a per-pixel lerp; require a constant
+            # so the blend folds into the LUT at export time.
             if fac_sock is not None and fac_sock.is_linked:
                 return None
             fac_val = _socket_f(fac_sock) if fac_sock is not None else 1.0
-            if abs(fac_val - 1.0) > 1e-4:
-                # Non-identity fac means we'd need to lerp with the input.
-                # Supported by reading the input twice in the graph; keep
-                # things simple and bail out when the artist has tuned Fac.
-                return None
             ci = emit(col_sock)
             if ci is None:
                 return None
             # Bake the curves into a 256x3 LUT. Blender stacks per-channel
             # curves and the combined curve — evaluate combined(per_channel(x))
-            # per sample so the LUT captures the full effect.
+            # per sample so the LUT captures the full effect. Non-unity Fac
+            # is folded in too: `out = lerp(x, curve(x), fac)` lets classroom's
+            # RGB-Curves-with-Fac-0.9 wood tint stay in the graph instead of
+            # falling out into a baked texture.
             cm = src.mapping
             cm.update()
             curves = cm.curves
@@ -2081,6 +2095,7 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
                     # CurveMap is evaluated via the parent CurveMapping.
                     y = cm.evaluate(curves[ch], x)
                     y = cm.evaluate(curves[3], y)
+                    y = x * (1.0 - fac_val) + y * fac_val
                     lut.append(max(0.0, min(1.0, float(y))))
             idx = len(nodes)
             nodes.append({"type": "rgb_curve", "input": ci, "lut": lut})
@@ -2109,6 +2124,24 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
             memo[key] = idx
             return idx
 
+        if bl == "ShaderNodeAttribute":
+            # Per-vertex colour attribute feeding the chain (classroom's
+            # schoolDesk_wood OVERLAY-mixes a per-instance tint this way).
+            # Only GEOMETRY-type attributes are real vertex data — Cycles'
+            # Instancer / Object attributes don't map to anything we ship.
+            attr_type = getattr(src, "attribute_type", "GEOMETRY")
+            if attr_type != "GEOMETRY":
+                return None
+            attr_name = getattr(src, "attribute_name", "") or ""
+            if not attr_name:
+                return None
+            if vc_attrs is not None and attr_name not in vc_attrs:
+                vc_attrs.append(attr_name)
+            idx = len(nodes)
+            nodes.append({"type": "vertex_color"})
+            memo[key] = idx
+            return idx
+
         if bl == "ShaderNodeValToRGB":
             # ColorRamp: scalar in, RGB out. We fold it to a Const node when
             # the Fac chain reduces to a constant (noise / procedural leaves
@@ -2133,8 +2166,17 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
             memo[key] = idx
             return idx
 
-        # Anything else (Noise, RGBCurve, Gamma, BrightContrast, NodeGroup,
-        # ...) — bail out so the caller falls back to baking.
+        # Fallback: any node whose sub-chain folds to a constant RGB (plain
+        # RGB / Blackbody / all-const Mix / TexImage mean, …) becomes a Const
+        # leaf so the surrounding graph can still emit. Specific handlers
+        # above (Attribute → vertex_color) already claim the nodes where a
+        # mean-colour fold would be less faithful than a per-pixel reader.
+        fallback_rgb = _socket_constant_rgb(emit_sock)
+        if fallback_rgb is not None:
+            idx = len(nodes)
+            nodes.append({"type": "const", "rgb": fallback_rgb})
+            memo[key] = idx
+            return idx
         return None
 
     out_idx = emit(sock)
@@ -2248,10 +2290,19 @@ def _resolve_shader(node, buf, textures, mat_name: str) -> dict:
 def _from_principled(node, buf, textures) -> dict:
     p = _default_params()
     bc = node.inputs["Base Color"]
-    graph = _try_emit_color_graph(bc, buf, textures) if bc.is_linked else None
+    vc_attrs: list[str] = []
+    graph = (
+        _try_emit_color_graph(bc, buf, textures, vc_attrs=vc_attrs)
+        if bc.is_linked else None
+    )
     if graph is not None:
         p["color_graph"] = graph
         p["base_color"] = [1.0, 1.0, 1.0]
+        if vc_attrs:
+            # The graph samples v.vc directly — don't also enable the
+            # base_color × v.vc multiplier (would double-apply the
+            # attribute).
+            p["_vertex_color_attr"] = vc_attrs[0]
     else:
         img, chain = _socket_linked_image_with_chain(bc)
         if img is not None:
@@ -2426,10 +2477,16 @@ def _from_diffuse(node, buf, textures) -> dict:
     p["roughness"] = 1.0
     p["metallic"] = 0.0
     color_sock = node.inputs["Color"]
-    graph = _try_emit_color_graph(color_sock, buf, textures) if color_sock.is_linked else None
+    vc_attrs: list[str] = []
+    graph = (
+        _try_emit_color_graph(color_sock, buf, textures, vc_attrs=vc_attrs)
+        if color_sock.is_linked else None
+    )
     if graph is not None:
         p["color_graph"] = graph
         p["base_color"] = [1.0, 1.0, 1.0]
+        if vc_attrs:
+            p["_vertex_color_attr"] = vc_attrs[0]
     else:
         img, chain = _socket_linked_image_with_chain(color_sock)
         if img is not None:

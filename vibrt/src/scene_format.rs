@@ -268,6 +268,10 @@ pub enum ColorNode {
         #[serde(default)]
         contrast: f32,
     },
+    /// Blender ShaderNodeAttribute reading a per-vertex colour. The mesh must
+    /// ship the matching colour attribute (exporter plumbs this via
+    /// `_vertex_color_attr`); when absent the device falls back to white.
+    VertexColor {},
 }
 
 fn default_mix_fac() -> ColorFactor {

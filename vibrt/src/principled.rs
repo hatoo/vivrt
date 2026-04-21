@@ -3,7 +3,7 @@
 use crate::gpu_types::{
     ColorGraphNode, PrincipledGpu, COLOR_NODE_BRIGHT_CONTRAST, COLOR_NODE_CONST,
     COLOR_NODE_HUE_SAT, COLOR_NODE_IMAGE_TEX, COLOR_NODE_INVERT, COLOR_NODE_MATH, COLOR_NODE_MIX,
-    COLOR_NODE_RGB_CURVE,
+    COLOR_NODE_RGB_CURVE, COLOR_NODE_VERTEX_COLOR,
 };
 use crate::scene_format::{ColorFactor, ColorGraph, ColorNode, PrincipledMaterial};
 use crate::scene_loader::LoadedTexture;
@@ -250,6 +250,9 @@ fn flatten_one(
             out[1] = *input;
             out[2] = bright.to_bits();
             out[3] = contrast.to_bits();
+        }
+        ColorNode::VertexColor {} => {
+            out[0] = COLOR_NODE_VERTEX_COLOR;
         }
     }
     Ok(())

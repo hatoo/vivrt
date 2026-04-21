@@ -626,7 +626,7 @@ static __forceinline__ __device__ float3 hsv_to_rgb_bl(float3 c) {
 }
 
 static __device__ float3 eval_color_graph(
-    ColorGraphNode *nodes, int n_nodes, int output, float2 base_uv) {
+    ColorGraphNode *nodes, int n_nodes, int output, float2 base_uv, float3 vc) {
   float3 slots[COLOR_GRAPH_MAX_NODES];
   int n = n_nodes < COLOR_GRAPH_MAX_NODES ? n_nodes : COLOR_GRAPH_MAX_NODES;
   for (int i = 0; i < n; i++) {
@@ -735,6 +735,8 @@ static __device__ float3 eval_color_graph(
       slots[i] = make_float3(src.x * facm + shifted.x * fac,
                              src.y * facm + shifted.y * fac,
                              src.z * facm + shifted.z * fac);
+    } else if (tag == COLOR_NODE_VERTEX_COLOR) {
+      slots[i] = vc;
     } else {
       slots[i] = make_float3(1.0f, 1.0f, 1.0f);
     }
@@ -782,7 +784,7 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
     // its own uv_transform so sources with different Mapping nodes don't
     // get jammed into one global scale.
     float3 g = eval_color_graph(m->color_graph_nodes, m->color_graph_len,
-                                m->color_graph_output, v.uv);
+                                m->color_graph_output, v.uv, v.vc);
     e.base_color = e.base_color * g;
   } else if (m->base_color_tex != nullptr) {
     float3 t =

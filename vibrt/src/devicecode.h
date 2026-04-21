@@ -17,6 +17,7 @@ struct ColorGraphNode {
 #define COLOR_NODE_HUE_SAT 5u
 #define COLOR_NODE_RGB_CURVE 6u
 #define COLOR_NODE_BRIGHT_CONTRAST 7u
+#define COLOR_NODE_VERTEX_COLOR 8u
 
 struct PrincipledGpu {
   float base_color[3];
