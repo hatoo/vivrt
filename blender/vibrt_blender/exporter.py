@@ -51,6 +51,12 @@ def _write_u32(buf: bytearray, xs) -> dict:
 def _find_displacement(obj_eval, buf, textures):
     """Return (tex_id, strength) for the first material slot's Displacement
     output that drives a single TexImage; (None, 0.0) otherwise.
+
+    Walks through bakeable nodes between Displacement.Height and the TexImage
+    so that classroom-style chains
+    (Displacement ← Math(scale) ← Bump ← TexImage) resolve correctly. The
+    chain's colour transforms bake into the height texture's pixels; any
+    scalar scale found on Math / Bump multiplies into `strength`.
     """
     for slot in obj_eval.material_slots:
         mat = slot.material
@@ -85,21 +91,12 @@ def _find_displacement(obj_eval, buf, textures):
                     f"— displacement ignored"
                 )
                 continue
-            upstream_node = height_sock.links[0].from_node
-            if (upstream_node.bl_idname == "ShaderNodeTexImage"
-                    and upstream_node.image is not None):
-                from . import material_export
-                tex_id = material_export.export_image_texture(
-                    upstream_node.image, buf, textures, "linear"
-                )
-                return tex_id, strength
-            print(
-                f"[vibrt] warn: {tag}: Displacement.Height driven by "
-                f"{upstream_node.bl_idname} (expected ShaderNodeTexImage) "
-                f"— displacement ignored"
+            tex_id, extra = _resolve_height_texture(
+                height_sock, buf, textures, tag
             )
+            if tex_id is not None:
+                return tex_id, strength * extra
         elif src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
-            from . import material_export
             tex_id = material_export.export_image_texture(
                 src.image, buf, textures, "linear"
             )
@@ -111,6 +108,125 @@ def _find_displacement(obj_eval, buf, textures):
                 f"ShaderNodeTexImage) — displacement ignored"
             )
     return None, 0.0
+
+
+_PROCEDURAL_HEIGHT_NODES = frozenset((
+    "ShaderNodeTexNoise",
+    "ShaderNodeTexWave",
+    "ShaderNodeTexVoronoi",
+    "ShaderNodeTexMusgrave",
+    "ShaderNodeTexMagic",
+    "ShaderNodeTexWhiteNoise",
+    "ShaderNodeTexChecker",
+    "ShaderNodeTexGradient",
+))
+
+
+def _resolve_height_texture(sock, buf, textures, tag, depth: int = 0):
+    """Walk a Height-style chain (Math, Bump) back to a TexImage.
+
+    Returns (tex_id, extra_strength). `extra_strength` multiplies into the
+    Displacement.Scale so a Bump.Distance or Math multiplier between the
+    TexImage and the Displacement node doesn't get silently dropped.
+    `(None, 1.0)` when the chain can't be resolved.
+    """
+    if sock is None or not sock.is_linked or depth > 4:
+        return None, 1.0
+    up = sock.links[0].from_node
+    if up.bl_idname == "ShaderNodeBump":
+        # Bump wraps a Height texture with Strength * Distance. Fold both
+        # constants into the returned strength multiplier and continue.
+        height = up.inputs.get("Height")
+        strength = _const_f(up.inputs.get("Strength"), 1.0)
+        distance = _const_f(up.inputs.get("Distance"), 1.0)
+        tex_id, extra = _resolve_height_texture(
+            height, buf, textures, tag, depth + 1
+        )
+        if tex_id is None:
+            return None, 1.0
+        return tex_id, extra * strength * distance
+    if up.bl_idname in _PROCEDURAL_HEIGHT_NODES:
+        # Pure procedural height (noise, wave, ...) — the exporter has no
+        # per-object displacement baker, so the best we can do is drop the
+        # displacement. Silent: we already flag this to the artist as "no
+        # image to export" rather than as an export error.
+        return None, 1.0
+    if up.bl_idname == "ShaderNodeMath":
+        # Only commutative / chain-preserving ops fold cleanly into a scalar
+        # multiplier on Displacement.Scale. MULTIPLY / ADD of a TexImage with
+        # a constant is the common pattern (classroom's woodPlanks does
+        # Math(TexImage, 0.1)); other ops would distort the signal.
+        op = getattr(up, "operation", "MULTIPLY")
+        inputs = list(up.inputs)
+        chain_idx = next(
+            (i for i, inp in enumerate(inputs) if inp.is_linked), -1
+        )
+        if chain_idx < 0:
+            return None, 1.0
+        if op == "MULTIPLY":
+            others = [
+                _const_f(inp, None) for i, inp in enumerate(inputs)
+                if i != chain_idx
+            ]
+            if None in others:
+                print(
+                    f"[vibrt] warn: {tag}: Displacement.Height Math({op}) "
+                    f"has non-constant side — displacement ignored"
+                )
+                return None, 1.0
+            k = 1.0
+            for v in others:
+                k *= v
+            tex_id, extra = _resolve_height_texture(
+                inputs[chain_idx], buf, textures, tag, depth + 1
+            )
+            if tex_id is None:
+                return None, 1.0
+            return tex_id, extra * k
+        # ADD of a constant shifts the height reference; the renderer already
+        # treats 0.5 as the neutral point, so swallow the shift silently as
+        # long as the other side is constant and the texture can be found.
+        if op == "ADD":
+            others = [
+                _const_f(inp, None) for i, inp in enumerate(inputs)
+                if i != chain_idx
+            ]
+            if None in others:
+                return None, 1.0
+            return _resolve_height_texture(
+                inputs[chain_idx], buf, textures, tag, depth + 1
+            )
+        print(
+            f"[vibrt] warn: {tag}: Displacement.Height Math op={op!r} not "
+            f"handled (only MULTIPLY / ADD) — displacement ignored"
+        )
+        return None, 1.0
+    # Fall through to the material-export chain walker: TexImage, plus any
+    # colour transform between it and here (HueSaturation / RGBCurve / Gamma /
+    # Invert / Clamp / ColorRamp / BrightContrast) bakes into the height
+    # texture's pixels. The chain walker also follows through Mapping /
+    # Mix / Separate nodes as pass-throughs, matching colour-chain semantics.
+    img, chain = material_export._socket_linked_image_with_chain(sock)
+    if img is None:
+        print(
+            f"[vibrt] warn: {tag}: Displacement.Height driven by "
+            f"{up.bl_idname} — couldn't resolve an image, displacement ignored"
+        )
+        return None, 1.0
+    return material_export.export_image_texture(
+        img, buf, textures, "linear", chain=chain
+    ), 1.0
+
+
+def _const_f(sock, default):
+    if sock is None:
+        return default
+    if sock.is_linked:
+        return default
+    try:
+        return float(sock.default_value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _export_mesh(
@@ -308,16 +424,24 @@ def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
             strength = 1.0
     else:
         strength = float(s_sock.default_value)
-    if c_sock is not None and c_sock.is_linked:
-        print(
-            f"[vibrt] warn: light {light.name!r}: Emission Color is linked "
-            f"— using light.color unchanged (shader color graph ignored)"
-        )
-    if c_sock is not None and not c_sock.is_linked:
+    if c_sock is None:
+        color = (1.0, 1.0, 1.0)
+    elif c_sock.is_linked:
+        # Resolve via the same constant-folding machinery used for material
+        # Emission.Color, so a Blackbody / Attribute / procedural drop-in
+        # collapses to its neutral constant instead of being thrown away.
+        rgb = material_export._socket_constant_rgb(c_sock)
+        if rgb is None:
+            print(
+                f"[vibrt] warn: light {light.name!r}: Emission Color chain "
+                f"isn't foldable to a constant — using light.color unchanged"
+            )
+            color = (1.0, 1.0, 1.0)
+        else:
+            color = (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+    else:
         cv = c_sock.default_value
         color = (float(cv[0]), float(cv[1]), float(cv[2]))
-    else:
-        color = (1.0, 1.0, 1.0)
     return strength, color
 
 

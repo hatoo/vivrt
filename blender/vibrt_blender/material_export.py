@@ -53,6 +53,12 @@ _PREMIX_CACHE: dict = {}
 _LINEAR_RGB_CACHE: dict = {}
 
 
+# Session-scoped cache for `_image_mean_rgb`. Used when a constant-folding
+# chain (MixShader factor, Emission colour, ...) needs the image reduced to
+# a single RGBA value rather than its per-pixel array.
+_MEAN_RGBA_CACHE: dict = {}
+
+
 def reset_stats() -> None:
     _STATS["material_self_s"] = 0.0
     _STATS["texture_self_s"] = 0.0
@@ -68,6 +74,7 @@ def reset_stats() -> None:
     _STATS["linear_rgb_cache_misses"] = 0
     _PREMIX_CACHE.clear()
     _LINEAR_RGB_CACHE.clear()
+    _MEAN_RGBA_CACHE.clear()
 
 
 def pop_stats() -> dict:
@@ -388,12 +395,45 @@ def _socket_constant_rgb(sock) -> list[float] | None:
     return _resolve_constant_socket(sock, depth=0)
 
 
+def _image_mean_rgba(image) -> tuple[list[float], float] | None:
+    """Return (mean_linear_rgb, mean_alpha) for `image`, or None when pixels
+    can't be read. Cached per-image. Used only in constant-folding paths —
+    the full texture pipeline reads pixels directly via foreach_get.
+    """
+    import numpy as np
+    ptr = image.as_pointer()
+    hit = _MEAN_RGBA_CACHE.get(ptr)
+    if hit is not None:
+        return hit
+    if image.size[0] == 0 or image.size[1] == 0:
+        image.update()
+    w, h = int(image.size[0]), int(image.size[1])
+    if w == 0 or h == 0:
+        return None
+    px = np.empty(w * h * 4, dtype=np.float32)
+    image.pixels.foreach_get(px)
+    _STATS["pixel_bytes"] += px.nbytes
+    px = px.reshape((-1, 4))
+    rgb = px[..., :3]
+    if image.colorspace_settings.name.lower().startswith("srgb"):
+        rgb = _srgb_to_linear_np(rgb)
+    mean_rgb = [float(rgb[..., c].mean()) for c in range(3)]
+    mean_a = float(px[..., 3].mean())
+    result = (mean_rgb, mean_a)
+    _MEAN_RGBA_CACHE[ptr] = result
+    return result
+
+
 def _resolve_constant_socket(sock, depth: int = 0):
     if depth > 8:
         return None
     if not sock.is_linked:
         return _socket_rgb(sock)
-    src = sock.links[0].from_node
+    link = sock.links[0]
+    src = link.from_node
+    mean = _node_mean_color(src, link.from_socket)
+    if mean is not None:
+        return mean
     if src.bl_idname == "ShaderNodeRGB":
         v = src.outputs[0].default_value
         return [float(v[0]), float(v[1]), float(v[2])]
@@ -403,8 +443,25 @@ def _resolve_constant_socket(sock, depth: int = 0):
             return None
         return _blackbody_to_linear_rgb(_socket_f(temp_sock))
     if src.bl_idname == "ShaderNodeTexImage":
-        # A real texture isn't a constant; callers handle textures separately.
-        return None
+        # A real texture doesn't have a single colour — but when a caller has
+        # no per-pixel path (MixShader factor, Light colour, Emission input),
+        # folding to the mean pixel value is the faithful host-side reduction.
+        # Callers that DO have a per-pixel path resolve the image directly via
+        # `_socket_linked_image_with_chain`, so this only fires when baking
+        # isn't an option.
+        if src.image is None:
+            return None
+        from_name = link.from_socket.name
+        if from_name == "Alpha":
+            mean = _image_mean_rgba(src.image)
+            if mean is None:
+                return None
+            a = mean[1]
+            return [a, a, a]
+        mean = _image_mean_rgba(src.image)
+        if mean is None:
+            return None
+        return list(mean[0])
     if src.bl_idname == "ShaderNodeValToRGB":
         # ColorRamp: walk the Fac input to a scalar constant, then evaluate.
         fac_sock = src.inputs.get("Fac")
@@ -421,17 +478,24 @@ def _resolve_constant_socket(sock, depth: int = 0):
         return [float(c) for c in ramp_color]
     if src.bl_idname in ("ShaderNodeMix", "ShaderNodeMixRGB"):
         fac_sock, a_sock, b_sock, blend, use_clamp, ok = _mix_node_params(src)
-        if not ok or fac_sock.is_linked or blend not in _SUPPORTED_MIX_BLENDS:
-            return None
-        a_const = _resolve_constant_socket(a_sock, depth + 1)
-        b_const = _resolve_constant_socket(b_sock, depth + 1)
-        if a_const is None or b_const is None:
-            return None
-        import numpy as np
-        a = np.array([a_const], dtype=np.float32)
-        b = np.array([b_const], dtype=np.float32)
-        out = _apply_mix_blend(a, b, _socket_f(fac_sock), blend, use_clamp)
-        return [float(c) for c in out[0]]
+        if ok and blend in _SUPPORTED_MIX_BLENDS:
+            if fac_sock.is_linked:
+                fac = _resolve_constant_scalar(fac_sock, depth + 1)
+                if fac is None:
+                    return None
+            else:
+                fac = _socket_f(fac_sock)
+            a_const = _resolve_constant_socket(a_sock, depth + 1)
+            b_const = _resolve_constant_socket(b_sock, depth + 1)
+            if a_const is None or b_const is None:
+                return None
+            import numpy as np
+            a = np.array([a_const], dtype=np.float32)
+            b = np.array([b_const], dtype=np.float32)
+            out = _apply_mix_blend(a, b, fac, blend, use_clamp)
+            return [float(c) for c in out[0]]
+        # Non-RGBA Mix: fall through to None. `_resolve_constant_scalar`
+        # handles the FLOAT case directly.
     # Try transforms that take a single Color input (Gamma, BrightContrast,
     # Invert, HueSaturation, RGBCurve, Clamp). Walk their input to a constant
     # and apply the transform's LUT.
@@ -496,6 +560,41 @@ def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
         if mode == "RANGE" and mn > mx:
             mn, mx = mx, mn
         return max(mn, min(mx, v))
+    if src.bl_idname == "ShaderNodeMix" and getattr(src, "data_type", "RGBA") == "FLOAT":
+        # Scalar Mix: inputs are scalar A/B with scalar Factor. Walk each.
+        fac_sock = next((i for i in src.inputs
+                         if i.name == "Factor" and i.type == "VALUE"), None)
+        a_sock = next((i for i in src.inputs
+                       if i.name == "A" and i.type == "VALUE"), None)
+        b_sock = next((i for i in src.inputs
+                       if i.name == "B" and i.type == "VALUE"), None)
+        if fac_sock is None or a_sock is None or b_sock is None:
+            return None
+        def _val(s):
+            if s.is_linked:
+                return _resolve_constant_scalar(s, depth + 1)
+            return float(s.default_value)
+        fa, va, vb = _val(fac_sock), _val(a_sock), _val(b_sock)
+        if fa is None or va is None or vb is None:
+            return None
+        if bool(getattr(src, "clamp_factor", True)):
+            fa = max(0.0, min(1.0, fa))
+        out = va * (1.0 - fa) + vb * fa
+        if bool(getattr(src, "clamp_result", False)):
+            out = max(0.0, min(1.0, out))
+        return out
+    # Approximated / procedural / per-geometry leaves — fold to the luminance
+    # of the node's mean colour so a surrounding Mix Factor / Light Strength
+    # can still bake.
+    mean = _node_mean_color(src, link.from_socket)
+    if mean is not None:
+        return 0.2126 * mean[0] + 0.7152 * mean[1] + 0.0722 * mean[2]
+    # Any colour-producing source the RGB resolver understands (TexImage
+    # mean, Invert, Mix, HueSat, RGBCurve, ...) can feed a scalar socket via
+    # luminance — Cycles' Colour→Value conversion uses the same weights.
+    rgb = _resolve_constant_socket(sock, depth)
+    if rgb is not None:
+        return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
     return None
 
 
@@ -799,13 +898,122 @@ def _export_linked_scalar_texture(sock, buf, textures):
 
 _CONSTANT_LEAF_NODES = frozenset((
     # Exact-constant sources: `_socket_constant_rgb` folds these into bakeable
-    # Mix operands. No procedural / data-driven leaves — those don't resolve to
-    # a single constant and must break the chain instead of being faked.
+    # Mix operands.
     "ShaderNodeRGB",
     "ShaderNodeBlackbody",
     "ShaderNodeWavelength",
     "ShaderNodeValue",
+    # Per-geometry / per-object / procedural signals we can't bake at export
+    # time. `_node_mean_color` gives each a neutral constant so the enclosing
+    # Mix / Emission / MixShader can still fold — the stochastic variation is
+    # lost but the surrounding colour chain survives instead of the whole
+    # texture being dropped. Kept in this set so chain walking treats them as
+    # dead-ends silently (no "not recognised" warning).
+    "ShaderNodeAttribute",
+    "ShaderNodeObjectInfo",
+    "ShaderNodeNewGeometry",
+    "ShaderNodeTexCoord",
+    "ShaderNodeTexNoise",
+    "ShaderNodeTexWave",
+    "ShaderNodeTexVoronoi",
+    "ShaderNodeTexMusgrave",
+    "ShaderNodeTexMagic",
+    "ShaderNodeTexChecker",
+    "ShaderNodeTexBrick",
+    "ShaderNodeTexGradient",
+    "ShaderNodeTexWhiteNoise",
+    "ShaderNodeTexSky",
+    "ShaderNodeTexEnvironment",
+    "ShaderNodeWireframe",
+    "ShaderNodeLightPath",
+    # Incidence-dependent — the renderer's own Principled Fresnel replaces
+    # these; folding to the normal-incidence value steers Mix/MixShader paths
+    # to the "body" side (shader1), which matches how these factors are
+    # typically wired (Fresnel-blended clearcoat / edge tint).
+    "ShaderNodeFresnel",
+    "ShaderNodeLayerWeight",
 ))
+
+
+def _node_mean_color(node, output_sock) -> list[float] | None:
+    """Best-effort constant colour for a non-chain node's output socket.
+
+    Returns None when the node isn't one we know how to approximate. Used by
+    the constant-folding path when a Mix / Emission / Light Color chain ends
+    on an Attribute / ObjectInfo / procedural / Fresnel leaf — folding to
+    their mean lets the rest of the chain collapse instead of being dropped.
+    """
+    bl = node.bl_idname
+    name = output_sock.name if output_sock is not None else ""
+    if bl == "ShaderNodeAttribute":
+        # Missing attribute at render-time defaults to white; use that so a
+        # surrounding Mix passes the other operand through untinted.
+        if name == "Alpha":
+            return [1.0, 1.0, 1.0]
+        if name in ("Fac", "Vector"):
+            return [0.0, 0.0, 0.0]
+        return [1.0, 1.0, 1.0]
+    if bl == "ShaderNodeObjectInfo":
+        if name == "Color":
+            return [1.0, 1.0, 1.0]
+        if name == "Random":
+            return [0.5, 0.5, 0.5]
+        if name == "Alpha":
+            return [1.0, 1.0, 1.0]
+        return [0.0, 0.0, 0.0]
+    if bl == "ShaderNodeNewGeometry":
+        return [0.0, 0.0, 0.0] if "Position" in name else [0.5, 0.5, 0.5]
+    if bl == "ShaderNodeTexCoord":
+        return [0.5, 0.5, 0.5]
+    if bl in ("ShaderNodeTexNoise", "ShaderNodeTexMusgrave",
+              "ShaderNodeTexMagic", "ShaderNodeTexWhiteNoise",
+              "ShaderNodeTexWave", "ShaderNodeTexVoronoi",
+              "ShaderNodeTexGradient"):
+        return [0.5, 0.5, 0.5]
+    if bl == "ShaderNodeTexChecker":
+        def _col(sock):
+            if sock is None or sock.is_linked:
+                return [0.5, 0.5, 0.5]
+            v = sock.default_value
+            return [float(v[0]), float(v[1]), float(v[2])]
+        a = _col(node.inputs.get("Color1"))
+        b = _col(node.inputs.get("Color2"))
+        return [0.5 * (a[i] + b[i]) for i in range(3)]
+    if bl == "ShaderNodeTexBrick":
+        def _col(sock, default):
+            if sock is None or sock.is_linked:
+                return default
+            v = sock.default_value
+            return [float(v[0]), float(v[1]), float(v[2])]
+        c1 = _col(node.inputs.get("Color1"), [0.8, 0.8, 0.8])
+        c2 = _col(node.inputs.get("Color2"), [0.2, 0.2, 0.2])
+        mortar = _col(node.inputs.get("Mortar"), [0.0, 0.0, 0.0])
+        # Roughly 80% brick, 20% mortar by default geometry.
+        return [0.4 * c1[i] + 0.4 * c2[i] + 0.2 * mortar[i] for i in range(3)]
+    if bl == "ShaderNodeFresnel":
+        # ≈ Schlick at normal incidence for IOR 1.5.
+        return [0.04, 0.04, 0.04]
+    if bl == "ShaderNodeLayerWeight":
+        # "Fresnel"/"Facing" outputs are 0 at normal incidence; folding to 0
+        # routes MixShader(factor=LayerWeight) through shader1.
+        return [0.0, 0.0, 0.0]
+    if bl == "ShaderNodeWireframe":
+        # Per-pixel edge detector: 0 except on triangle edges, so the mean is
+        # effectively 0. Folding to 0 picks shader1 in the common
+        # MixShader(Wireframe, edge, body) wiring.
+        return [0.0, 0.0, 0.0]
+    if bl == "ShaderNodeLightPath":
+        # "Is Camera Ray" is 1 for primary rays (what the user sees); the
+        # other path flags (Shadow/Diffuse/Glossy/Transmission) are 0 for
+        # camera rays. "Ray Depth"/"Ray Length" fold to 0 / 0 as a neutral.
+        if name == "Is Camera Ray":
+            return [1.0, 1.0, 1.0]
+        return [0.0, 0.0, 0.0]
+    if bl in ("ShaderNodeTexSky", "ShaderNodeTexEnvironment"):
+        # Without evaluating the sky model, daylight-sky zenith colour is a
+        # reasonable average for folding into a MixShader / Emission.
+        return [0.5, 0.65, 0.85]
+    return None
 
 
 # Stack of ShaderNodeGroup nodes currently being resolved by _from_group.
@@ -2045,21 +2253,9 @@ def _from_principled(node, buf, textures) -> dict:
         p["transmission"] = _socket_f(node.inputs[trans_name])
 
     if "Emission" in node.inputs:
-        if node.inputs["Emission"].is_linked:
-            _warn(
-                f"emission-linked:{node.as_pointer()}",
-                f"{_node_tag(node)}: Emission input is linked but color graphs "
-                f"on emission aren't baked — using constant default",
-            )
-        p["emission"] = _socket_rgb(node.inputs["Emission"])
+        p["emission"] = _emission_constant_color(node, node.inputs["Emission"])
     elif "Emission Color" in node.inputs:
-        if node.inputs["Emission Color"].is_linked:
-            _warn(
-                f"emission-col-linked:{node.as_pointer()}",
-                f"{_node_tag(node)}: Emission Color is linked but color graphs "
-                f"on emission aren't baked — using constant default",
-            )
-        color = _socket_rgb(node.inputs["Emission Color"])
+        color = _emission_constant_color(node, node.inputs["Emission Color"])
         if "Emission Strength" in node.inputs:
             _warn_linked_scalar(node, "Emission Strength")
             strength = _socket_f(node.inputs["Emission Strength"])
@@ -2320,13 +2516,7 @@ def _from_transparent(node, buf, textures) -> dict:
 def _from_emission(node, buf, textures) -> dict:
     p = _default_params()
     color_sock = node.inputs["Color"]
-    if color_sock.is_linked:
-        _warn(
-            f"emit-color-linked:{node.as_pointer()}",
-            f"{_node_tag(node)}: Color is linked but emission color graphs "
-            f"aren't baked — using constant default",
-        )
-    color = _socket_rgb(color_sock)
+    color = _emission_constant_color(node, color_sock)
     if "Strength" in node.inputs:
         _warn_linked_scalar(node, "Strength")
         strength = _socket_f(node.inputs["Strength"])
@@ -2335,6 +2525,27 @@ def _from_emission(node, buf, textures) -> dict:
     p["emission"] = [c * strength for c in color]
     p["base_color"] = [0.0, 0.0, 0.0]
     return p
+
+
+def _emission_constant_color(node, color_sock) -> list[float]:
+    """Resolve an Emission-style Color socket to a constant RGB.
+
+    Walks the chain through bakeable transforms + procedural/leaf folding. If
+    the chain isn't foldable (e.g. a live TexImage drives the emission), we
+    warn and fall back to the socket's default. The renderer stores emission
+    as a constant RGB, so there's no "bake to texture" option here.
+    """
+    if not color_sock.is_linked:
+        return _socket_rgb(color_sock)
+    rgb = _socket_constant_rgb(color_sock)
+    if rgb is not None:
+        return rgb
+    _warn(
+        f"emit-color-linked:{node.as_pointer()}",
+        f"{_node_tag(node)}: Color chain isn't foldable to a constant "
+        f"(textured emission) — using socket default",
+    )
+    return _socket_rgb(color_sock)
 
 
 def _from_mix(node, buf, textures, mat_name: str) -> dict:
@@ -2351,21 +2562,22 @@ def _from_mix(node, buf, textures, mat_name: str) -> dict:
 
     fac_sock = node.inputs[0]
     if fac_sock.is_linked:
-        # Per-pixel Factor (Fresnel, LayerWeight, texture mask, ...) can't
-        # collapse to a single scalar without losing the spatial signal.
-        # Keep shader1 unchanged: this matches the Blender convention where
-        # shader1 is the body/base and shader2 an overlay that dominates only
-        # at grazing / masked regions (Fresnel ≈ 0 at normal incidence), and
-        # avoids blending p2's colour into the base (which would wash a
-        # red/blue body towards a white clearcoat).
-        _warn(
-            f"mixshader-fac-linked:{node.as_pointer()}",
-            f"{_node_tag(node)}: MixShader Factor is linked — keeping "
-            f"shader1's params (per-pixel mix not bakeable)",
-        )
-        return dict(p1)
-
-    fac = _socket_f(fac_sock)
+        # Try to fold the factor to a scalar (Fresnel / LayerWeight /
+        # constant-driven Math / procedural → mean). Fresnel and LayerWeight
+        # fold to 0 at normal incidence, which picks shader1 — the body in
+        # Blender's shader1/shader2 = base/overlay convention. The renderer's
+        # Principled Fresnel handles the view-dependent blend itself.
+        fac = _resolve_constant_scalar(fac_sock)
+        if fac is None:
+            _warn(
+                f"mixshader-fac-linked:{node.as_pointer()}",
+                f"{_node_tag(node)}: MixShader Factor is linked and not "
+                f"foldable — keeping shader1's params (per-pixel mix not "
+                f"bakeable)",
+            )
+            return dict(p1)
+    else:
+        fac = _socket_f(fac_sock)
     primary = p1 if fac < 0.5 else p2
     out = dict(primary)
     # Scalar params lerp; textures / graphs / normal maps come from `primary`
