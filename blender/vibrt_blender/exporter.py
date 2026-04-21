@@ -48,6 +48,45 @@ def _write_u32(buf: bytearray, xs) -> dict:
     return {"offset": off, "len": int(arr.nbytes)}
 
 
+def _resolve_height_source(node, tag):
+    """Walk a scalar-height node chain down to a ShaderNodeTexImage.
+
+    Returns (tex_image_node, extra_strength_scale) or (None, 1.0).
+    Currently handles ShaderNodeHueSaturation as a pass-through: its Hue/Sat
+    shifts don't change a greyscale height reading, but Value*Fac scales the
+    output amplitude linearly, so we fold that into the displacement strength.
+    Everything else is returned as-is for the caller to validate.
+    """
+    if node.bl_idname == "ShaderNodeTexImage":
+        return node, 1.0
+    if node.bl_idname == "ShaderNodeHueSaturation":
+        for n in ("Hue", "Saturation", "Value", "Fac"):
+            s = node.inputs.get(n)
+            if s is not None and s.is_linked:
+                print(
+                    f"[vibrt] warn: {tag}: HueSaturation.{n} is linked — "
+                    f"using constant default ({s.default_value})"
+                )
+        hue = float(node.inputs["Hue"].default_value) if "Hue" in node.inputs else 0.5
+        sat = float(node.inputs["Saturation"].default_value) if "Saturation" in node.inputs else 1.0
+        val = float(node.inputs["Value"].default_value) if "Value" in node.inputs else 1.0
+        fac = float(node.inputs["Fac"].default_value) if "Fac" in node.inputs else 1.0
+        if abs(hue - 0.5) > 1e-4 or abs(sat - 1.0) > 1e-4:
+            print(
+                f"[vibrt] warn: {tag}: HueSaturation Hue/Saturation on a "
+                f"displacement-height chain are ignored (height is scalar); "
+                f"only Value*Fac is applied"
+            )
+        col_sock = node.inputs.get("Color")
+        if col_sock is None or not col_sock.is_linked:
+            return None, 1.0
+        upstream, inner_scale = _resolve_height_source(col_sock.links[0].from_node, tag)
+        # Blender's HSV mix lerps (value_input, modified) by Fac; for a
+        # linear height reading that's strength *= (1 - fac) + fac * val.
+        return upstream, inner_scale * ((1.0 - fac) + fac * val)
+    return node, 1.0
+
+
 def _find_displacement(obj_eval, buf, textures):
     """Return (tex_id, strength) for the first material slot's Displacement
     output that drives a single TexImage; (None, 0.0) otherwise.
@@ -85,16 +124,21 @@ def _find_displacement(obj_eval, buf, textures):
                     f"— displacement ignored"
                 )
                 continue
-            upstream = height_sock.links[0].from_node
-            if upstream.bl_idname == "ShaderNodeTexImage" and upstream.image is not None:
+            upstream_node, extra_scale = _resolve_height_source(
+                height_sock.links[0].from_node, tag
+            )
+            if (upstream_node is not None
+                    and upstream_node.bl_idname == "ShaderNodeTexImage"
+                    and upstream_node.image is not None):
                 from . import material_export
                 tex_id = material_export.export_image_texture(
-                    upstream.image, buf, textures, "linear"
+                    upstream_node.image, buf, textures, "linear"
                 )
-                return tex_id, strength
+                return tex_id, strength * extra_scale
+            driver = upstream_node.bl_idname if upstream_node is not None else "None"
             print(
                 f"[vibrt] warn: {tag}: Displacement.Height driven by "
-                f"{upstream.bl_idname} (expected ShaderNodeTexImage) "
+                f"{driver} (expected ShaderNodeTexImage) "
                 f"— displacement ignored"
             )
         elif src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
