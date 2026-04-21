@@ -29,6 +29,11 @@ pub struct ColorGraphNode {
     pub payload: [u32; 15],
 }
 
+// Layout contract with `devicecode.h`: 16 × u32, no padding, 4-byte aligned.
+// Host-side uploaders rely on this to reinterpret `&[ColorGraphNode]` as `&[u32]`.
+const _: () = assert!(std::mem::size_of::<ColorGraphNode>() == 64);
+const _: () = assert!(std::mem::align_of::<ColorGraphNode>() == 4);
+
 // Must stay in sync with `devicecode.h` and `scene_loader.rs`.
 pub const COLOR_NODE_CONST: u32 = 0;
 pub const COLOR_NODE_IMAGE_TEX: u32 = 1;

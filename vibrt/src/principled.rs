@@ -86,9 +86,14 @@ pub fn upload_color_graph(
         }
     }
     let flat = flatten_color_graph(graph, textures, &lut_ptrs)?;
-    // Each ColorGraphNode is 16 u32 (64 bytes). `flat` is that already, but
-    // packed as a Vec<u32> for cheap htod.
-    let slice = stream.clone_htod(&flat).cuda()?;
+    // ColorGraphNode is repr(C) + 16 × u32 with no padding (see the
+    // compile-time size/align asserts in `gpu_types.rs`), so reinterpreting
+    // the buffer as `&[u32]` is sound and lets us reuse the existing
+    // CudaSlice<u32> storage in `bufs`.
+    let flat_u32: &[u32] = unsafe {
+        std::slice::from_raw_parts(flat.as_ptr() as *const u32, flat.len() * 16)
+    };
+    let slice = stream.clone_htod(flat_u32).cuda()?;
     let ptr = dptr_u32(&slice, stream);
     bufs.push(slice);
     let len = graph.nodes.len() as i32;
@@ -114,12 +119,15 @@ fn flatten_color_graph(
     graph: &ColorGraph,
     textures: &[(optix_sys::CUdeviceptr, i32, i32)],
     lut_ptrs: &[optix_sys::CUdeviceptr],
-) -> Result<Vec<u32>> {
-    let mut out: Vec<u32> = Vec::with_capacity(graph.nodes.len() * 16);
+) -> Result<Vec<ColorGraphNode>> {
+    let mut out: Vec<ColorGraphNode> = Vec::with_capacity(graph.nodes.len());
     for (i, node) in graph.nodes.iter().enumerate() {
-        let mut record = [0u32; 16];
+        let mut record = ColorGraphNode {
+            tag: 0,
+            payload: [0u32; 15],
+        };
         flatten_one(node, i, textures, lut_ptrs, &mut record)?;
-        out.extend_from_slice(&record);
+        out.push(record);
     }
     Ok(out)
 }
@@ -129,7 +137,7 @@ fn flatten_one(
     self_idx: usize,
     textures: &[(optix_sys::CUdeviceptr, i32, i32)],
     lut_ptrs: &[optix_sys::CUdeviceptr],
-    out: &mut [u32; 16],
+    out: &mut ColorGraphNode,
 ) -> Result<()> {
     let check_ref = |r: u32, field: &str| -> Result<()> {
         if (r as usize) >= self_idx {
@@ -143,25 +151,26 @@ fn flatten_one(
             Ok(())
         }
     };
+    let p = &mut out.payload;
     match node {
         ColorNode::Const { rgb } => {
-            out[0] = COLOR_NODE_CONST;
-            out[1] = rgb[0].to_bits();
-            out[2] = rgb[1].to_bits();
-            out[3] = rgb[2].to_bits();
+            out.tag = COLOR_NODE_CONST;
+            p[0] = rgb[0].to_bits();
+            p[1] = rgb[1].to_bits();
+            p[2] = rgb[2].to_bits();
         }
         ColorNode::ImageTex { tex, uv } => {
             let (ptr, w, h) = *textures.get(*tex as usize).ok_or_else(|| {
                 anyhow!("color_graph ImageTex.tex = {} out of range", tex)
             })?;
-            out[0] = COLOR_NODE_IMAGE_TEX;
-            out[1] = ptr as u32;
-            out[2] = (ptr >> 32) as u32;
-            out[3] = w as u32;
-            out[4] = h as u32;
-            out[5] = 4; // RGBA f32 — every loaded texture is padded to 4 channels
+            out.tag = COLOR_NODE_IMAGE_TEX;
+            p[0] = ptr as u32;
+            p[1] = (ptr >> 32) as u32;
+            p[2] = w as u32;
+            p[3] = h as u32;
+            p[4] = 4; // RGBA f32 — every loaded texture is padded to 4 channels
             for k in 0..6 {
-                out[6 + k] = uv[k].to_bits();
+                p[5 + k] = uv[k].to_bits();
             }
         }
         ColorNode::Mix {
@@ -174,30 +183,30 @@ fn flatten_one(
             check_ref(*a, "a")?;
             check_ref(*b, "b")?;
             let blend_id = parse_blend(blend)?;
-            out[0] = COLOR_NODE_MIX;
-            out[1] = *a;
-            out[2] = *b;
-            out[3] = blend_id;
+            out.tag = COLOR_NODE_MIX;
+            p[0] = *a;
+            p[1] = *b;
+            p[2] = blend_id;
             match fac {
                 ColorFactor::Const(v) => {
-                    out[4] = 0; // fac_src = const
-                    out[5] = 0;
-                    out[7] = v.to_bits();
+                    p[3] = 0; // fac_src = const
+                    p[4] = 0;
+                    p[6] = v.to_bits();
                 }
                 ColorFactor::Node { node } => {
                     check_ref(*node, "fac.node")?;
-                    out[4] = 1; // fac_src = node
-                    out[5] = *node;
-                    out[7] = 0;
+                    p[3] = 1; // fac_src = node
+                    p[4] = *node;
+                    p[6] = 0;
                 }
             }
-            out[6] = if *clamp { 1 } else { 0 };
+            p[5] = if *clamp { 1 } else { 0 };
         }
         ColorNode::Invert { input, fac } => {
             check_ref(*input, "input")?;
-            out[0] = COLOR_NODE_INVERT;
-            out[1] = *input;
-            out[2] = fac.to_bits();
+            out.tag = COLOR_NODE_INVERT;
+            p[0] = *input;
+            p[1] = fac.to_bits();
         }
         ColorNode::Math {
             input,
@@ -209,13 +218,13 @@ fn flatten_one(
         } => {
             check_ref(*input, "input")?;
             let op_id = parse_math_op(op)?;
-            out[0] = COLOR_NODE_MATH;
-            out[1] = *input;
-            out[2] = op_id;
-            out[3] = if *clamp { 1 } else { 0 };
-            out[4] = b.to_bits();
-            out[5] = c.to_bits();
-            out[6] = if *swap { 1 } else { 0 };
+            out.tag = COLOR_NODE_MATH;
+            p[0] = *input;
+            p[1] = op_id;
+            p[2] = if *clamp { 1 } else { 0 };
+            p[3] = b.to_bits();
+            p[4] = c.to_bits();
+            p[5] = if *swap { 1 } else { 0 };
         }
         ColorNode::HueSat {
             input,
@@ -225,20 +234,20 @@ fn flatten_one(
             fac,
         } => {
             check_ref(*input, "input")?;
-            out[0] = COLOR_NODE_HUE_SAT;
-            out[1] = *input;
-            out[2] = hue.to_bits();
-            out[3] = saturation.to_bits();
-            out[4] = value.to_bits();
-            out[5] = fac.to_bits();
+            out.tag = COLOR_NODE_HUE_SAT;
+            p[0] = *input;
+            p[1] = hue.to_bits();
+            p[2] = saturation.to_bits();
+            p[3] = value.to_bits();
+            p[4] = fac.to_bits();
         }
         ColorNode::RgbCurve { input, .. } => {
             check_ref(*input, "input")?;
             let lut_ptr = lut_ptrs[self_idx];
-            out[0] = COLOR_NODE_RGB_CURVE;
-            out[1] = *input;
-            out[2] = lut_ptr as u32;
-            out[3] = (lut_ptr >> 32) as u32;
+            out.tag = COLOR_NODE_RGB_CURVE;
+            p[0] = *input;
+            p[1] = lut_ptr as u32;
+            p[2] = (lut_ptr >> 32) as u32;
         }
         ColorNode::BrightContrast {
             input,
@@ -246,13 +255,13 @@ fn flatten_one(
             contrast,
         } => {
             check_ref(*input, "input")?;
-            out[0] = COLOR_NODE_BRIGHT_CONTRAST;
-            out[1] = *input;
-            out[2] = bright.to_bits();
-            out[3] = contrast.to_bits();
+            out.tag = COLOR_NODE_BRIGHT_CONTRAST;
+            p[0] = *input;
+            p[1] = bright.to_bits();
+            p[2] = contrast.to_bits();
         }
         ColorNode::VertexColor {} => {
-            out[0] = COLOR_NODE_VERTEX_COLOR;
+            out.tag = COLOR_NODE_VERTEX_COLOR;
         }
     }
     Ok(())
