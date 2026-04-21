@@ -1019,11 +1019,16 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
       r.f = r.f + make_float3(coat_f, coat_f, coat_f) * NoL;
     }
 
-    // --- Sheen: soft angular cosine lobe on top of diffuse. ---
+    // --- Sheen: soft grazing-angle lobe on top of diffuse. Symmetric in
+    // NoV and NoL so the BRDF is reciprocal, and normalised by 1/π so the
+    // integral stays bounded as sheen_roughness→0. Still an ad-hoc shape
+    // (not Charlie), but energy-sane and reciprocal.
     float sheen_w = mc->sheen_weight;
     if (sheen_w > 0.0f) {
       float sr = fmaxf(mc->sheen_roughness, 1e-3f);
-      float sf = powf(fmaxf(1.0f - NoV, 0.0f), 1.0f / sr) * sheen_w;
+      float inv_sr = 1.0f / sr;
+      float sf = powf(fmaxf(1.0f - NoV, 0.0f), inv_sr) *
+                 powf(fmaxf(1.0f - NoL, 0.0f), inv_sr) * sheen_w * INV_PIf;
       float3 tint = make_f3(mc->sheen_tint);
       r.f = r.f + tint * sf * NoL;
     }
@@ -1536,10 +1541,14 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
     // Flip normal if ray hit backside (for dielectric transmission). Mirror
     // the bitangent instead of rebuilding the frame so the authored tangent
     // rotation (anisotropy axis) survives on back-faces; negating one axis
-    // keeps (T, B, Ns) right-handed.
+    // keeps (T, B, Ns) right-handed. Also invert e.ior: sample_bsdf and
+    // eval_bsdf read it as η_t/η_i for the current incident side, so on a
+    // back-face hit (ray exiting the medium) we need 1/ior to get correct
+    // Fresnel and TIR.
     if (dot3(v.Ns, -dir) < 0.0f) {
       e.Ns = -e.Ns;
       e.B = -e.B;
+      e.ior = 1.0f / e.ior;
     }
 
     // Emission (add on primary or after specular bounce)
