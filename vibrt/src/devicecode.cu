@@ -938,13 +938,15 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
   float NoL_wrap = 0.5f * (1.0f + NoL);
 
   if (reflect) {
-    // Diffuse (Lambert, possibly wrap-shifted by SSS)
+    // Diffuse (Lambert, possibly wrap-shifted by SSS). The wrap term only
+    // modifies f — the sampler is plain cosine hemisphere, so the MIS pdf
+    // has to stay at NoL/π to match what was actually sampled.
     if (w_diffuse > 0.0f) {
       float effective = (1.0f - sss_w) * NoL_std + sss_w * NoL_wrap;
       float3 bc_sss = e.base_color * (make_float3(1, 1, 1) * (1.0f - sss_w) +
                                       sss_tint * sss_w);
       r.f = r.f + bc_sss * (INV_PIf * w_diffuse * effective);
-      r.pdf += p_diff * fmaxf(effective, 0.0f) * INV_PIf;
+      r.pdf += p_diff * NoL_std * INV_PIf;
     }
     // Specular (metallic + dielectric spec layer)
     float3 H = normalize3(wo + wi);
@@ -1026,13 +1028,14 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
       r.f = r.f + tint * sf * NoL;
     }
   } else if (sss_backlit) {
-    // Back-lit diffuse via SSS wrap lobe only.
+    // Back-lit diffuse via SSS wrap lobe only. The cosine-hemisphere sampler
+    // can't reach below-surface directions, so r.pdf stays 0 here — NEE
+    // carries these paths and the MIS weight falls to the NEE side.
     float w_wrap = fmaxf(NoL_wrap, 0.0f);
     if (w_wrap > 0.0f && w_diffuse > 0.0f) {
       float3 bc_sss = e.base_color * (make_float3(1, 1, 1) * (1.0f - sss_w) +
                                       sss_tint * sss_w);
       r.f = r.f + bc_sss * (INV_PIf * w_diffuse * sss_w * w_wrap);
-      r.pdf += p_diff * w_wrap * INV_PIf * sss_w;
     }
   } else if (transmit) {
     // Rough dielectric transmission (Walter et al.). Half-vector
@@ -1530,10 +1533,13 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
     }
 
     MaterialEval e = eval_material(v);
-    // Flip normal if ray hit backside (for dielectric transmission).
+    // Flip normal if ray hit backside (for dielectric transmission). Mirror
+    // the bitangent instead of rebuilding the frame so the authored tangent
+    // rotation (anisotropy axis) survives on back-faces; negating one axis
+    // keeps (T, B, Ns) right-handed.
     if (dot3(v.Ns, -dir) < 0.0f) {
       e.Ns = -e.Ns;
-      build_frame(e.Ns, e.T, e.B);
+      e.B = -e.B;
     }
 
     // Emission (add on primary or after specular bounce)
@@ -1568,9 +1574,14 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
       throughput = throughput / q;
     }
 
-    // Offset along geometric normal to reduce self-intersection
+    // Offset along geometric normal to reduce self-intersection. Scale with
+    // |P| so large-coordinate scenes (e.g. archviz authored in cm) don't
+    // fall below float-precision noise while the 1e-4 floor still covers
+    // unit-scale scenes.
     float3 offset_n = dot3(bs.wi, v.Ng) > 0.0f ? v.Ng : -v.Ng;
-    origin = v.P + offset_n * 1e-4f;
+    float p_scale = fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
+    float eps = fmaxf(1e-4f, p_scale * 1e-5f);
+    origin = v.P + offset_n * eps;
     dir = bs.wi;
   }
   return L;
