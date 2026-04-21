@@ -53,19 +53,6 @@ _PREMIX_CACHE: dict = {}
 _LINEAR_RGB_CACHE: dict = {}
 
 
-# Per-(material_name, attribute_name) mean RGB for vertex color attributes,
-# populated by the exporter before material export runs. Lets ShaderNodeAttribute
-# collapse to the mesh's actual mean colour rather than the neutral (1,1,1)
-# fallback — critical for attributes used as dominant colour (e.g. classroom
-# wallClock_darkWood frame, whose `Col` bakes near-black onto the rim).
-_ATTRIBUTE_MEANS: dict = {}
-
-
-def set_attribute_means(means: dict) -> None:
-    _ATTRIBUTE_MEANS.clear()
-    _ATTRIBUTE_MEANS.update(means)
-
-
 def reset_stats() -> None:
     _STATS["material_self_s"] = 0.0
     _STATS["texture_self_s"] = 0.0
@@ -389,105 +376,6 @@ def _warn_linked_scalar(node, input_name: str) -> None:
     )
 
 
-# Procedural / data-driven leaves that have no TexImage behind them. Treated
-# as approximate constants when feeding the "other" side of a Mix bake — the
-# spatial detail they would add is lost, but the resulting tint usually still
-# matches the artist's intent better than dropping the whole chain.
-_PROCEDURAL_LEAF_DEFAULTS: dict[str, list[float]] = {
-    "ShaderNodeTexNoise": [0.5, 0.5, 0.5],
-    "ShaderNodeTexWave": [0.5, 0.5, 0.5],
-    "ShaderNodeTexMusgrave": [0.5, 0.5, 0.5],
-    "ShaderNodeTexVoronoi": [0.5, 0.5, 0.5],
-    "ShaderNodeTexMagic": [0.5, 0.5, 0.5],
-    "ShaderNodeTexChecker": [0.5, 0.5, 0.5],
-    "ShaderNodeTexGradient": [0.5, 0.5, 0.5],
-    "ShaderNodeTexSky": [0.5, 0.5, 0.5],
-    # Vertex / object data — neutral white so an Attribute used as a
-    # multiplicative tint collapses to identity.
-    "ShaderNodeAttribute": [1.0, 1.0, 1.0],
-    "ShaderNodeObjectInfo": [1.0, 1.0, 1.0],
-    "ShaderNodeParticleInfo": [1.0, 1.0, 1.0],
-    "ShaderNodeUVMap": [0.5, 0.5, 0.0],
-}
-
-
-def _attribute_driven_color(sock, depth: int = 0):
-    """Detect a ShaderNodeAttribute driving `sock`, through Mix nodes whose
-    factor is a compile-time 0 or 1. Returns `(attribute_name, tint_rgb)` or
-    `None`.
-
-    The renderer multiplies `base_color * vertex_color` at the hit point, so
-    `tint_rgb` is the per-material factor that collapses the non-attribute
-    side of the Mix into a constant:
-
-    - MIX fac=1, B=Attribute: `result = B` → tint = (1,1,1).
-    - MULTIPLY fac=1, B=Attribute: `result = A * B` → tint ≈ A_const.
-    - OVERLAY fac=1, B=Attribute (as in classroom `wallClock_darkWood`):
-      `result = 2*A*B` when A<0.5 per channel — approximated as `tint =
-      clamp(2*A_const, 0, 1)`. A is the ColorRamp over a noise mix here,
-      which folds near-0.5 via procedural leaf defaults, giving a mid-dark
-      wood tint that the per-vertex mask further darkens to near-black.
-    """
-    if depth > 4 or not sock.is_linked:
-        return None
-    src = sock.links[0].from_node
-    if src.bl_idname == "ShaderNodeAttribute":
-        name = getattr(src, "attribute_name", "") or ""
-        return (name, [1.0, 1.0, 1.0]) if name else None
-    if src.bl_idname in ("ShaderNodeMix", "ShaderNodeMixRGB"):
-        fac_sock, a_sock, b_sock, blend, _use_clamp, ok = _mix_node_params(src)
-        if not ok or fac_sock.is_linked:
-            return None
-        fac = _socket_f(fac_sock)
-        if blend == "MIX":
-            if fac >= 0.999:
-                return _attribute_driven_color(b_sock, depth + 1)
-            if fac <= 0.001:
-                return _attribute_driven_color(a_sock, depth + 1)
-            return None
-        if blend not in ("MULTIPLY", "OVERLAY", "DARKEN"):
-            return None
-        if fac < 0.999:
-            return None
-        inner_a = _attribute_driven_color(a_sock, depth + 1)
-        inner_b = _attribute_driven_color(b_sock, depth + 1)
-        if inner_b is not None:
-            other_const = _socket_constant_rgb(a_sock)
-            if other_const is None:
-                return None
-            attr_name, inner_tint = inner_b
-            tint = [c * t for c, t in zip(other_const, inner_tint)]
-        elif inner_a is not None:
-            other_const = _socket_constant_rgb(b_sock)
-            if other_const is None:
-                return None
-            attr_name, inner_tint = inner_a
-            tint = [c * t for c, t in zip(other_const, inner_tint)]
-        else:
-            return None
-        if blend == "OVERLAY":
-            tint = [min(2.0 * c, 1.0) for c in tint]
-        return attr_name, tint
-    return None
-
-
-def _leaf_constant_rgb(src) -> list[float]:
-    """Best-effort constant colour for a non-bakeable leaf node.
-
-    For ShaderNodeAttribute, prefer the mesh's precomputed mean of the named
-    vertex-colour attribute (see `_ATTRIBUTE_MEANS`) so attributes used as the
-    dominant colour side of a Mix don't collapse to white. Falls back to the
-    neutral default for unknown names or non-attribute leaves.
-    """
-    if src.bl_idname == "ShaderNodeAttribute":
-        attr_name = getattr(src, "attribute_name", "") or ""
-        if attr_name and _CURRENT_MATERIAL:
-            mean = _ATTRIBUTE_MEANS.get((_CURRENT_MATERIAL, attr_name))
-            if mean is not None:
-                return list(mean)
-    return list(_PROCEDURAL_LEAF_DEFAULTS[src.bl_idname])
-
-
 def _socket_constant_rgb(sock) -> list[float] | None:
     """Return a constant RGB triple if the socket is effectively constant.
 
@@ -514,8 +402,6 @@ def _resolve_constant_socket(sock, depth: int = 0):
         if temp_sock is None or temp_sock.is_linked:
             return None
         return _blackbody_to_linear_rgb(_socket_f(temp_sock))
-    if src.bl_idname in _PROCEDURAL_LEAF_DEFAULTS:
-        return _leaf_constant_rgb(src)
     if src.bl_idname == "ShaderNodeTexImage":
         # A real texture isn't a constant; callers handle textures separately.
         return None
@@ -575,44 +461,12 @@ def _resolve_constant_socket(sock, depth: int = 0):
     return None
 
 
-# Representative scalar values for VALUE outputs that have no fold-able
-# definition — per-object random, procedural noise, vertex attributes etc.
-# 0.5 is the mean of a uniform [0, 1] so boolean Math ops around random
-# sources land on their threshold in a sensible spot. Used only when a Mix's
-# Factor can't be baked into a texture and we'd otherwise drop the Mix's
-# contribution entirely.
-_SCALAR_LEAF_DEFAULTS: dict[tuple[str, str], float] = {
-    ("ShaderNodeObjectInfo", "Random"): 0.5,
-    ("ShaderNodeObjectInfo", "Object Index"): 0.0,
-    ("ShaderNodeObjectInfo", "Material Index"): 0.0,
-    ("ShaderNodeParticleInfo", "Random"): 0.5,
-    ("ShaderNodeParticleInfo", "Index"): 0.0,
-    ("ShaderNodeParticleInfo", "Age"): 0.0,
-    ("ShaderNodeParticleInfo", "Lifetime"): 1.0,
-    ("ShaderNodeAttribute", "Fac"): 1.0,
-    ("ShaderNodeTexNoise", "Fac"): 0.5,
-    ("ShaderNodeTexNoise", "Factor"): 0.5,
-    ("ShaderNodeTexVoronoi", "Distance"): 0.5,
-    ("ShaderNodeTexWave", "Fac"): 0.5,
-    ("ShaderNodeTexWave", "Factor"): 0.5,
-    ("ShaderNodeTexMagic", "Fac"): 0.5,
-    ("ShaderNodeTexMagic", "Factor"): 0.5,
-    ("ShaderNodeTexChecker", "Fac"): 0.5,
-    ("ShaderNodeTexChecker", "Factor"): 0.5,
-    ("ShaderNodeTexGradient", "Fac"): 0.5,
-    ("ShaderNodeTexGradient", "Factor"): 0.5,
-    ("ShaderNodeTexMusgrave", "Fac"): 0.5,
-    ("ShaderNodeTexMusgrave", "Height"): 0.5,
-}
-
-
 def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
-    """Fold a VALUE socket to a single float, walking Math/Clamp/Value and
-    substituting non-foldable leaves (Random, procedural noise) with their
-    representative means in `_SCALAR_LEAF_DEFAULTS`.
+    """Fold a VALUE socket to a single float, walking Math/Clamp/Value.
 
-    Returns None when we hit a node we can't evaluate — callers that need a
-    strict constant (no approximation) should inspect the socket themselves.
+    Returns None when we hit a node we can't evaluate — no "representative
+    mean" substitution for non-foldable leaves (Random, procedural noise).
+    Callers must handle the None by warning and dropping the effect.
     """
     if depth > 8:
         return None
@@ -626,17 +480,8 @@ def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
             return None
     link = sock.links[0]
     src = link.from_node
-    out_name = link.from_socket.name
     if src.bl_idname == "ShaderNodeValue":
         return float(src.outputs[0].default_value)
-    leaf = _SCALAR_LEAF_DEFAULTS.get((src.bl_idname, out_name))
-    if leaf is not None:
-        return leaf
-    # Colour-leaf used as a scalar: Blender would luminance-convert. Match the
-    # socket's expected range by using the leaf's procedural default.
-    if src.bl_idname in _PROCEDURAL_LEAF_DEFAULTS:
-        col = _leaf_constant_rgb(src)
-        return 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2]
     if src.bl_idname == "ShaderNodeMath":
         return _eval_math_constant(src, depth + 1)
     if src.bl_idname == "ShaderNodeClamp":
@@ -953,14 +798,13 @@ def _export_linked_scalar_texture(sock, buf, textures):
 
 
 _CONSTANT_LEAF_NODES = frozenset((
-    # No texture lives behind these; `_socket_constant_rgb` folds them into
-    # bakeable Mix operands (with an approximate constant for procedurals),
-    # so chain traversal can stop here without warning.
+    # Exact-constant sources: `_socket_constant_rgb` folds these into bakeable
+    # Mix operands. No procedural / data-driven leaves — those don't resolve to
+    # a single constant and must break the chain instead of being faked.
     "ShaderNodeRGB",
     "ShaderNodeBlackbody",
     "ShaderNodeWavelength",
     "ShaderNodeValue",
-    *list(_PROCEDURAL_LEAF_DEFAULTS),
 ))
 
 
@@ -1484,6 +1328,39 @@ _SUPPORTED_MIX_BLENDS = frozenset((
 ))
 
 
+def _find_base_color_attribute(sock, depth: int = 0) -> str | None:
+    """Return the attribute name if `sock` is driven — directly or through any
+    chain of Mix / MixRGB nodes — by a ShaderNodeAttribute. Otherwise None.
+
+    Used by the BSDF helpers to spot a per-vertex colour mask sitting in the
+    Base Color chain (e.g. classroom's `wallClock_darkWood` wood mask). The
+    renderer multiplies base_color × vertex_color at the hit point, so
+    callers set base_color=(1,1,1) and let the per-hit attribute drive the
+    colour unmodulated — no tint inference, no procedural substitution, no
+    mean-colour fallback. When the artist also blended in a procedural or
+    texture alongside the Attribute, that side is dropped: picking up the
+    spatial vertex-mask signal is more faithful than synthesising a constant
+    stand-in for the non-attribute side.
+    """
+    if depth > 6 or not sock.is_linked:
+        return None
+    src = sock.links[0].from_node
+    if src.bl_idname == "ShaderNodeAttribute":
+        name = getattr(src, "attribute_name", "") or ""
+        return name or None
+    if src.bl_idname in ("ShaderNodeMix", "ShaderNodeMixRGB"):
+        _fac, a_sock, b_sock, _blend, _clamp, ok = _mix_node_params(src)
+        if not ok:
+            return None
+        # Prefer B (Blender convention: shader A = body, shader B = overlay)
+        # but try both so the detection is symmetric.
+        return (
+            _find_base_color_attribute(b_sock, depth + 1)
+            or _find_base_color_attribute(a_sock, depth + 1)
+        )
+    return None
+
+
 def _mix_node_params(node):
     """Return `(fac_sock, a_sock, b_sock, blend, use_clamp, ok)` for a Mix node,
     or `(*_, False)` if the node isn't a bakeable RGBA-mode Mix.
@@ -1650,10 +1527,9 @@ def _try_premix_two_textures(mix_node, group_stack):
             if img_b is None and const_b is None:
                 return None
         else:
-            # No texture behind the factor chain; try folding Math / data
-            # leaves (Random, procedural noise) to a representative scalar.
-            # `_mix_transform` picks this up for tex-vs-const shapes, so only
-            # claim the premix when both colour sides are textures.
+            # No texture behind the factor chain; fold Math/Clamp/Value to a
+            # real constant. `_mix_transform` picks up tex-vs-const shapes, so
+            # only claim the premix when both colour sides are textures.
             chain_f = ()
             fac_scalar = _resolve_constant_scalar(fac_sock)
             if fac_scalar is None or img_a is None or img_b is None:
@@ -2094,7 +1970,9 @@ def _resolve_shader(node, buf, textures, mat_name: str) -> dict:
     if bl == "ShaderNodeBsdfTransparent":
         return _from_transparent(node, buf, textures)
     if bl == "ShaderNodeBsdfSheen" or bl == "ShaderNodeBsdfVelvet":
-        return _from_sheen(node, buf, textures)
+        # Sheen has no native slot in the simplified Principled; treat the
+        # Color input as a rough diffuse so the surface isn't blacked out.
+        return _from_diffuse(node, buf, textures)
     if bl == "ShaderNodeMixShader":
         return _from_mix(node, buf, textures, mat_name)
     if bl == "ShaderNodeBsdfGlass":
@@ -2129,15 +2007,16 @@ def _from_principled(node, buf, textures) -> dict:
             # the factor to avoid tinting the texture.
             p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
             p["base_color"] = [1.0, 1.0, 1.0]
-        else:
-            attr_info = _attribute_driven_color(bc)
-            if attr_info is not None:
-                attr_name, tint = attr_info
+        elif bc.is_linked:
+            attr = _find_base_color_attribute(bc)
+            if attr is not None:
                 p["use_vertex_color"] = True
-                p["_vertex_color_attr"] = attr_name
-                p["base_color"] = tint
+                p["_vertex_color_attr"] = attr
+                p["base_color"] = [1.0, 1.0, 1.0]
             else:
                 p["base_color"] = _socket_rgb(bc)
+        else:
+            p["base_color"] = _socket_rgb(bc)
 
     tex = _export_linked_scalar_texture(node.inputs["Metallic"], buf, textures)
     if tex is not None:
@@ -2319,15 +2198,16 @@ def _from_diffuse(node, buf, textures) -> dict:
         if img is not None:
             p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
             p["base_color"] = [1.0, 1.0, 1.0]
-        else:
-            attr_info = _attribute_driven_color(color_sock)
-            if attr_info is not None:
-                attr_name, tint = attr_info
+        elif color_sock.is_linked:
+            attr = _find_base_color_attribute(color_sock)
+            if attr is not None:
                 p["use_vertex_color"] = True
-                p["_vertex_color_attr"] = attr_name
-                p["base_color"] = tint
+                p["_vertex_color_attr"] = attr
+                p["base_color"] = [1.0, 1.0, 1.0]
             else:
                 p["base_color"] = _socket_rgb(color_sock)
+        else:
+            p["base_color"] = _socket_rgb(color_sock)
     _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
     return p
 
@@ -2408,7 +2288,13 @@ def _from_refraction(node, buf, textures) -> dict:
 
 
 def _from_add(node, buf, textures, mat_name: str) -> dict:
-    """Add Shader: sum of two branches. Average surface-like params, sum emission."""
+    """Add Shader: sum of emission, max of transmission, p1's surface params.
+
+    The renderer has one BSDF slot, so we can't actually add two lobes — the
+    best faithful fallback is to keep p1's surface and sum the emissive
+    contributions. Transmission takes the max so Add(Glass, Emission) still
+    refracts.
+    """
     in1, in2 = node.inputs[0], node.inputs[1]
     n1 = in1.links[0].from_node if in1.is_linked else None
     n2 = in2.links[0].from_node if in2.is_linked else None
@@ -2417,16 +2303,6 @@ def _from_add(node, buf, textures, mat_name: str) -> dict:
     out = dict(p1)
     out["emission"] = [a + b for a, b in zip(p1["emission"], p2["emission"])]
     out["transmission"] = max(p1["transmission"], p2["transmission"])
-    # Prefer the non-emission branch's surface params when mixing with an Emission.
-    if sum(p1["emission"]) > 0 and sum(p2["emission"]) == 0:
-        out["base_color"] = p2["base_color"]
-        out["metallic"] = p2["metallic"]
-        out["roughness"] = p2["roughness"]
-        for k in ("base_color_tex", "normal_tex", "roughness_tex",
-                  "metallic_tex", "bump_tex", "normal_strength",
-                  "bump_strength", "uv_transform", "alpha_threshold"):
-            if k in p2:
-                out[k] = p2[k]
     return out
 
 
@@ -2445,36 +2321,14 @@ def _from_transparent(node, buf, textures) -> dict:
     return p
 
 
-def _from_sheen(node, buf, textures) -> dict:
-    """Velvet / Sheen BSDF → Principled with only the sheen lobe active.
-
-    base_color=0 kills the Lambert diffuse; metallic=0 keeps the spec lobe
-    dielectric and roughness=1 makes it near-Lambertian so it contributes
-    little. The grazing-angle colour lives in sheen_tint.
-    """
-    p = _default_params()
-    p["base_color"] = [0.0, 0.0, 0.0]
-    p["metallic"] = 0.0
-    p["roughness"] = 1.0
-    p["sheen_weight"] = 1.0
-    color_sock = node.inputs.get("Color")
-    if color_sock is not None:
-        p["sheen_tint"] = _socket_rgb(color_sock)
-    rough_sock = node.inputs.get("Roughness")
-    if rough_sock is not None:
-        p["sheen_roughness"] = _socket_f(rough_sock)
-    _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
-    return p
-
-
 def _from_emission(node, buf, textures) -> dict:
     p = _default_params()
     color_sock = node.inputs["Color"]
     if color_sock.is_linked:
         _warn(
             f"emit-color-linked:{node.as_pointer()}",
-            f"{_node_tag(node)}: Color is linked but emission is driven by the "
-            f"constant default (texture only contributes as unlit base_color_tex)",
+            f"{_node_tag(node)}: Color is linked but emission color graphs "
+            f"aren't baked — using constant default",
         )
     color = _socket_rgb(color_sock)
     if "Strength" in node.inputs:
@@ -2484,91 +2338,57 @@ def _from_emission(node, buf, textures) -> dict:
         strength = 1.0
     p["emission"] = [c * strength for c in color]
     p["base_color"] = [0.0, 0.0, 0.0]
-    # Allow a color texture to be picked up as base_color_tex (shaded on the
-    # emissive surface below the emission term).
-    img = _socket_linked_image(color_sock)
-    if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
     return p
 
 
 def _from_mix(node, buf, textures, mat_name: str) -> dict:
+    """Shader Mix: lerp Principled params by the constant Factor.
+
+    A linked Factor is not bakeable into scalar params, so we warn and lerp at
+    fac=0.5 — the least-biased collapse (and no side is silently dropped).
+    """
     in1, in2 = node.inputs[1], node.inputs[2]
     n1 = in1.links[0].from_node if in1.is_linked else None
     n2 = in2.links[0].from_node if in2.is_linked else None
     p1 = _resolve_shader(n1, buf, textures, mat_name) if n1 else _default_params()
     p2 = _resolve_shader(n2, buf, textures, mat_name) if n2 else _default_params()
-    t1 = n1.bl_idname if n1 else None
-    t2 = n2.bl_idname if n2 else None
-
-    diffuse_like = {"ShaderNodeBsdfDiffuse", "ShaderNodeBsdfTranslucent"}
-    glossy_like = {"ShaderNodeBsdfGlossy", "ShaderNodeBsdfAnisotropic"}
-    if (t1 in diffuse_like and t2 in glossy_like) or (t2 in diffuse_like and t1 in glossy_like):
-        diff = p1 if t1 in diffuse_like else p2
-        gloss = p1 if t1 in glossy_like else p2
-        out = dict(diff)
-        out["roughness"] = gloss["roughness"]
-        out["metallic"] = 0.0
-        if "roughness_tex" in gloss:
-            out["roughness_tex"] = gloss["roughness_tex"]
-        for k in ("normal_tex", "normal_strength", "bump_tex",
-                  "bump_strength", "alpha_threshold"):
-            if k not in out and k in gloss:
-                out[k] = gloss[k]
-        return out
 
     fac_sock = node.inputs[0]
-    fresnel_driven = False
     if fac_sock.is_linked:
-        src = fac_sock.links[0].from_node
-        src_sock = fac_sock.links[0].from_socket.name.lower()
-        fresnel_driven = src.bl_idname == "ShaderNodeFresnel" or (
-            src.bl_idname == "ShaderNodeLayerWeight" and src_sock == "fresnel"
+        # Per-pixel Factor (Fresnel, LayerWeight, texture mask, ...) can't
+        # collapse to a single scalar without losing the spatial signal.
+        # Keep shader1 unchanged: this matches the Blender convention where
+        # shader1 is the body/base and shader2 an overlay that dominates only
+        # at grazing / masked regions (Fresnel ≈ 0 at normal incidence), and
+        # avoids blending p2's colour into the base (which would wash a
+        # red/blue body towards a white clearcoat).
+        _warn(
+            f"mixshader-fac-linked:{node.as_pointer()}",
+            f"{_node_tag(node)}: MixShader Factor is linked — keeping "
+            f"shader1's params (per-pixel mix not bakeable)",
         )
-    # color_fac drives the base_color blend; rough_fac drives the roughness
-    # blend. For clearcoat-style Fresnel mixes the second branch is a specular
-    # overlay (visible only near grazing), so we keep the body colour from
-    # slot 1 but borrow some of the overlay's lower roughness so highlights
-    # stay sharp.
-    if fac_sock.is_linked:
-        if fresnel_driven:
-            color_fac = 0.0
-            rough_fac = 0.3
-        else:
-            color_fac = 0.5
-            rough_fac = 0.5
-    else:
-        color_fac = _socket_f(fac_sock)
-        rough_fac = color_fac
+        return dict(p1)
 
-    # Car-paint pattern: Fresnel-mix(body Glossy, clearcoat Glossy) is a
-    # metallic base with a sharp dielectric overlay. Principled can express it
-    # via its coat layer (dielectric Fresnel GGX), but our sampler only has one
-    # spec lobe — at the ratio body_rough≈0.5, coat_rough≈0.1 the coat's narrow
-    # D spikes produce fireflies. Use a single metallic lobe and bias roughness
-    # heavily toward the clearcoat so grazing highlights stay tight. Schlick
-    # takes care of the Fresnel-to-white transition at grazing on its own.
-    if fresnel_driven and t1 in glossy_like and t2 in glossy_like:
-        out = dict(p1)
-        if "roughness_tex" not in out:
-            rough_fac = 0.7
-            out["roughness"] = (
-                p1["roughness"] * (1.0 - rough_fac) + p2["roughness"] * rough_fac
-            )
-        return out
-
-    primary = p1 if color_fac < 0.5 else p2
-    other = p2 if color_fac < 0.5 else p1
+    fac = _socket_f(fac_sock)
+    primary = p1 if fac < 0.5 else p2
     out = dict(primary)
+    # Scalar params lerp; textures / graphs / normal maps come from `primary`
+    # (they can't be weighted on the host).
     if "base_color_tex" not in out and "color_graph" not in out:
         bc1, bc2 = p1["base_color"], p2["base_color"]
         out["base_color"] = [
-            bc1[i] * (1.0 - color_fac) + bc2[i] * color_fac for i in range(3)
+            bc1[i] * (1.0 - fac) + bc2[i] * fac for i in range(3)
         ]
     if "roughness_tex" not in out:
-        out["roughness"] = p1["roughness"] * (1.0 - rough_fac) + p2["roughness"] * rough_fac
-    out["emission"] = [max(a, b) for a, b in zip(primary["emission"], other["emission"])]
-    out["transmission"] = max(primary["transmission"], other["transmission"])
+        out["roughness"] = p1["roughness"] * (1.0 - fac) + p2["roughness"] * fac
+    if "metallic_tex" not in out:
+        out["metallic"] = p1["metallic"] * (1.0 - fac) + p2["metallic"] * fac
+    out["emission"] = [
+        a * (1.0 - fac) + b * fac for a, b in zip(p1["emission"], p2["emission"])
+    ]
+    out["transmission"] = (
+        p1["transmission"] * (1.0 - fac) + p2["transmission"] * fac
+    )
     return out
 
 

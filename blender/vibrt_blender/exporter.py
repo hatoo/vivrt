@@ -48,45 +48,6 @@ def _write_u32(buf: bytearray, xs) -> dict:
     return {"offset": off, "len": int(arr.nbytes)}
 
 
-def _resolve_height_source(node, tag):
-    """Walk a scalar-height node chain down to a ShaderNodeTexImage.
-
-    Returns (tex_image_node, extra_strength_scale) or (None, 1.0).
-    Currently handles ShaderNodeHueSaturation as a pass-through: its Hue/Sat
-    shifts don't change a greyscale height reading, but Value*Fac scales the
-    output amplitude linearly, so we fold that into the displacement strength.
-    Everything else is returned as-is for the caller to validate.
-    """
-    if node.bl_idname == "ShaderNodeTexImage":
-        return node, 1.0
-    if node.bl_idname == "ShaderNodeHueSaturation":
-        for n in ("Hue", "Saturation", "Value", "Fac"):
-            s = node.inputs.get(n)
-            if s is not None and s.is_linked:
-                print(
-                    f"[vibrt] warn: {tag}: HueSaturation.{n} is linked — "
-                    f"using constant default ({s.default_value})"
-                )
-        hue = float(node.inputs["Hue"].default_value) if "Hue" in node.inputs else 0.5
-        sat = float(node.inputs["Saturation"].default_value) if "Saturation" in node.inputs else 1.0
-        val = float(node.inputs["Value"].default_value) if "Value" in node.inputs else 1.0
-        fac = float(node.inputs["Fac"].default_value) if "Fac" in node.inputs else 1.0
-        if abs(hue - 0.5) > 1e-4 or abs(sat - 1.0) > 1e-4:
-            print(
-                f"[vibrt] warn: {tag}: HueSaturation Hue/Saturation on a "
-                f"displacement-height chain are ignored (height is scalar); "
-                f"only Value*Fac is applied"
-            )
-        col_sock = node.inputs.get("Color")
-        if col_sock is None or not col_sock.is_linked:
-            return None, 1.0
-        upstream, inner_scale = _resolve_height_source(col_sock.links[0].from_node, tag)
-        # Blender's HSV mix lerps (value_input, modified) by Fac; for a
-        # linear height reading that's strength *= (1 - fac) + fac * val.
-        return upstream, inner_scale * ((1.0 - fac) + fac * val)
-    return node, 1.0
-
-
 def _find_displacement(obj_eval, buf, textures):
     """Return (tex_id, strength) for the first material slot's Displacement
     output that drives a single TexImage; (None, 0.0) otherwise.
@@ -124,21 +85,17 @@ def _find_displacement(obj_eval, buf, textures):
                     f"— displacement ignored"
                 )
                 continue
-            upstream_node, extra_scale = _resolve_height_source(
-                height_sock.links[0].from_node, tag
-            )
-            if (upstream_node is not None
-                    and upstream_node.bl_idname == "ShaderNodeTexImage"
+            upstream_node = height_sock.links[0].from_node
+            if (upstream_node.bl_idname == "ShaderNodeTexImage"
                     and upstream_node.image is not None):
                 from . import material_export
                 tex_id = material_export.export_image_texture(
                     upstream_node.image, buf, textures, "linear"
                 )
-                return tex_id, strength * extra_scale
-            driver = upstream_node.bl_idname if upstream_node is not None else "None"
+                return tex_id, strength
             print(
                 f"[vibrt] warn: {tag}: Displacement.Height driven by "
-                f"{driver} (expected ShaderNodeTexImage) "
+                f"{upstream_node.bl_idname} (expected ShaderNodeTexImage) "
                 f"— displacement ignored"
             )
         elif src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
@@ -169,8 +126,8 @@ def _export_mesh(
     cost on non-trivial meshes (seconds per 100k-tri object vs milliseconds).
 
     If `vc_attr_name` is given and the mesh has a matching colour attribute,
-    emits f32x3 per emitted vertex (one per triangle corner, matching the
-    duplicated-vertex layout) so the renderer can interpolate it.
+    emits f32x3 per emitted vertex so the renderer can interpolate it against
+    a material with `use_vertex_color=True`.
     """
     import numpy as np
 
@@ -506,69 +463,6 @@ def _export_world(world, buf: bytearray, textures: list) -> dict:
     return {"type": "constant", "color": [0, 0, 0], "strength": 0.0}
 
 
-def _collect_attribute_means(depsgraph) -> dict:
-    """Mean colour per (material_name, attribute_name) across mesh objects.
-
-    Feeds `material_export.set_attribute_means`. ShaderNodeAttribute nodes
-    otherwise fold to neutral white, which breaks shaders (classroom
-    wallClock_darkWood) where the attribute is the dominant colour input to a
-    Mix. Using the mesh's actual mean keeps the baked colour close to what
-    Cycles would render.
-
-    Imprecise on meshes with multiple material slots — the mesh's overall
-    attribute mean is credited to every referenced material rather than split
-    per-slot. Good enough for this export path, where the typical use is a
-    single-material asset (the clock frame) with a darkening mask attribute.
-    """
-    import numpy as np
-    acc: dict = {}
-    seen_meshes: set = set()
-    for inst in depsgraph.object_instances:
-        obj = inst.object
-        obj_eval = obj if inst.is_instance else obj.evaluated_get(depsgraph)
-        if obj_eval.type != "MESH":
-            continue
-        me = obj_eval.data
-        if me is None:
-            continue
-        mesh_ptr = me.as_pointer()
-        if mesh_ptr in seen_meshes:
-            continue
-        seen_meshes.add(mesh_ptr)
-        col_attrs = getattr(me, "color_attributes", None)
-        if not col_attrs:
-            continue
-        mats_used = {s.material.name for s in obj_eval.material_slots if s.material}
-        if not mats_used:
-            continue
-        for ca in col_attrs:
-            n = len(ca.data)
-            if n == 0:
-                continue
-            buf = np.empty(n * 4, dtype=np.float32)
-            try:
-                ca.data.foreach_get("color", buf)
-            except Exception:
-                continue
-            rgb = buf.reshape(n, 4)[:, :3]
-            sum_rgb = rgb.sum(axis=0)
-            for mat_name in mats_used:
-                key = (mat_name, ca.name)
-                e = acc.get(key)
-                if e is None:
-                    acc[key] = [float(sum_rgb[0]), float(sum_rgb[1]), float(sum_rgb[2]), n]
-                else:
-                    e[0] += float(sum_rgb[0])
-                    e[1] += float(sum_rgb[1])
-                    e[2] += float(sum_rgb[2])
-                    e[3] += n
-    return {
-        key: [r / n, g / n, b / n]
-        for key, (r, g, b, n) in acc.items()
-        if n > 0
-    }
-
-
 def export_scene(
     depsgraph: bpy.types.Depsgraph,
     json_path: Path,
@@ -576,7 +470,6 @@ def export_scene(
 ):
     t0 = time.perf_counter()
     material_export.reset_stats()
-    material_export.set_attribute_means(_collect_attribute_means(depsgraph))
     mesh_s = 0.0
     slow_meshes: list[tuple] = []
     scene = depsgraph.scene_eval
@@ -589,10 +482,10 @@ def export_scene(
     textures: list[dict] = []
     materials: list[dict] = []
     material_index: dict[str, int] = {}
-    # Materials that drive base_color from a ShaderNodeAttribute flag the
+    # Materials whose Base Color is driven by a ShaderNodeAttribute stash the
     # attribute name on their exported dict under `_vertex_color_attr`. We pop
-    # it here so the material JSON stays clean, and remember it so meshes that
-    # reference the material can emit the matching vertex-colour blob.
+    # it so the material JSON stays clean and record it per-material so meshes
+    # that reference the material can emit the matching vertex-colour blob.
     material_vc_attr: dict[str, str] = {}
 
     def resolve_material(mat) -> int:
@@ -640,8 +533,6 @@ def export_scene(
             continue
 
         if obj_eval.type == "MESH":
-            # Resolve materials before mesh export — _export_mesh needs to know
-            # which vertex-colour attribute (if any) a bound material references.
             slot_mat_ids: list[int] = []
             vc_attr_name: str | None = None
             if obj_eval.material_slots:
@@ -652,8 +543,6 @@ def export_scene(
             if not slot_mat_ids:
                 slot_mat_ids = [resolve_material(None)]
 
-            # Same mesh data exported with / without vertex colour would need
-            # separate blobs, so fold the attribute name into the cache key.
             mkey = f"{obj_eval.data.name}#{obj_eval.name}#vc={vc_attr_name}"
             mesh_id = mesh_cache.get(mkey)
             if mesh_id is None:
