@@ -176,6 +176,29 @@ impl Denoiser {
         error::check(result)
     }
 
+    /// Compute a single-float HDR intensity for an input image.
+    pub fn compute_intensity(
+        &self,
+        stream: optix_sys::CUstream,
+        input: &Image2D,
+        output_intensity: optix_sys::CUdeviceptr,
+        scratch: optix_sys::CUdeviceptr,
+        scratch_size: usize,
+    ) -> Result<()> {
+        let raw_input = input.to_raw();
+        let result = unsafe {
+            (self.table.raw.optixDenoiserComputeIntensity.unwrap())(
+                self.raw,
+                stream,
+                &raw_input,
+                output_intensity,
+                scratch,
+                scratch_size,
+            )
+        };
+        error::check(result)
+    }
+
     /// Invoke the denoiser.
     pub fn invoke(
         &self,

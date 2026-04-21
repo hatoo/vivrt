@@ -1661,6 +1661,44 @@ extern "C" __global__ void __raygen__rg() {
   float3 V = make_f3(params.cam_v);
   float3 W = make_f3(params.cam_w);
 
+  // Denoiser guide AOVs: one un-jittered primary ray into the first surface.
+  // Keeps guides crisp (no sub-pixel averaging) and cheap (one trace/pixel).
+  if (params.albedo_aov != nullptr || params.normal_aov != nullptr) {
+    float px0 = (2.0f * ((float)idx.x + 0.5f) / (float)dim.x) - 1.0f;
+    float py0 = (2.0f * ((float)idx.y + 0.5f) / (float)dim.y) - 1.0f;
+    float3 dir0 = normalize3(U * px0 + V * py0 + W);
+    PathVertex v;
+    v.hit = 0;
+    unsigned int hi, lo;
+    pack_ptr(&v, hi, lo);
+    optixTrace(params.traversable, eye, dir0, 1e-4f, 1e20f, 0.0f,
+               OptixVisibilityMask(0x01), OPTIX_RAY_FLAG_NONE, 0, 2, 0, hi, lo);
+    float3 alb = make_float3(0, 0, 0);
+    float3 nrm = make_float3(0, 0, 0);
+    if (v.hit != 0) {
+      MaterialEval e = eval_material(v);
+      if (dot3(e.Ns, -dir0) < 0.0f)
+        e.Ns = -e.Ns;
+      alb = e.base_color;
+      float3 Uu = normalize3(U);
+      float3 Vu = normalize3(V);
+      // W is already unit (camera forward).
+      nrm = make_float3(dot3(e.Ns, Uu), dot3(e.Ns, Vu), dot3(e.Ns, W));
+    }
+    if (params.albedo_aov != nullptr) {
+      float *a = &params.albedo_aov[pixel * 3];
+      a[0] = alb.x;
+      a[1] = alb.y;
+      a[2] = alb.z;
+    }
+    if (params.normal_aov != nullptr) {
+      float *n = &params.normal_aov[pixel * 3];
+      n[0] = nrm.x;
+      n[1] = nrm.y;
+      n[2] = nrm.z;
+    }
+  }
+
   float3 accum = make_float3(0, 0, 0);
   for (unsigned int s = 0; s < params.samples_per_pixel; s++) {
     RNG rng(pixel, s, 0u);

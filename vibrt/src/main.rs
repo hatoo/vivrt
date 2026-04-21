@@ -53,6 +53,10 @@ struct Args {
     /// Only compile the device code.
     #[arg(long)]
     compile_only: bool,
+
+    /// Run the OptiX AI denoiser on the final image.
+    #[arg(long)]
+    denoise: bool,
 }
 
 pub trait CudaResultExt<T> {
@@ -169,10 +173,10 @@ fn main() -> Result<()> {
         scene.rect_lights.len(),
     );
 
-    render(&scene, &output)
+    render(&scene, &output, args.denoise)
 }
 
-fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
+fn render(scene: &LoadedScene, output: &std::path::Path, denoise: bool) -> Result<()> {
     let cuda_ctx = CudaContext::new(0).cuda().context("CUDA context")?;
     let stream = cuda_ctx.default_stream();
     let cu_stream = stream.cu_stream() as optix_sys::CUstream;
@@ -547,6 +551,20 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
     let pixel_count = (scene.file.render.width * scene.file.render.height) as usize;
     let d_image: CudaSlice<f32> = stream.alloc_zeros(pixel_count * 4).cuda()?;
 
+    // Denoiser guide AOVs: allocated (float3 per pixel) only when --denoise.
+    let d_albedo: Option<CudaSlice<f32>> = if denoise {
+        Some(stream.alloc_zeros(pixel_count * 3).cuda()?)
+    } else {
+        None
+    };
+    let d_normal: Option<CudaSlice<f32>> = if denoise {
+        Some(stream.alloc_zeros(pixel_count * 3).cuda()?)
+    } else {
+        None
+    };
+    let albedo_aov = d_albedo.as_ref().map_or(0, |s| dptr_f32(s, &stream));
+    let normal_aov = d_normal.as_ref().map_or(0, |s| dptr_f32(s, &stream));
+
     let lp = LaunchParams {
         image: dptr_f32(&d_image, &stream),
         width: scene.file.render.width,
@@ -582,6 +600,8 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
         ggx_e_lut: d_ggx_e,
         ggx_e_avg_lut: d_ggx_e_avg,
         clamp_indirect: scene.file.render.clamp_indirect,
+        albedo_aov,
+        normal_aov,
     };
     let d_params = alloc_and_copy(&stream, &lp)?;
 
@@ -601,8 +621,128 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
     stream.synchronize().cuda()?;
     println!("Render: {:.2?}", t0.elapsed());
 
+    // --- Optional OptiX denoiser (AOV model, HDR float4, no guides) ---
+    let d_final = if denoise {
+        let t_dn = std::time::Instant::now();
+        let w = scene.file.render.width;
+        let h = scene.file.render.height;
+
+        let denoiser = denoiser::Denoiser::new(
+            &ctx,
+            DenoiserModelKind::Aov,
+            &denoiser::DenoiserOptions {
+                guide_albedo: true,
+                guide_normal: true,
+                ..Default::default()
+            },
+        )
+        .context("denoiser create")?;
+
+        let sizes = denoiser.compute_memory_resources(w, h).context("denoiser sizes")?;
+        let d_state: CudaSlice<u8> = unsafe { stream.alloc(sizes.state_size) }.cuda()?;
+        let d_scratch: CudaSlice<u8> = unsafe { stream.alloc(sizes.without_overlap_scratch_size) }.cuda()?;
+        let d_intensity_scratch: CudaSlice<u8> =
+            unsafe { stream.alloc(sizes.compute_intensity_size) }.cuda()?;
+        let d_intensity: CudaSlice<f32> = stream.alloc_zeros(1).cuda()?;
+        let d_denoised: CudaSlice<f32> = stream.alloc_zeros(pixel_count * 4).cuda()?;
+
+        denoiser
+            .setup(
+                cu_stream,
+                w,
+                h,
+                dptr_u8(&d_state, &stream),
+                sizes.state_size,
+                dptr_u8(&d_scratch, &stream),
+                sizes.without_overlap_scratch_size,
+            )
+            .context("denoiser setup")?;
+
+        let pixel_stride = 4 * mem::size_of::<f32>() as u32;
+        let input_image = denoiser::Image2D {
+            data: dptr_f32(&d_image, &stream),
+            width: w,
+            height: h,
+            row_stride: w * pixel_stride,
+            pixel_stride,
+            format: PixelFormat::Float4,
+        };
+        let output_image = denoiser::Image2D {
+            data: dptr_f32(&d_denoised, &stream),
+            ..input_image
+        };
+
+        denoiser
+            .compute_intensity(
+                cu_stream,
+                &input_image,
+                dptr_f32(&d_intensity, &stream),
+                dptr_u8(&d_intensity_scratch, &stream),
+                sizes.compute_intensity_size,
+            )
+            .context("denoiser compute_intensity")?;
+
+        let params = denoiser::DenoiserParams {
+            hdr_intensity: dptr_f32(&d_intensity, &stream),
+            blend_factor: 0.0,
+            hdr_average_color: 0,
+            temporal_mode_use_previous_layers: false,
+        };
+        let layer = denoiser::DenoiserLayer {
+            input: input_image,
+            output: output_image,
+            previous_output: None,
+        };
+
+        let f3_stride = 3 * mem::size_of::<f32>() as u32;
+        let guide_albedo_img = d_albedo.as_ref().map(|s| denoiser::Image2D {
+            data: dptr_f32(s, &stream),
+            width: w,
+            height: h,
+            row_stride: w * f3_stride,
+            pixel_stride: f3_stride,
+            format: PixelFormat::Float3,
+        });
+        let guide_normal_img = d_normal.as_ref().map(|s| denoiser::Image2D {
+            data: dptr_f32(s, &stream),
+            width: w,
+            height: h,
+            row_stride: w * f3_stride,
+            pixel_stride: f3_stride,
+            format: PixelFormat::Float3,
+        });
+        let guide = denoiser::DenoiserGuideLayer {
+            albedo: guide_albedo_img,
+            normal: guide_normal_img,
+            flow: None,
+        };
+
+        denoiser
+            .invoke(
+                cu_stream,
+                &params,
+                dptr_u8(&d_state, &stream),
+                sizes.state_size,
+                &guide,
+                &[layer],
+                0,
+                0,
+                dptr_u8(&d_scratch, &stream),
+                sizes.without_overlap_scratch_size,
+            )
+            .context("denoiser invoke")?;
+        stream.synchronize().cuda()?;
+        println!("Denoise: {:.2?}", t_dn.elapsed());
+
+        // Keep scratch/state buffers alive until the stream has caught up.
+        drop((d_state, d_scratch, d_intensity_scratch, d_intensity));
+        d_denoised
+    } else {
+        d_image
+    };
+
     // --- Readback + save ---
-    let rgba: Vec<f32> = stream.clone_dtoh(&d_image).cuda()?;
+    let rgba: Vec<f32> = stream.clone_dtoh(&d_final).cuda()?;
     image_io::save_image(
         output,
         scene.file.render.width,

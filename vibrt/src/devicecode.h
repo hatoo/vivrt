@@ -158,6 +158,12 @@ struct LaunchParams {
 
   // Clamp for indirect (bounce>=1) contributions. <=0 disables.
   float clamp_indirect;
+
+  // Denoiser guide AOVs (optional; null when denoising is off). Each is one
+  // float3 per pixel, captured from a single un-jittered primary ray.
+  // `normal_aov` is in camera space: X=right, Y=up, Z=forward.
+  float *albedo_aov;
+  float *normal_aov;
 };
 
 struct RayGenData {};

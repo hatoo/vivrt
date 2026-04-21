@@ -216,6 +216,11 @@ pub struct LaunchParams {
     pub ggx_e_avg_lut: optix_sys::CUdeviceptr,
 
     pub clamp_indirect: f32,
+
+    /// Denoiser guide AOV buffers (float3/pixel). 0 when denoising is off.
+    pub albedo_aov: optix_sys::CUdeviceptr,
+    /// Camera-space shading normal (X=right, Y=up, Z=forward).
+    pub normal_aov: optix_sys::CUdeviceptr,
 }
 
 #[repr(C)]
