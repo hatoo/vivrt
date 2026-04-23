@@ -55,9 +55,14 @@ DENOISE_FLAG     := $(if $(strip $(DENOISE)),--denoise)
 ADDON_ZIP     := blender/vibrt_blender.zip
 ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
 
-.PHONY: all scenes previews cycles-previews addon dev-install clean FORCE $(SCENES) $(PREVIEW_TARGETS) $(BLEND_PREVIEW_TARGETS) $(BLEND_CYCLES_TARGETS)
+.PHONY: all scenes previews cycles-previews addon dev-install clean vibrt-build FORCE $(SCENES) $(PREVIEW_TARGETS) $(BLEND_PREVIEW_TARGETS) $(BLEND_CYCLES_TARGETS)
 
 FORCE:
+
+# Build the Rust binary that previews depend on. Cargo is incremental, so
+# this is a no-op when nothing changed.
+vibrt-build:
+	cargo build --release -p vibrt
 
 all: scenes
 
@@ -77,14 +82,14 @@ $(BLEND_CYCLES_TARGETS): %-cycles: test_scenes/%/preview_cycles.png
 test_scenes/%/scene.json: test_scenes/%/make_scene.py
 	cd $(dir $<) && $(PYTHON) make_scene.py
 
-test_scenes/%/preview.png: test_scenes/%/scene.json FORCE
+test_scenes/%/preview.png: test_scenes/%/scene.json vibrt-build FORCE
 	$(VIBRT) $< --spp $(SPP) --output $@ $(DENOISE_FLAG)
 
 # .blend scenes go via scripts/render_blend.py, which spawns Blender to export
 # then runs vibrt. Rebuilds when the .blend or the addon's Python sources
 # change (the latter because material_export.py changes the exported scene).
 define BLEND_PREVIEW_RULE
-test_scenes/$(1)/preview.png: $$(BLEND_SCENE_$(1)) $$(ADDON_SOURCES) scripts/render_blend.py scripts/_blender_export.py FORCE
+test_scenes/$(1)/preview.png: $$(BLEND_SCENE_$(1)) $$(ADDON_SOURCES) scripts/render_blend.py scripts/_blender_export.py vibrt-build FORCE
 	$$(PYTHON) scripts/render_blend.py $$< --output $$@ --spp $$(SPP) --vibrt $$(VIBRT) $$(PCT_FLAG) $$(TEXTURE_PCT_FLAG) $$(DENOISE_FLAG)
 endef
 $(foreach s,$(BLEND_SCENES),$(eval $(call BLEND_PREVIEW_RULE,$(s))))
