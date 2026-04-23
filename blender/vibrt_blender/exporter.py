@@ -704,6 +704,7 @@ def export_scene(
     depsgraph: bpy.types.Depsgraph,
     json_path: Path,
     bin_path: Path,
+    texture_pct: int | None = None,
 ):
     t0 = time.perf_counter()
     material_export.reset_stats()
@@ -740,7 +741,7 @@ def export_scene(
         w, h = int(img.size[0]), int(img.size[1])
         if w > 0 and h > 0:
             max_pixel_count = max(max_pixel_count, w * h)
-    material_export.begin_export(max_pixel_count)
+    material_export.begin_export(max_pixel_count, texture_pct=texture_pct)
 
     try:
         with bin_path.open("wb") as f:
@@ -910,11 +911,16 @@ def export_scene(
         + world_s + json_dump_s + bin_write_s + json_write_s
     )
     other_s = max(0.0, dt - accounted)
+    tex_pct_str = (
+        f", texture_pct={texture_pct}%"
+        if texture_pct is not None and texture_pct != 100 else ""
+    )
     print(
         f"[vibrt] export {dt:.2f}s "
         f"({len(meshes)} mesh, {len(objects)} obj, "
         f"{len(textures)} tex, {len(materials)} mat, "
-        f"{bin_size/1024/1024:.1f}MB bin, {stats['pixel_bytes']/1024/1024:.1f}MB px)"
+        f"{bin_size/1024/1024:.1f}MB bin, {stats['pixel_bytes']/1024/1024:.1f}MB px"
+        f"{tex_pct_str})"
     )
     print(
         f"[vibrt]   mesh={mesh_s:.2f}s  material={material_s:.2f}s  "

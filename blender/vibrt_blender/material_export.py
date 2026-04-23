@@ -123,21 +123,28 @@ def _node_tag(node) -> str:
 # RenderEngine.render is serial on the main thread, so no locking needed.
 _REUSABLE_PIXELS = None
 
+# Integer percentage applied to final-written texture dimensions, or None/100
+# for no-op. Intermediate caches (linear RGB, mean RGBA, premix) still operate
+# at full resolution; the downsample only affects what lands in scene.bin.
+_TEXTURE_PCT = None
 
-def begin_export(max_pixel_count: int) -> None:
+
+def begin_export(max_pixel_count: int, texture_pct: int | None = None) -> None:
     """Allocate the reusable foreach_get buffer for the upcoming export."""
     import numpy as np
-    global _REUSABLE_PIXELS
+    global _REUSABLE_PIXELS, _TEXTURE_PCT
     # `max(1, ...)` so a scene with no images still produces a valid view
     # should export_image_texture be invoked for an empty image.
     n = max(1, int(max_pixel_count)) * 4
     _REUSABLE_PIXELS = np.empty(n, dtype=np.float32)
+    _TEXTURE_PCT = texture_pct
 
 
 def end_export() -> None:
     """Release the reusable buffer so peak RAM drops back once export is done."""
-    global _REUSABLE_PIXELS
+    global _REUSABLE_PIXELS, _TEXTURE_PCT
     _REUSABLE_PIXELS = None
+    _TEXTURE_PCT = None
 
 
 class _PreBakedTexture:
@@ -208,6 +215,14 @@ def export_image_texture(
         )
     if chain:
         pixels, colorspace = _bake_chain(pixels, width, height, colorspace, chain)
+    if _TEXTURE_PCT is not None and _TEXTURE_PCT != 100:
+        new_w = max(1, int(round(width * _TEXTURE_PCT / 100.0)))
+        new_h = max(1, int(round(height * _TEXTURE_PCT / 100.0)))
+        if (new_w, new_h) != (width, height):
+            rgba = pixels.reshape((height, width, 4))
+            rgba = _resample_bilinear(rgba, new_h, new_w)
+            pixels = np.ascontiguousarray(rgba, dtype=np.float32).reshape(-1)
+            width, height = new_w, new_h
     desc = {
         "width": int(width),
         "height": int(height),
@@ -234,13 +249,21 @@ def _export_prebaked(pb: "_PreBakedTexture", writer, textures: list) -> int:
     for i, t in enumerate(textures):
         if t.get("_key") == pb.cache_key:
             return i
+    rgb = pb.rgb
+    w, h = int(pb.w), int(pb.h)
+    if _TEXTURE_PCT is not None and _TEXTURE_PCT != 100:
+        new_w = max(1, int(round(w * _TEXTURE_PCT / 100.0)))
+        new_h = max(1, int(round(h * _TEXTURE_PCT / 100.0)))
+        if (new_w, new_h) != (w, h):
+            rgb = _resample_bilinear(rgb, new_h, new_w)
+            w, h = new_w, new_h
     rgba = np.concatenate(
-        [pb.rgb, np.ones((pb.h, pb.w, 1), dtype=np.float32)], axis=-1
+        [rgb, np.ones((h, w, 1), dtype=np.float32)], axis=-1
     )
     pixels = np.ascontiguousarray(rgba, dtype=np.float32).reshape(-1)
     desc = {
-        "width": int(pb.w),
-        "height": int(pb.h),
+        "width": w,
+        "height": h,
         "channels": 4,
         "colorspace": "linear",
         "pixels": writer.write_f32(pixels),

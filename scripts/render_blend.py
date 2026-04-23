@@ -34,6 +34,9 @@ def main() -> int:
                     help="run the OptiX AI denoiser on the final image")
     ap.add_argument("--percentage", type=int, default=None,
                     help="override render resolution percentage (e.g. 25 for 1/4 size)")
+    ap.add_argument("--texture-pct", type=int, default=None,
+                    help="downsample exported textures to N%% of original size "
+                         "(e.g. 25 for quarter-res); defaults to full size")
     ap.add_argument("--scene", default=None,
                     help="Blender scene name to use (default: active scene)")
     ap.add_argument("--blender", default=os.environ.get("BLENDER", DEFAULT_BLENDER))
@@ -59,6 +62,8 @@ def main() -> int:
         export_argv = ["--workdir", str(workdir)]
         if args.percentage is not None:
             export_argv += ["--percentage", str(args.percentage)]
+        if args.texture_pct is not None:
+            export_argv += ["--texture-pct", str(args.texture_pct)]
         if args.scene is not None:
             export_argv += ["--scene", args.scene]
         cmd = [

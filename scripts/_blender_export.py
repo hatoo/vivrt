@@ -35,6 +35,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--workdir", type=Path, required=True)
     ap.add_argument("--percentage", type=int, default=None)
+    ap.add_argument("--texture-pct", type=int, default=None,
+                    help="downsample all exported textures to N%% of their "
+                         "original size (e.g. 25 for quarter-res)")
     ap.add_argument("--scene", default=None)
     args = ap.parse_args(argv)
 
@@ -54,6 +57,7 @@ def main() -> None:
         depsgraph,
         args.workdir / "scene.json",
         args.workdir / "scene.bin",
+        texture_pct=args.texture_pct,
     )
     print(f"[vibrt] exported to {args.workdir}")
 
