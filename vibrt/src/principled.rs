@@ -56,6 +56,9 @@ pub fn upload_color_graph(
     bufs: &mut Vec<CudaSlice<u32>>,
     f_bufs: &mut Vec<CudaSlice<f32>>,
 ) -> Result<ColorGraphGpu> {
+    // Collapse fully-constant subgraphs before any GPU work (incl. LUT upload).
+    let folded = crate::color_fold::fold_constants(graph);
+    let graph = &folded;
     if graph.nodes.len() > 255 {
         return Err(anyhow!(
             "color_graph has {} nodes (max 255)",
@@ -267,7 +270,7 @@ fn flatten_one(
     Ok(())
 }
 
-fn parse_blend(s: &str) -> Result<u32> {
+pub(crate) fn parse_blend(s: &str) -> Result<u32> {
     Ok(match s {
         "mix" => 0,
         "multiply" => 1,
@@ -285,7 +288,7 @@ fn parse_blend(s: &str) -> Result<u32> {
     })
 }
 
-fn parse_math_op(s: &str) -> Result<u32> {
+pub(crate) fn parse_math_op(s: &str) -> Result<u32> {
     Ok(match s {
         "add" => 0,
         "subtract" => 1,

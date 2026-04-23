@@ -164,7 +164,7 @@ pub struct PrincipledMaterial {
 /// value is the material's base colour. Input indices must be strictly
 /// less than the owning node's index so the graph stays a DAG in
 /// topological order.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct ColorGraph {
     pub nodes: Vec<ColorNode>,
     /// Index of the output node. Default: last node.
@@ -174,14 +174,14 @@ pub struct ColorGraph {
 
 /// Factor input for a Mix node: either a constant scalar or a reference to
 /// another node's value (converted to luminance at evaluation time).
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(untagged)]
 pub enum ColorFactor {
     Const(f32),
     Node { node: u32 },
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ColorNode {
     /// Literal RGB.

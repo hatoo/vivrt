@@ -1,6 +1,7 @@
 #![allow(clippy::missing_transmute_annotations)]
 
 mod camera;
+mod color_fold;
 mod gpu_types;
 mod image_io;
 mod pipeline;
