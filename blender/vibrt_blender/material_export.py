@@ -115,19 +115,29 @@ def _node_tag(node) -> str:
     return f"{node.name!r} ({node.bl_idname})"
 
 
-def _write_f32(buf: bytearray, xs) -> dict:
-    """Append a float32 blob to `buf` using a memoryview — no intermediate
-    `bytes()` copy. Saves ~200ms on a ~1GB texture set vs `.tobytes()`.
-    """
+# Reusable flat float32 buffer shared across `export_image_texture` calls
+# within a single `export_scene`. Sized up front to the largest image datablock
+# so each texture's foreach_get writes into a slice view instead of allocating
+# a fresh per-texture buffer. Not a cache — contents are overwritten on every
+# texture and the buffer is released when `end_export()` runs. Blender's
+# RenderEngine.render is serial on the main thread, so no locking needed.
+_REUSABLE_PIXELS = None
+
+
+def begin_export(max_pixel_count: int) -> None:
+    """Allocate the reusable foreach_get buffer for the upcoming export."""
     import numpy as np
-    arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.float32)
-    arr = np.ascontiguousarray(arr, dtype=np.float32)
-    off = len(buf)
-    buf.extend(memoryview(arr).cast("B"))
-    pad = (-len(buf)) & 15
-    if pad:
-        buf.extend(b"\x00" * pad)
-    return {"offset": off, "len": int(arr.nbytes)}
+    global _REUSABLE_PIXELS
+    # `max(1, ...)` so a scene with no images still produces a valid view
+    # should export_image_texture be invoked for an empty image.
+    n = max(1, int(max_pixel_count)) * 4
+    _REUSABLE_PIXELS = np.empty(n, dtype=np.float32)
+
+
+def end_export() -> None:
+    """Release the reusable buffer so peak RAM drops back once export is done."""
+    global _REUSABLE_PIXELS
+    _REUSABLE_PIXELS = None
 
 
 class _PreBakedTexture:
@@ -148,7 +158,7 @@ class _PreBakedTexture:
 
 def export_image_texture(
     image,
-    buf: bytearray,
+    writer,
     textures: list,
     colorspace: str | None = None,
     chain: tuple = (),
@@ -161,7 +171,7 @@ def export_image_texture(
     """
     import numpy as np
     if isinstance(image, _PreBakedTexture):
-        return _export_prebaked(image, buf, textures)
+        return _export_prebaked(image, writer, textures)
     chain_key = "" if not chain else "|" + repr(tuple(x[0] for x in chain))
     key = f"__image__{image.name}{chain_key}"
     for i, t in enumerate(textures):
@@ -177,9 +187,15 @@ def export_image_texture(
         width, height = 1, 1
         pixels = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
     else:
-        # `list(image.pixels[:])` iterates one Python float at a time; foreach_get
-        # drops the whole buffer into a numpy array at C speed.
-        pixels = np.empty(width * height * 4, dtype=np.float32)
+        # foreach_get writes into a view of the module-level reusable buffer so
+        # we skip the per-image `np.empty(w*h*4)` allocation. Fall back to a
+        # fresh alloc if export_image_texture was reached without a surrounding
+        # `begin_export()` (e.g. test harness calling it directly).
+        n = width * height * 4
+        if _REUSABLE_PIXELS is not None and _REUSABLE_PIXELS.size >= n:
+            pixels = _REUSABLE_PIXELS[:n]
+        else:
+            pixels = np.empty(n, dtype=np.float32)
         t_px = time.perf_counter()
         image.pixels.foreach_get(pixels)
         _STATS["pixel_read_s"] += time.perf_counter() - t_px
@@ -197,7 +213,7 @@ def export_image_texture(
         "height": int(height),
         "channels": 4,
         "colorspace": colorspace,
-        "pixels": _write_f32(buf, pixels),
+        "pixels": writer.write_f32(pixels),
         "_key": key,
     }
     textures.append(desc)
@@ -213,7 +229,7 @@ def export_image_texture(
     return len(textures) - 1
 
 
-def _export_prebaked(pb: "_PreBakedTexture", buf: bytearray, textures: list) -> int:
+def _export_prebaked(pb: "_PreBakedTexture", writer, textures: list) -> int:
     import numpy as np
     for i, t in enumerate(textures):
         if t.get("_key") == pb.cache_key:
@@ -227,7 +243,7 @@ def _export_prebaked(pb: "_PreBakedTexture", buf: bytearray, textures: list) -> 
         "height": int(pb.h),
         "channels": 4,
         "colorspace": "linear",
-        "pixels": _write_f32(buf, pixels),
+        "pixels": writer.write_f32(pixels),
         "_key": pb.cache_key,
     }
     textures.append(desc)
@@ -927,7 +943,7 @@ def _socket_linked_image(sock, depth: int = 0) -> bpy.types.Image | None:
     return img
 
 
-def _export_linked_scalar_texture(sock, buf, textures):
+def _export_linked_scalar_texture(sock, writer, textures):
     """Resolve a scalar input socket to a (linear) baked texture.
 
     The chain transforms still apply per-channel; the GPU only reads the R
@@ -938,7 +954,7 @@ def _export_linked_scalar_texture(sock, buf, textures):
     img, chain = _socket_linked_image_with_chain(sock)
     if img is None:
         return None
-    return export_image_texture(img, buf, textures, "linear", chain=chain)
+    return export_image_texture(img, writer, textures, "linear", chain=chain)
 
 
 _CONSTANT_LEAF_NODES = frozenset((
@@ -1890,7 +1906,7 @@ def _tex_node_uv_transform(tex_node) -> list[float]:
     return list(_IDENTITY_UV)
 
 
-def _try_emit_color_graph(sock, buf, textures, group_stack=None, vc_attrs=None) -> dict | None:
+def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=None) -> dict | None:
     """Walk the shader graph feeding `sock` and emit a `color_graph` dict that
     the GPU evaluator can run per-pixel. Returns None if the graph uses a
     node we can't yet translate (ShaderNodeValToRGB, ShaderNodeTexNoise, ...);
@@ -1933,7 +1949,7 @@ def _try_emit_color_graph(sock, buf, textures, group_stack=None, vc_attrs=None) 
         if bl == "ShaderNodeTexImage":
             if src.image is None:
                 return None
-            tex_id = export_image_texture(src.image, buf, textures, "srgb")
+            tex_id = export_image_texture(src.image, writer, textures, "srgb")
             uv = _tex_node_uv_transform(src)
             idx = len(nodes)
             nodes.append({"type": "image_tex", "tex": tex_id, "uv": uv})
@@ -2223,17 +2239,17 @@ def _normal_map_image(normal_sock) -> bpy.types.Image | None:
     return _socket_linked_image(src)
 
 
-def _apply_normal_perturbation(params: dict, normal_sock, buf, textures) -> None:
+def _apply_normal_perturbation(params: dict, normal_sock, writer, textures) -> None:
     """Resolve the Normal input and assign normal_tex / bump_tex + strengths."""
     n_sock, n_strength, b_sock, b_strength = _normal_perturbation(normal_sock)
     if n_sock is not None:
-        tex = _export_linked_scalar_texture(n_sock, buf, textures)
+        tex = _export_linked_scalar_texture(n_sock, writer, textures)
         if tex is not None:
             params["normal_tex"] = tex
             if n_strength != 1.0:
                 params["normal_strength"] = n_strength
     if b_sock is not None:
-        tex = _export_linked_scalar_texture(b_sock, buf, textures)
+        tex = _export_linked_scalar_texture(b_sock, writer, textures)
         if tex is not None:
             params["bump_tex"] = tex
             if b_strength != 1.0:
@@ -2251,35 +2267,35 @@ def _default_params() -> dict:
     }
 
 
-def _resolve_shader(node, buf, textures, mat_name: str) -> dict:
+def _resolve_shader(node, writer, textures, mat_name: str) -> dict:
     """Return Principled-equivalent params for any surface-shader node."""
     bl = node.bl_idname
     if bl == "ShaderNodeBsdfPrincipled":
-        return _from_principled(node, buf, textures)
+        return _from_principled(node, writer, textures)
     if bl == "ShaderNodeBsdfDiffuse":
-        return _from_diffuse(node, buf, textures)
+        return _from_diffuse(node, writer, textures)
     if bl == "ShaderNodeBsdfGlossy" or bl == "ShaderNodeBsdfAnisotropic":
-        return _from_glossy(node, buf, textures)
+        return _from_glossy(node, writer, textures)
     if bl == "ShaderNodeBsdfTranslucent":
-        return _from_diffuse(node, buf, textures)
+        return _from_diffuse(node, writer, textures)
     if bl == "ShaderNodeBsdfTransparent":
-        return _from_transparent(node, buf, textures)
+        return _from_transparent(node, writer, textures)
     if bl == "ShaderNodeBsdfSheen" or bl == "ShaderNodeBsdfVelvet":
         # Sheen has no native slot in the simplified Principled; treat the
         # Color input as a rough diffuse so the surface isn't blacked out.
-        return _from_diffuse(node, buf, textures)
+        return _from_diffuse(node, writer, textures)
     if bl == "ShaderNodeMixShader":
-        return _from_mix(node, buf, textures, mat_name)
+        return _from_mix(node, writer, textures, mat_name)
     if bl == "ShaderNodeBsdfGlass":
-        return _from_glass(node, buf, textures)
+        return _from_glass(node, writer, textures)
     if bl == "ShaderNodeBsdfRefraction":
-        return _from_refraction(node, buf, textures)
+        return _from_refraction(node, writer, textures)
     if bl == "ShaderNodeEmission":
-        return _from_emission(node, buf, textures)
+        return _from_emission(node, writer, textures)
     if bl == "ShaderNodeAddShader":
-        return _from_add(node, buf, textures, mat_name)
+        return _from_add(node, writer, textures, mat_name)
     if bl == "ShaderNodeGroup":
-        return _from_group(node, buf, textures, mat_name)
+        return _from_group(node, writer, textures, mat_name)
     if bl == "ShaderNodeVolumeAbsorption" or bl == "ShaderNodeVolumeScatter" or bl == "ShaderNodeVolumePrincipled":
         _warn(f"vol-shader:{bl}", f"ignoring volume shader {bl}")
         return _default_params()
@@ -2287,12 +2303,12 @@ def _resolve_shader(node, buf, textures, mat_name: str) -> dict:
     return _default_params()
 
 
-def _from_principled(node, buf, textures) -> dict:
+def _from_principled(node, writer, textures) -> dict:
     p = _default_params()
     bc = node.inputs["Base Color"]
     vc_attrs: list[str] = []
     graph = (
-        _try_emit_color_graph(bc, buf, textures, vc_attrs=vc_attrs)
+        _try_emit_color_graph(bc, writer, textures, vc_attrs=vc_attrs)
         if bc.is_linked else None
     )
     if graph is not None:
@@ -2309,7 +2325,7 @@ def _from_principled(node, buf, textures) -> dict:
             # Linked socket: the link drives the colour, the default RGB is unused
             # in Cycles. The renderer multiplies base_color × texture, so neutralise
             # the factor to avoid tinting the texture.
-            p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
+            p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
             p["base_color"] = [1.0, 1.0, 1.0]
         elif bc.is_linked:
             attr = _find_base_color_attribute(bc)
@@ -2322,14 +2338,14 @@ def _from_principled(node, buf, textures) -> dict:
         else:
             p["base_color"] = _socket_rgb(bc)
 
-    tex = _export_linked_scalar_texture(node.inputs["Metallic"], buf, textures)
+    tex = _export_linked_scalar_texture(node.inputs["Metallic"], writer, textures)
     if tex is not None:
         p["metallic_tex"] = tex
         p["metallic"] = 1.0
     else:
         p["metallic"] = _socket_f(node.inputs["Metallic"])
 
-    tex = _export_linked_scalar_texture(node.inputs["Roughness"], buf, textures)
+    tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures)
     if tex is not None:
         p["roughness_tex"] = tex
         p["roughness"] = 1.0
@@ -2359,7 +2375,7 @@ def _from_principled(node, buf, textures) -> dict:
             strength = 1.0
         p["emission"] = [c * strength for c in color]
 
-    _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
 
     # Anisotropy (Blender Principled: "Anisotropic" + "Anisotropic Rotation").
     for name in ("Anisotropic", "Anisotropy"):
@@ -2459,7 +2475,7 @@ def _from_principled(node, buf, textures) -> dict:
             if "base_color_tex" not in p:
                 img = _socket_linked_image(alpha_sock)
                 if img is not None:
-                    p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+                    p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb")
                 else:
                     _warn(
                         f"alpha-noimg:{node.as_pointer()}",
@@ -2472,14 +2488,14 @@ def _from_principled(node, buf, textures) -> dict:
     return p
 
 
-def _from_diffuse(node, buf, textures) -> dict:
+def _from_diffuse(node, writer, textures) -> dict:
     p = _default_params()
     p["roughness"] = 1.0
     p["metallic"] = 0.0
     color_sock = node.inputs["Color"]
     vc_attrs: list[str] = []
     graph = (
-        _try_emit_color_graph(color_sock, buf, textures, vc_attrs=vc_attrs)
+        _try_emit_color_graph(color_sock, writer, textures, vc_attrs=vc_attrs)
         if color_sock.is_linked else None
     )
     if graph is not None:
@@ -2490,7 +2506,7 @@ def _from_diffuse(node, buf, textures) -> dict:
     else:
         img, chain = _socket_linked_image_with_chain(color_sock)
         if img is not None:
-            p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
+            p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
             p["base_color"] = [1.0, 1.0, 1.0]
         elif color_sock.is_linked:
             attr = _find_base_color_attribute(color_sock)
@@ -2502,21 +2518,21 @@ def _from_diffuse(node, buf, textures) -> dict:
                 p["base_color"] = _socket_rgb(color_sock)
         else:
             p["base_color"] = _socket_rgb(color_sock)
-    _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
     return p
 
 
-def _from_glossy(node, buf, textures) -> dict:
+def _from_glossy(node, writer, textures) -> dict:
     p = _default_params()
     p["metallic"] = 1.0
     img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
+        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
-        tex = _export_linked_scalar_texture(node.inputs["Roughness"], buf, textures)
+        tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures)
         if tex is not None:
             p["roughness_tex"] = tex
             p["roughness"] = 1.0
@@ -2532,11 +2548,11 @@ def _from_glossy(node, buf, textures) -> dict:
         r = _socket_f(node.inputs["Rotation"])
         if r != 0.0:
             p["tangent_rotation"] = r * 2.0 * math.pi
-    _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
     return p
 
 
-def _from_glass(node, buf, textures) -> dict:
+def _from_glass(node, writer, textures) -> dict:
     p = _default_params()
     p["transmission"] = 1.0
     if "IOR" in node.inputs:
@@ -2544,12 +2560,12 @@ def _from_glass(node, buf, textures) -> dict:
         p["ior"] = _socket_f(node.inputs["IOR"])
     img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
+        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
-        tex = _export_linked_scalar_texture(node.inputs["Roughness"], buf, textures)
+        tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures)
         if tex is not None:
             p["roughness_tex"] = tex
             p["roughness"] = 1.0
@@ -2558,7 +2574,7 @@ def _from_glass(node, buf, textures) -> dict:
     return p
 
 
-def _from_refraction(node, buf, textures) -> dict:
+def _from_refraction(node, writer, textures) -> dict:
     p = _default_params()
     p["transmission"] = 1.0
     p["metallic"] = 0.0
@@ -2567,12 +2583,12 @@ def _from_refraction(node, buf, textures) -> dict:
         p["ior"] = _socket_f(node.inputs["IOR"])
     img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
+        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
-        tex = _export_linked_scalar_texture(node.inputs["Roughness"], buf, textures)
+        tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures)
         if tex is not None:
             p["roughness_tex"] = tex
             p["roughness"] = 1.0
@@ -2581,7 +2597,7 @@ def _from_refraction(node, buf, textures) -> dict:
     return p
 
 
-def _from_add(node, buf, textures, mat_name: str) -> dict:
+def _from_add(node, writer, textures, mat_name: str) -> dict:
     """Add Shader: sum of emission, max of transmission, p1's surface params.
 
     The renderer has one BSDF slot, so we can't actually add two lobes — the
@@ -2592,22 +2608,22 @@ def _from_add(node, buf, textures, mat_name: str) -> dict:
     in1, in2 = node.inputs[0], node.inputs[1]
     n1 = in1.links[0].from_node if in1.is_linked else None
     n2 = in2.links[0].from_node if in2.is_linked else None
-    p1 = _resolve_shader(n1, buf, textures, mat_name) if n1 else _default_params()
-    p2 = _resolve_shader(n2, buf, textures, mat_name) if n2 else _default_params()
+    p1 = _resolve_shader(n1, writer, textures, mat_name) if n1 else _default_params()
+    p2 = _resolve_shader(n2, writer, textures, mat_name) if n2 else _default_params()
     out = dict(p1)
     out["emission"] = [a + b for a, b in zip(p1["emission"], p2["emission"])]
     out["transmission"] = max(p1["transmission"], p2["transmission"])
     return out
 
 
-def _from_transparent(node, buf, textures) -> dict:
+def _from_transparent(node, writer, textures) -> dict:
     p = _default_params()
     p["transmission"] = 1.0
     p["ior"] = 1.0  # no refraction
     p["roughness"] = 0.0
     img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
+        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
         p["alpha_threshold"] = 0.5
     else:
@@ -2615,7 +2631,7 @@ def _from_transparent(node, buf, textures) -> dict:
     return p
 
 
-def _from_emission(node, buf, textures) -> dict:
+def _from_emission(node, writer, textures) -> dict:
     p = _default_params()
     color_sock = node.inputs["Color"]
     color = _emission_constant_color(node, color_sock)
@@ -2650,7 +2666,7 @@ def _emission_constant_color(node, color_sock) -> list[float]:
     return _socket_rgb(color_sock)
 
 
-def _from_mix(node, buf, textures, mat_name: str) -> dict:
+def _from_mix(node, writer, textures, mat_name: str) -> dict:
     """Shader Mix: lerp Principled params by the constant Factor.
 
     A linked Factor is not bakeable into scalar params, so we warn and lerp at
@@ -2659,8 +2675,8 @@ def _from_mix(node, buf, textures, mat_name: str) -> dict:
     in1, in2 = node.inputs[1], node.inputs[2]
     n1 = in1.links[0].from_node if in1.is_linked else None
     n2 = in2.links[0].from_node if in2.is_linked else None
-    p1 = _resolve_shader(n1, buf, textures, mat_name) if n1 else _default_params()
-    p2 = _resolve_shader(n2, buf, textures, mat_name) if n2 else _default_params()
+    p1 = _resolve_shader(n1, writer, textures, mat_name) if n1 else _default_params()
+    p2 = _resolve_shader(n2, writer, textures, mat_name) if n2 else _default_params()
 
     fac_sock = node.inputs[0]
     view_ior = _view_dependent_ior(fac_sock) if fac_sock.is_linked else None
@@ -2727,7 +2743,7 @@ def _from_mix(node, buf, textures, mat_name: str) -> dict:
     return out
 
 
-def _from_group(node, buf, textures, mat_name: str) -> dict:
+def _from_group(node, writer, textures, mat_name: str) -> dict:
     tree = node.node_tree
     if tree is None:
         _warn(f"group-empty:{node.as_pointer()}", f"empty node group {_node_tag(node)}")
@@ -2746,7 +2762,7 @@ def _from_group(node, buf, textures, mat_name: str) -> dict:
             # NodeGroupInput → external socket on this group node.
             _GROUP_STACK.append(node)
             try:
-                return _resolve_shader(inner, buf, textures, mat_name)
+                return _resolve_shader(inner, writer, textures, mat_name)
             finally:
                 _GROUP_STACK.pop()
     _warn(
@@ -2757,7 +2773,7 @@ def _from_group(node, buf, textures, mat_name: str) -> dict:
 
 
 def export_material(
-    mat: bpy.types.Material, buf: bytearray, textures: list
+    mat: bpy.types.Material, writer, textures: list
 ) -> dict:
     """Dispatch to the surface-node handler; fall back to diffuse_color."""
     global _CURRENT_MATERIAL
@@ -2806,7 +2822,7 @@ def export_material(
             pass
 
         surface = out_node.inputs["Surface"].links[0].from_node
-        params = _resolve_shader(surface, buf, textures, mat.name)
+        params = _resolve_shader(surface, writer, textures, mat.name)
 
         # Per-material UV transform: read it off the TexImage nodes rather
         # than picking up any Mapping node (which may drive a Noise procedural,

@@ -116,35 +116,52 @@ def _try_emissive_quad_as_rect_light(obj, obj_eval, mat_params):
     }
 
 
-def _write_f32(buf: bytearray, xs) -> dict:
-    """Append a float32 blob to `buf`. Accepts numpy arrays (zero-copy view)
-    or sequences (coerced via np.asarray). Saves a full-buffer copy vs
-    `.tobytes()` — for ~1GB of textures that's ~200ms.
+class BinWriter:
+    """Streaming writer for scene.bin.
+
+    Each `write_*` appends the blob's bytes directly to the open file via
+    `numpy.ndarray.tofile(f)` (one `fwrite` per blob) and returns a
+    `{"offset", "len"}` BlobRef. Offsets are tracked with `f.tell()` so there
+    is no bytearray intermediate to hold the whole scene.bin in RAM — writes
+    stream through the stdlib buffered writer to the OS as they are produced.
     """
-    import numpy as np
-    arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.float32)
-    arr = np.ascontiguousarray(arr, dtype=np.float32)
-    off = len(buf)
-    buf.extend(memoryview(arr).cast("B"))
-    pad = (-len(buf)) & 15
-    if pad:
-        buf.extend(b"\x00" * pad)
-    return {"offset": off, "len": int(arr.nbytes)}
+    __slots__ = ("f",)
+
+    _PAD = b"\x00" * 16
+
+    def __init__(self, f):
+        self.f = f
+
+    def tell(self) -> int:
+        return self.f.tell()
+
+    def write_f32(self, xs) -> dict:
+        """Write a float32 blob. `xs` may be numpy or any array-like."""
+        import numpy as np
+        arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.float32)
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        off = self.f.tell()
+        arr.tofile(self.f)
+        length = int(arr.nbytes)
+        pad = (-length) & 15
+        if pad:
+            self.f.write(self._PAD[:pad])
+        return {"offset": off, "len": length}
+
+    def write_u32(self, xs) -> dict:
+        import numpy as np
+        arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.uint32)
+        arr = np.ascontiguousarray(arr, dtype=np.uint32)
+        off = self.f.tell()
+        arr.tofile(self.f)
+        length = int(arr.nbytes)
+        pad = (-length) & 15
+        if pad:
+            self.f.write(self._PAD[:pad])
+        return {"offset": off, "len": length}
 
 
-def _write_u32(buf: bytearray, xs) -> dict:
-    import numpy as np
-    arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.uint32)
-    arr = np.ascontiguousarray(arr, dtype=np.uint32)
-    off = len(buf)
-    buf.extend(memoryview(arr).cast("B"))
-    pad = (-len(buf)) & 15
-    if pad:
-        buf.extend(b"\x00" * pad)
-    return {"offset": off, "len": int(arr.nbytes)}
-
-
-def _find_displacement(obj_eval, buf, textures):
+def _find_displacement(obj_eval, writer, textures):
     """Return (tex_id, strength) for the first material slot's Displacement
     output that drives a single TexImage; (None, 0.0) otherwise.
 
@@ -188,13 +205,13 @@ def _find_displacement(obj_eval, buf, textures):
                 )
                 continue
             tex_id, extra = _resolve_height_texture(
-                height_sock, buf, textures, tag
+                height_sock, writer, textures, tag
             )
             if tex_id is not None:
                 return tex_id, strength * extra
         elif src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
             tex_id = material_export.export_image_texture(
-                src.image, buf, textures, "linear"
+                src.image, writer, textures, "linear"
             )
             return tex_id, strength
         else:
@@ -218,7 +235,7 @@ _PROCEDURAL_HEIGHT_NODES = frozenset((
 ))
 
 
-def _resolve_height_texture(sock, buf, textures, tag, depth: int = 0):
+def _resolve_height_texture(sock, writer, textures, tag, depth: int = 0):
     """Walk a Height-style chain (Math, Bump) back to a TexImage.
 
     Returns (tex_id, extra_strength). `extra_strength` multiplies into the
@@ -236,7 +253,7 @@ def _resolve_height_texture(sock, buf, textures, tag, depth: int = 0):
         strength = _const_f(up.inputs.get("Strength"), 1.0)
         distance = _const_f(up.inputs.get("Distance"), 1.0)
         tex_id, extra = _resolve_height_texture(
-            height, buf, textures, tag, depth + 1
+            height, writer, textures, tag, depth + 1
         )
         if tex_id is None:
             return None, 1.0
@@ -274,7 +291,7 @@ def _resolve_height_texture(sock, buf, textures, tag, depth: int = 0):
             for v in others:
                 k *= v
             tex_id, extra = _resolve_height_texture(
-                inputs[chain_idx], buf, textures, tag, depth + 1
+                inputs[chain_idx], writer, textures, tag, depth + 1
             )
             if tex_id is None:
                 return None, 1.0
@@ -290,7 +307,7 @@ def _resolve_height_texture(sock, buf, textures, tag, depth: int = 0):
             if None in others:
                 return None, 1.0
             return _resolve_height_texture(
-                inputs[chain_idx], buf, textures, tag, depth + 1
+                inputs[chain_idx], writer, textures, tag, depth + 1
             )
         print(
             f"[vibrt] warn: {tag}: Displacement.Height Math op={op!r} not "
@@ -310,7 +327,7 @@ def _resolve_height_texture(sock, buf, textures, tag, depth: int = 0):
         )
         return None, 1.0
     return material_export.export_image_texture(
-        img, buf, textures, "linear", chain=chain
+        img, writer, textures, "linear", chain=chain
     ), 1.0
 
 
@@ -326,7 +343,7 @@ def _const_f(sock, default):
 
 
 def _export_mesh(
-    obj_eval, buf: bytearray, textures: list, vc_attr_name: str | None = None
+    obj_eval, writer, textures: list, vc_attr_name: str | None = None
 ) -> dict | None:
     """Export a mesh + per-triangle material indices.
 
@@ -384,15 +401,15 @@ def _export_mesh(
         indices = np.arange(ntri * 3, dtype=np.uint32)
 
         desc = {
-            "vertices": _write_f32(buf, positions),
-            "normals": _write_f32(buf, split_normals),
-            "uvs": _write_f32(buf, uvs) if uvs is not None else None,
-            "indices": _write_u32(buf, indices),
+            "vertices": writer.write_f32(positions),
+            "normals": writer.write_f32(split_normals),
+            "uvs": writer.write_f32(uvs) if uvs is not None else None,
+            "indices": writer.write_u32(indices),
         }
         if num_slots > 1:
             tri_mat_idx = np.empty(ntri, dtype=np.int32)
             mesh.loop_triangles.foreach_get("material_index", tri_mat_idx)
-            desc["material_indices"] = _write_u32(buf, tri_mat_idx)
+            desc["material_indices"] = writer.write_u32(tri_mat_idx)
         if vc_attr_name:
             color_attrs = getattr(mesh, "color_attributes", None) or []
             target = next((ca for ca in color_attrs if ca.name == vc_attr_name), None)
@@ -408,10 +425,10 @@ def _export_mesh(
                 else:
                     per_corner = None
                 if per_corner is not None:
-                    desc["vertex_colors"] = _write_f32(
-                        buf, np.ascontiguousarray(per_corner.reshape(-1))
+                    desc["vertex_colors"] = writer.write_f32(
+                        np.ascontiguousarray(per_corner.reshape(-1))
                     )
-        disp_tex, disp_strength = _find_displacement(obj_eval, buf, textures)
+        disp_tex, disp_strength = _find_displacement(obj_eval, writer, textures)
         if disp_tex is not None and disp_strength != 0.0:
             desc["displacement_tex"] = disp_tex
             desc["displacement_strength"] = disp_strength
@@ -541,7 +558,7 @@ def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
     return strength, color
 
 
-def _export_light(obj, buf: bytearray, textures: list) -> dict | None:
+def _export_light(obj, writer, textures: list) -> dict | None:
     light = obj.data
     node_strength, node_color = _light_node_emission(light)
     energy = float(light.energy) * node_strength
@@ -610,7 +627,7 @@ def _export_light(obj, buf: bytearray, textures: list) -> dict | None:
     return None
 
 
-def _export_world(world, buf: bytearray, textures: list) -> dict:
+def _export_world(world, writer, textures: list) -> dict:
     if world is None or not world.use_nodes:
         col = list(world.color)[:3] if world else [0.05, 0.05, 0.05]
         return {"type": "constant", "color": col, "strength": 1.0}
@@ -656,7 +673,7 @@ def _export_world(world, buf: bytearray, textures: list) -> dict:
                     )
                 else:
                     tex_id = material_export.export_image_texture(
-                        linked.image, buf, textures, colorspace="linear"
+                        linked.image, writer, textures, colorspace="linear"
                     )
                     rotation_z_rad = 0.0
                     return {
@@ -698,7 +715,6 @@ def export_scene(
     height = int(rd.resolution_y * rd.resolution_percentage / 100.0)
     aspect = width / height if height > 0 else 1.0
 
-    buf = bytearray()
     textures: list[dict] = []
     materials: list[dict] = []
     material_index: dict[str, int] = {}
@@ -708,29 +724,6 @@ def export_scene(
     # that reference the material can emit the matching vertex-colour blob.
     material_vc_attr: dict[str, str] = {}
 
-    def resolve_material(mat) -> int:
-        if mat is None:
-            # Default diffuse grey
-            name = "__default__"
-            if name in material_index:
-                return material_index[name]
-            mid = len(materials)
-            materials.append(
-                {"base_color": [0.8, 0.8, 0.8], "metallic": 0.0, "roughness": 0.5}
-            )
-            material_index[name] = mid
-            return mid
-        if mat.name in material_index:
-            return material_index[mat.name]
-        exported = material_export.export_material(mat, buf, textures)
-        vc_attr = exported.pop("_vertex_color_attr", None)
-        if vc_attr:
-            material_vc_attr[mat.name] = vc_attr
-        mid = len(materials)
-        materials.append(exported)
-        material_index[mat.name] = mid
-        return mid
-
     meshes: list[dict] = []
     objects: list[dict] = []
     mesh_cache: dict[str, int] = {}
@@ -738,96 +731,144 @@ def export_scene(
     cam_obj = None
     lights_json: list[dict] = []
 
-    for inst in depsgraph.object_instances:
-        obj = inst.object
-        if inst.is_instance:
-            obj_eval = obj
-        else:
-            obj_eval = obj.evaluated_get(depsgraph)
+    # Upper bound for the largest texture foreach_get destination. Walking
+    # `bpy.data.images` covers every image datablock loaded into the .blend —
+    # over-allocating on unused images is preferable to per-texture reallocs
+    # and doesn't pin memory beyond `material_export.end_export()` below.
+    max_pixel_count = 1
+    for img in bpy.data.images:
+        w, h = int(img.size[0]), int(img.size[1])
+        if w > 0 and h > 0:
+            max_pixel_count = max(max_pixel_count, w * h)
+    material_export.begin_export(max_pixel_count)
 
-        if obj_eval.type == "MESH":
-            slot_mat_ids: list[int] = []
-            vc_attr_name: str | None = None
-            if obj_eval.material_slots:
-                for slot in obj_eval.material_slots:
-                    slot_mat_ids.append(resolve_material(slot.material))
-                    if slot.material is not None and vc_attr_name is None:
-                        vc_attr_name = material_vc_attr.get(slot.material.name)
-            if not slot_mat_ids:
-                slot_mat_ids = [resolve_material(None)]
+    try:
+        with bin_path.open("wb") as f:
+            writer = BinWriter(f)
 
-            # Promote single-quad pure-emissive meshes to area_rect lights
-            # so NEE can find them. Runs before the visible_camera skip
-            # because Blender scenes routinely use camera-hidden meshes as
-            # emissive panels (BMW27's `Light`) — without promotion their
-            # contribution is entirely lost. The rect honours the original
-            # visible_camera flag so hidden panels stay hidden from the
-            # final image.
-            if len(slot_mat_ids) == 1 and not inst.is_instance:
-                rect = _try_emissive_quad_as_rect_light(
-                    obj, obj_eval, materials[slot_mat_ids[0]]
-                )
-                if rect is not None:
-                    lights_json.append(rect)
-                    continue
+            def resolve_material(mat) -> int:
+                if mat is None:
+                    # Default diffuse grey
+                    name = "__default__"
+                    if name in material_index:
+                        return material_index[name]
+                    mid = len(materials)
+                    materials.append(
+                        {"base_color": [0.8, 0.8, 0.8], "metallic": 0.0, "roughness": 0.5}
+                    )
+                    material_index[name] = mid
+                    return mid
+                if mat.name in material_index:
+                    return material_index[mat.name]
+                exported = material_export.export_material(mat, writer, textures)
+                vc_attr = exported.pop("_vertex_color_attr", None)
+                if vc_attr:
+                    material_vc_attr[mat.name] = vc_attr
+                mid = len(materials)
+                materials.append(exported)
+                material_index[mat.name] = mid
+                return mid
 
-            # Skip meshes that Cycles hides from camera — they're light
-            # portals (e.g. classroom's `windows` dayLight_portal) meant
-            # to inject light but never appear as geometry on the
-            # rendered image. Without this check the emissive portal
-            # bleeds over the ceiling / walls.
-            if not getattr(obj, "visible_camera", True):
-                continue
+            for inst in depsgraph.object_instances:
+                obj = inst.object
+                if inst.is_instance:
+                    obj_eval = obj
+                else:
+                    obj_eval = obj.evaluated_get(depsgraph)
 
-            mkey = f"{obj_eval.data.name}#{obj_eval.name}#vc={vc_attr_name}"
-            mesh_id = mesh_cache.get(mkey)
-            if mesh_id is None:
-                t_mesh = time.perf_counter()
-                mesh = _export_mesh(obj_eval, buf, textures, vc_attr_name)
-                dt_mesh = time.perf_counter() - t_mesh
-                mesh_s += dt_mesh
-                if mesh is None:
-                    continue
-                if dt_mesh > 0.25:
-                    ntri = mesh["indices"]["len"] // 12  # 4 bytes/u32, 3 per tri
-                    slow_meshes.append((obj_eval.name, ntri, dt_mesh))
-                    slow_meshes.sort(key=lambda e: e[2], reverse=True)
-                    del slow_meshes[5:]
-                mesh_id = len(meshes)
-                meshes.append(mesh)
-                mesh_cache[mkey] = mesh_id
-            obj_desc = {
-                "mesh": mesh_id,
-                "material": slot_mat_ids[0],
-                "transform": _matrix_to_row_major(inst.matrix_world),
-            }
-            if len(slot_mat_ids) > 1:
-                obj_desc["materials"] = slot_mat_ids
-            # Cycles' object Ray Visibility → Shadow. The source object carries
-            # the flag (instances inherit it). Classroom's paper-lantern shades
-            # use this to let the inner point light escape the drum; without
-            # the hint the drum occludes NEE and we get characteristic
-            # rectangular shadow-cutouts on the ceiling.
-            if not getattr(obj, "visible_shadow", True):
-                obj_desc["cast_shadow"] = False
-            objects.append(obj_desc)
-        elif obj_eval.type == "LIGHT":
-            light = _export_light(obj_eval, buf, textures)
-            if light is not None:
-                lights_json.append(light)
-        elif obj_eval.type == "CAMERA" and obj_eval == scene.camera.evaluated_get(
-            depsgraph
-        ):
-            cam_obj = obj_eval
+                if obj_eval.type == "MESH":
+                    slot_mat_ids: list[int] = []
+                    vc_attr_name: str | None = None
+                    if obj_eval.material_slots:
+                        for slot in obj_eval.material_slots:
+                            slot_mat_ids.append(resolve_material(slot.material))
+                            if slot.material is not None and vc_attr_name is None:
+                                vc_attr_name = material_vc_attr.get(slot.material.name)
+                    if not slot_mat_ids:
+                        slot_mat_ids = [resolve_material(None)]
 
-    if cam_obj is None and scene.camera is not None:
-        cam_obj = scene.camera.evaluated_get(depsgraph)
-    if cam_obj is None:
-        raise RuntimeError("No active camera in scene")
+                    # Promote single-quad pure-emissive meshes to area_rect lights
+                    # so NEE can find them. Runs before the visible_camera skip
+                    # because Blender scenes routinely use camera-hidden meshes as
+                    # emissive panels (BMW27's `Light`) — without promotion their
+                    # contribution is entirely lost. The rect honours the original
+                    # visible_camera flag so hidden panels stay hidden from the
+                    # final image.
+                    if len(slot_mat_ids) == 1 and not inst.is_instance:
+                        rect = _try_emissive_quad_as_rect_light(
+                            obj, obj_eval, materials[slot_mat_ids[0]]
+                        )
+                        if rect is not None:
+                            lights_json.append(rect)
+                            continue
 
-    t_world = time.perf_counter()
-    world = _export_world(scene.world, buf, textures)
-    world_s = time.perf_counter() - t_world
+                    # Skip meshes that Cycles hides from camera — they're light
+                    # portals (e.g. classroom's `windows` dayLight_portal) meant
+                    # to inject light but never appear as geometry on the
+                    # rendered image. Without this check the emissive portal
+                    # bleeds over the ceiling / walls.
+                    if not getattr(obj, "visible_camera", True):
+                        continue
+
+                    mkey = f"{obj_eval.data.name}#{obj_eval.name}#vc={vc_attr_name}"
+                    mesh_id = mesh_cache.get(mkey)
+                    if mesh_id is None:
+                        t_mesh = time.perf_counter()
+                        mesh = _export_mesh(obj_eval, writer, textures, vc_attr_name)
+                        dt_mesh = time.perf_counter() - t_mesh
+                        mesh_s += dt_mesh
+                        if mesh is None:
+                            continue
+                        if dt_mesh > 0.25:
+                            ntri = mesh["indices"]["len"] // 12  # 4 bytes/u32, 3 per tri
+                            slow_meshes.append((obj_eval.name, ntri, dt_mesh))
+                            slow_meshes.sort(key=lambda e: e[2], reverse=True)
+                            del slow_meshes[5:]
+                        mesh_id = len(meshes)
+                        meshes.append(mesh)
+                        mesh_cache[mkey] = mesh_id
+                    obj_desc = {
+                        "mesh": mesh_id,
+                        "material": slot_mat_ids[0],
+                        "transform": _matrix_to_row_major(inst.matrix_world),
+                    }
+                    if len(slot_mat_ids) > 1:
+                        obj_desc["materials"] = slot_mat_ids
+                    # Cycles' object Ray Visibility → Shadow. The source object carries
+                    # the flag (instances inherit it). Classroom's paper-lantern shades
+                    # use this to let the inner point light escape the drum; without
+                    # the hint the drum occludes NEE and we get characteristic
+                    # rectangular shadow-cutouts on the ceiling.
+                    if not getattr(obj, "visible_shadow", True):
+                        obj_desc["cast_shadow"] = False
+                    objects.append(obj_desc)
+                elif obj_eval.type == "LIGHT":
+                    light = _export_light(obj_eval, writer, textures)
+                    if light is not None:
+                        lights_json.append(light)
+                elif obj_eval.type == "CAMERA" and obj_eval == scene.camera.evaluated_get(
+                    depsgraph
+                ):
+                    cam_obj = obj_eval
+
+            if cam_obj is None and scene.camera is not None:
+                cam_obj = scene.camera.evaluated_get(depsgraph)
+            if cam_obj is None:
+                raise RuntimeError("No active camera in scene")
+
+            t_world = time.perf_counter()
+            world = _export_world(scene.world, writer, textures)
+            world_s = time.perf_counter() - t_world
+
+            bin_size = writer.tell()
+    finally:
+        material_export.end_export()
+
+    # `bin_write_s` used to measure the final `f.write(bytearray)` dump (~200ms
+    # on classroom-size scenes). With streaming writes it's essentially the
+    # close/flush, which is already accounted in the `with` block above; keep
+    # the field so the breakdown log stays additive.
+    bin_write_s = 0.0
 
     spp = max(1, int(scene.vibrt_spp))
     print(f"[vibrt] spp={spp}")
@@ -849,13 +890,6 @@ def export_scene(
         "lights": lights_json,
         "world": world,
     }
-
-    t_bin = time.perf_counter()
-    # `write_bytes(bytes(buf))` would copy the whole bytearray once more before
-    # hitting the OS write; for ~1GB scenes that's ~200ms of pure memcpy.
-    with bin_path.open("wb") as f:
-        f.write(buf)
-    bin_write_s = time.perf_counter() - t_bin
 
     t_dump = time.perf_counter()
     json_blob = json.dumps(scene_json, indent=2)
@@ -880,7 +914,7 @@ def export_scene(
         f"[vibrt] export {dt:.2f}s "
         f"({len(meshes)} mesh, {len(objects)} obj, "
         f"{len(textures)} tex, {len(materials)} mat, "
-        f"{len(buf)/1024/1024:.1f}MB bin, {stats['pixel_bytes']/1024/1024:.1f}MB px)"
+        f"{bin_size/1024/1024:.1f}MB bin, {stats['pixel_bytes']/1024/1024:.1f}MB px)"
     )
     print(
         f"[vibrt]   mesh={mesh_s:.2f}s  material={material_s:.2f}s  "
