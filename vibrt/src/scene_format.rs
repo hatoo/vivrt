@@ -109,6 +109,8 @@ pub struct PrincipledMaterial {
     pub roughness_tex: Option<u32>,
     #[serde(default)]
     pub metallic_tex: Option<u32>,
+    #[serde(default)]
+    pub transmission_tex: Option<u32>,
     /// 2x3 row-major affine UV transform [a,b,tu, c,d,tv]: uv' = M · (uv, 1).
     /// Default identity.
     #[serde(default = "identity_uv_transform")]

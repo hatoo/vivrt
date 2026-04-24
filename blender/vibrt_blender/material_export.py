@@ -2476,7 +2476,14 @@ def _from_principled(node, writer, textures) -> dict:
         else None
     )
     if trans_name:
-        p["transmission"] = _warn_linked_scalar(node, trans_name)
+        tex = _export_linked_scalar_texture(
+            node.inputs[trans_name], writer, textures,
+        )
+        if tex is not None:
+            p["transmission_tex"] = tex
+            p["transmission"] = 1.0
+        else:
+            p["transmission"] = _warn_linked_scalar(node, trans_name)
 
     if "Emission" in node.inputs:
         p["emission"] = _emission_constant_color(node, node.inputs["Emission"])

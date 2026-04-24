@@ -805,7 +805,14 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
                            m->metallic_tex_h, m->metallic_tex_channels, uv);
     e.metallic = e.metallic * t.x;
   }
+  if (m->transmission_tex != nullptr) {
+    float3 t =
+        sample_rgba(m->transmission_tex, m->transmission_tex_w,
+                    m->transmission_tex_h, m->transmission_tex_channels, uv);
+    e.transmission = e.transmission * t.x;
+  }
   e.metallic = fminf(fmaxf(e.metallic, 0.0f), 1.0f);
+  e.transmission = fminf(fmaxf(e.transmission, 0.0f), 1.0f);
   // No separate roughness floor — the alpha clamp below is the sampler's
   // numerical safeguard; forcing a minimum roughness on top of it would
   // silently turn artist-authored mirrors into slightly-rough dielectrics.

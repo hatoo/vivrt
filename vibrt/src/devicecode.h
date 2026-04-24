@@ -42,6 +42,10 @@ struct PrincipledGpu {
   int metallic_tex_w;
   int metallic_tex_h;
   int metallic_tex_channels;
+  float *transmission_tex;
+  int transmission_tex_w;
+  int transmission_tex_h;
+  int transmission_tex_channels;
   float uv_transform[6];
   float normal_strength;
   float bump_strength;
