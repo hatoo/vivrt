@@ -371,8 +371,11 @@ def _export_mesh(
         if hasattr(mesh, "calc_normals_split"):
             try:
                 mesh.calc_normals_split()
-            except RuntimeError:
-                pass
+            except RuntimeError as exc:
+                print(
+                    f"[vibrt] warn: mesh {obj_eval.name!r}: "
+                    f"calc_normals_split failed ({exc}) — using existing split normals"
+                )
         num_slots = len(obj_eval.material_slots)
 
         tri_vert_idx = np.empty(ntri * 3, dtype=np.int32)

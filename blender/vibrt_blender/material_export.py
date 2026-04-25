@@ -645,7 +645,12 @@ def _resolve_constant_socket(sock, depth: int = 0):
         else:
             try:
                 inner = _socket_rgb(inp)
-            except Exception:
+            except Exception as exc:
+                _warn(
+                    f"resolve_const:{_node_tag(src)}:{name}",
+                    f"could not read default of socket {name!r} on "
+                    f"{_node_tag(src)} ({exc}) — skipping constant-fold candidate",
+                )
                 continue
         xform = _node_color_transform(src, chain_input_name=name)
         if xform is None:
@@ -2117,7 +2122,12 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
             if col_sock is None:
                 return None
             if fac_sock is not None and fac_sock.is_linked:
-                return None  # textured Fac on Invert not supported yet
+                _warn(
+                    f"invert_textured_fac:{_node_tag(src)}",
+                    f"{_node_tag(src)}: textured Fac on Invert is not yet "
+                    "supported — node will be ignored in the color graph",
+                )
+                return None
             fac = _socket_f(fac_sock) if fac_sock is not None else 1.0
             ci = emit(col_sock)
             if ci is None:

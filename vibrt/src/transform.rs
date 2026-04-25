@@ -19,6 +19,10 @@ pub fn invert(t: &[f32; 12]) -> [f32; 12] {
     let c02 = t[4] * t[9] - t[5] * t[8];
     let det = t[0] * c00 + t[1] * c01 + t[2] * c02;
     if det.abs() < 1e-20 {
+        eprintln!(
+            "[vibrt] warn: transform invert: singular matrix (det={:e}) — falling back to identity",
+            det
+        );
         return identity();
     }
     let inv_det = 1.0 / det;

@@ -18,7 +18,15 @@ pub fn save_image(path: &Path, width: u32, height: u32, rgba: &[f32]) -> Result<
     match ext.as_str() {
         "exr" => save_exr(path, width, height, rgba),
         "raw" => save_raw(path, width, height, rgba),
-        _ => save_png(path, width, height, rgba),
+        "png" => save_png(path, width, height, rgba),
+        other => {
+            eprintln!(
+                "[vibrt] warn: unrecognized output extension {:?} for {} — defaulting to PNG (supported: exr, raw, png)",
+                other,
+                path.display()
+            );
+            save_png(path, width, height, rgba)
+        }
     }
 }
 

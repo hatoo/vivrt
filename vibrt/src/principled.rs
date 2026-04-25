@@ -310,10 +310,18 @@ pub fn make_material_data(
 ) -> PrincipledGpu {
     let lookup = |id: Option<u32>| -> (optix_sys::CUdeviceptr, i32, i32, i32) {
         match id {
-            Some(i) => {
-                let t = textures.get(i as usize).copied().unwrap_or((0, 0, 0));
-                (t.0, t.1, t.2, 4)
-            }
+            Some(i) => match textures.get(i as usize).copied() {
+                Some(t) => (t.0, t.1, t.2, 4),
+                None => {
+                    eprintln!(
+                        "[vibrt] warn: material texture index {} out of range \
+                         (have {} textures) — using null texture",
+                        i,
+                        textures.len()
+                    );
+                    (0, 0, 0, 0)
+                }
+            },
             None => (0, 0, 0, 0),
         }
     };

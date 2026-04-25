@@ -401,9 +401,18 @@ fn render(scene: &LoadedScene, output: &std::path::Path, denoise: bool) -> Resul
         let (materials_ptr, num_materials) = if !obj_materials.is_empty() {
             let ptrs: Vec<u64> = obj_materials
                 .iter()
-                .map(|mi| {
-                    mat_device_ptrs.get(*mi as usize).copied().unwrap_or(mat_ptr)
-                        as u64
+                .map(|mi| match mat_device_ptrs.get(*mi as usize).copied() {
+                    Some(p) => p as u64,
+                    None => {
+                        eprintln!(
+                            "[vibrt] warn: object {} per-tri material index {} out of range \
+                             (have {} materials) — falling back to object's primary material",
+                            obj_idx,
+                            mi,
+                            mat_device_ptrs.len()
+                        );
+                        mat_ptr as u64
+                    }
                 })
                 .collect();
             let slice = stream.clone_htod(&ptrs).cuda()?;

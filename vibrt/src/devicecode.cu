@@ -738,11 +738,25 @@ static __device__ float3 eval_color_graph(
     } else if (tag == COLOR_NODE_VERTEX_COLOR) {
       slots[i] = vc;
     } else {
+      // Unknown tag means the host built a graph with a node type the device
+      // doesn't recognize — a real bug in the exporter / scene_loader. Print
+      // once per launch (gated by launch-idx==0) so the log isn't flooded.
+      uint3 _li = optixGetLaunchIndex();
+      if (_li.x == 0 && _li.y == 0) {
+        printf("[vibrt] warn: eval_color_graph: unknown node tag %u at slot %d -- returning white\n",
+               tag, i);
+      }
       slots[i] = make_float3(1.0f, 1.0f, 1.0f);
     }
   }
-  if (output < 0 || output >= n)
+  if (output < 0 || output >= n) {
+    uint3 _li = optixGetLaunchIndex();
+    if (_li.x == 0 && _li.y == 0) {
+      printf("[vibrt] warn: eval_color_graph: output index %d out of range [0, %d) -- returning white\n",
+             output, n);
+    }
     return make_float3(1.0f, 1.0f, 1.0f);
+  }
   return slots[output];
 }
 
