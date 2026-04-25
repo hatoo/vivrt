@@ -31,6 +31,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         # subprocess path if the extension is missing or errors out so a
         # broken pyd doesn't take the addon down with it.
         if runner.find_native_module() is not None:
+            self.report({"INFO"}, "vibrt: rendering in-process (vibrt_native)")
             try:
                 self._render_in_process(depsgraph, width, height, denoise)
                 return
@@ -43,6 +44,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
                     f"In-process render failed ({e!r}) — falling back to subprocess",
                 )
 
+        self.report({"INFO"}, "vibrt: rendering via subprocess (vibrt.exe)")
         self._render_via_subprocess(depsgraph, width, height, denoise)
 
     def _render_in_process(
