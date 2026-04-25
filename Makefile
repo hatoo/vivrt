@@ -112,7 +112,16 @@ $(ADDON_ZIP): $(ADDON_SOURCES) blender/build_addon.py
 addon-with-native: $(ADDON_SOURCES) blender/build_addon.py
 	$(PYTHON) blender/build_addon.py --with-native
 
+# `make dev-install` is the one-shot for fresh checkouts:
+#   1. Build the Rust crate with the `python` feature so vibrt_native.dll
+#      lands in target/release/.
+#   2. Stage it as `blender/vibrt_blender/vibrt_native.pyd` (the dev-junction
+#      target). Without this the addon falls back to the subprocess path.
+#   3. Junction the addon dir into Blender's user-addons folder.
+#
+# Pass `MAKEFLAGS=--no-print-directory` if the cargo output is too noisy.
 dev-install:
+	$(PYTHON) blender/build_addon.py --with-native --stage-only
 	$(PYTHON) blender/dev_install.py
 
 clean:

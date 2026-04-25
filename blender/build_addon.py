@@ -84,10 +84,22 @@ def main() -> None:
         action="store_true",
         help="skip the cargo build step (assumes target/release/vibrt_native.* is already present)",
     )
+    parser.add_argument(
+        "--stage-only",
+        action="store_true",
+        help=(
+            "build and stage vibrt_native.pyd into the addon source dir but "
+            "skip writing the zip — used by `make dev-install` so the dev "
+            "junctioned addon picks up the freshly built extension"
+        ),
+    )
     args = parser.parse_args()
 
-    if args.with_native:
+    if args.with_native or args.stage_only:
         _stage_native(args.skip_build)
+
+    if args.stage_only:
+        return
 
     if OUT.exists():
         OUT.unlink()
