@@ -66,7 +66,12 @@ fn main() -> Result<()> {
         .as_ref()
         .context("input scene.json required (or use --compile-only)")?;
     let t_load = std::time::Instant::now();
-    let scene = scene_loader::load_scene_from_path(input)?;
+    // The bin / json buffers must outlive `scene` because LoadedScene now
+    // borrows directly from them (textures, mesh attributes) instead of
+    // allocating its own copies.
+    let mut json_text = String::new();
+    let mut bin = Vec::new();
+    let scene = scene_loader::load_scene_from_path(input, &mut json_text, &mut bin)?;
     println!("Scene load: {:.2?}", t_load.elapsed());
 
     let opts = RenderOptions {

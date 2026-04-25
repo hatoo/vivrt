@@ -5,27 +5,35 @@ use crate::scene_format::*;
 use crate::transform;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-pub struct LoadedMesh {
-    pub vertices: Vec<f32>,
-    pub normals: Vec<f32>,
-    pub uvs: Vec<f32>,
-    pub indices: Vec<u32>,
+pub struct LoadedMesh<'bin> {
+    /// f32 x 3 per vertex. Borrowed directly from the source bin when the
+    /// mesh has no displacement; an owned `Vec<f32>` when displacement
+    /// perturbation has to mutate the positions.
+    pub vertices: Cow<'bin, [f32]>,
+    pub normals: Cow<'bin, [f32]>,
+    pub uvs: Cow<'bin, [f32]>,
+    pub indices: Cow<'bin, [u32]>,
     /// u32 per triangle; empty when the mesh is single-material.
-    pub material_indices: Vec<u32>,
+    pub material_indices: Cow<'bin, [u32]>,
     /// f32 x 3 per vertex; empty when the mesh has no vertex colour attribute
     /// referenced by any material. See `MeshDesc::vertex_colors`.
-    pub vertex_colors: Vec<f32>,
+    pub vertex_colors: Cow<'bin, [f32]>,
     /// f32 x 3 per vertex; empty when the mesh has no authored tangent (the
     /// common case — only hair ribbon meshes ship one today). See
     /// `MeshDesc::tangents`.
-    pub tangents: Vec<f32>,
+    pub tangents: Cow<'bin, [f32]>,
 }
 
-pub struct LoadedTexture {
-    /// RGBA f32, width*height*4 floats, already linearised if colorspace == "srgb".
-    pub data: Vec<f32>,
+pub struct LoadedTexture<'bin> {
+    /// RGBA f32, width*height*4 floats, already linearised if colorspace ==
+    /// "srgb". Linear textures (`colorspace == "linear"`, channels == 4)
+    /// borrow directly from the bin — no host-side memcpy. sRGB textures get
+    /// an owned `Vec<f32>` because the linearisation has to write into a
+    /// fresh buffer; that pass folds the copy and the conversion together.
+    pub data: Cow<'bin, [f32]>,
     pub width: u32,
     pub height: u32,
 }
@@ -36,10 +44,10 @@ pub struct LoadedObject {
     pub transform: [f32; 12],
 }
 
-pub struct LoadedScene {
+pub struct LoadedScene<'bin> {
     pub file: SceneFile,
-    pub meshes: Vec<LoadedMesh>,
-    pub textures: Vec<LoadedTexture>,
+    pub meshes: Vec<LoadedMesh<'bin>>,
+    pub textures: Vec<LoadedTexture<'bin>>,
     pub objects: Vec<LoadedObject>,
     pub point_lights: Vec<PointLight>,
     pub sun_lights: Vec<SunLight>,
@@ -50,13 +58,24 @@ pub struct LoadedScene {
     pub envmap_rgb: Option<(Vec<f32>, u32, u32)>,
 }
 
-/// Read scene.json + the scene.bin it references from disk.
+/// Read scene.json + scene.bin paths into the storage the caller owns, so
+/// the resulting [`LoadedScene`] can borrow from them.
 ///
-/// Thin wrapper over [`load_scene_from_bytes`] used by the CLI binary. The
-/// in-process Python path skips this and calls `load_scene_from_bytes`
-/// directly so the addon never has to spill its scene to disk.
-pub fn load_scene_from_path(json_path: &Path) -> Result<LoadedScene> {
-    let json_text = std::fs::read_to_string(json_path)
+/// Used by the CLI binary; the in-process Python path skips this entirely
+/// and calls [`load_scene_from_bytes`] with a Python-owned buffer.
+///
+/// Caller pattern:
+/// ```ignore
+/// let mut json_text = String::new();
+/// let mut bin = Vec::new();
+/// let scene = load_scene_from_path(&input, &mut json_text, &mut bin)?;
+/// ```
+pub fn load_scene_from_path<'a>(
+    json_path: &Path,
+    json_text: &'a mut String,
+    bin: &'a mut Vec<u8>,
+) -> Result<LoadedScene<'a>> {
+    *json_text = std::fs::read_to_string(json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
     // Probe just the `binary` field so we don't pay a full SceneFile parse
     // twice. The full parse happens inside load_scene_from_bytes.
@@ -64,20 +83,21 @@ pub fn load_scene_from_path(json_path: &Path) -> Result<LoadedScene> {
     struct BinaryRef {
         binary: String,
     }
-    let probe: BinaryRef = serde_json::from_str(&json_text)
+    let probe: BinaryRef = serde_json::from_str(json_text)
         .context("parsing scene.json (locating .bin reference)")?;
     let scene_dir: PathBuf = json_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let binary_path = scene_dir.join(&probe.binary);
-    let bin = std::fs::read(&binary_path)
+    *bin = std::fs::read(&binary_path)
         .with_context(|| format!("reading {}", binary_path.display()))?;
-    load_scene_from_bytes(&json_text, &bin)
+    load_scene_from_bytes(json_text, bin)
 }
 
 /// Parse an in-memory scene.json + scene.bin pair into a [`LoadedScene`].
 ///
-/// Used by both the CLI ([`load_scene_from_path`]) and the in-process Python
-/// renderer (which builds these buffers without touching disk).
-pub fn load_scene_from_bytes(json_text: &str, bin: &[u8]) -> Result<LoadedScene> {
+/// Mesh and texture payloads are borrowed from `bin` wherever possible;
+/// only sRGB textures and displacement-modified mesh vertices end up with
+/// owned `Vec`s. The returned scene's lifetime is tied to `bin`'s.
+pub fn load_scene_from_bytes<'a>(json_text: &str, bin: &'a [u8]) -> Result<LoadedScene<'a>> {
     let file: SceneFile = serde_json::from_str(json_text).context("parsing scene.json")?;
 
     if file.version != 1 {
@@ -292,19 +312,33 @@ fn slice_bin(bin: &[u8], blob: BlobRef) -> Result<&[u8]> {
     Ok(&bin[start..end])
 }
 
-fn read_f32_vec(bytes: &[u8]) -> Vec<f32> {
-    // `chunks_exact(4)` is an ExactSizeIterator so `collect()` allocates once.
-    // On LE hosts `f32::from_le_bytes` is a direct reinterpret and LLVM lowers
-    // the whole pattern to a memcpy-shaped loop. The previous scalar form did
-    // four bounds-checked `bytes[i*4+k]` reads and a `Vec::push` per element,
-    // costing ~0.5s on a 1GB scene.
+/// Reinterpret the bin slice as `&[f32]` without copying. Falls back to a
+/// fresh `Vec<f32>` only when the slice is misaligned (bytemuck panics
+/// otherwise) — which never happens for blobs the exporter writes (BlobRefs
+/// are always written at 16-byte-aligned offsets), but the fallback keeps
+/// us safe against hand-authored test bins.
+fn cast_f32_slice(bytes: &[u8]) -> Cow<'_, [f32]> {
+    match bytemuck::try_cast_slice::<u8, f32>(bytes) {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(read_f32_vec_owned(bytes)),
+    }
+}
+
+fn cast_u32_slice(bytes: &[u8]) -> Cow<'_, [u32]> {
+    match bytemuck::try_cast_slice::<u8, u32>(bytes) {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(read_u32_vec_owned(bytes)),
+    }
+}
+
+fn read_f32_vec_owned(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
 
-fn read_u32_vec(bytes: &[u8]) -> Vec<u32> {
+fn read_u32_vec_owned(bytes: &[u8]) -> Vec<u32> {
     bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -352,39 +386,43 @@ fn apply_displacement(mesh: &mut LoadedMesh, tex: &LoadedTexture, strength: f32)
     if mesh.uvs.is_empty() || mesh.normals.is_empty() {
         return;
     }
+    // Displacement perturbs vertex positions in place — promote the
+    // (potentially borrowed) Cow to an owned Vec so we can mutate it. Other
+    // attributes stay borrowed.
     let nv = mesh.vertices.len() / 3;
+    let verts = mesh.vertices.to_mut();
     for i in 0..nv {
         let u = mesh.uvs[i * 2 + 0];
         let v = mesh.uvs[i * 2 + 1];
         let h = sample_heightmap(tex, u, v) * strength;
-        mesh.vertices[i * 3 + 0] += mesh.normals[i * 3 + 0] * h;
-        mesh.vertices[i * 3 + 1] += mesh.normals[i * 3 + 1] * h;
-        mesh.vertices[i * 3 + 2] += mesh.normals[i * 3 + 2] * h;
+        verts[i * 3 + 0] += mesh.normals[i * 3 + 0] * h;
+        verts[i * 3 + 1] += mesh.normals[i * 3 + 1] * h;
+        verts[i * 3 + 2] += mesh.normals[i * 3 + 2] * h;
     }
 }
 
-fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
-    let vertices = read_f32_vec(slice_bin(bin, desc.vertices)?);
+fn load_mesh<'a>(desc: &MeshDesc, bin: &'a [u8]) -> Result<LoadedMesh<'a>> {
+    let vertices = cast_f32_slice(slice_bin(bin, desc.vertices)?);
     let normals = match desc.normals {
-        Some(b) => read_f32_vec(slice_bin(bin, b)?),
-        None => Vec::new(),
+        Some(b) => cast_f32_slice(slice_bin(bin, b)?),
+        None => Cow::Owned(Vec::new()),
     };
     let uvs = match desc.uvs {
-        Some(b) => read_f32_vec(slice_bin(bin, b)?),
-        None => Vec::new(),
+        Some(b) => cast_f32_slice(slice_bin(bin, b)?),
+        None => Cow::Owned(Vec::new()),
     };
-    let indices = read_u32_vec(slice_bin(bin, desc.indices)?);
+    let indices = cast_u32_slice(slice_bin(bin, desc.indices)?);
     let material_indices = match desc.material_indices {
-        Some(b) => read_u32_vec(slice_bin(bin, b)?),
-        None => Vec::new(),
+        Some(b) => cast_u32_slice(slice_bin(bin, b)?),
+        None => Cow::Owned(Vec::new()),
     };
     let vertex_colors = match desc.vertex_colors {
-        Some(b) => read_f32_vec(slice_bin(bin, b)?),
-        None => Vec::new(),
+        Some(b) => cast_f32_slice(slice_bin(bin, b)?),
+        None => Cow::Owned(Vec::new()),
     };
     let tangents = match desc.tangents {
-        Some(b) => read_f32_vec(slice_bin(bin, b)?),
-        None => Vec::new(),
+        Some(b) => cast_f32_slice(slice_bin(bin, b)?),
+        None => Cow::Owned(Vec::new()),
     };
 
     if indices.len() % 3 != 0 {
@@ -427,7 +465,7 @@ fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
     })
 }
 
-fn load_texture(desc: &TextureDesc, bin: &[u8]) -> Result<LoadedTexture> {
+fn load_texture<'a>(desc: &TextureDesc, bin: &'a [u8]) -> Result<LoadedTexture<'a>> {
     let bytes = slice_bin(bin, desc.pixels)?;
     let expected = (desc.width * desc.height * desc.channels) as usize;
     let got_floats = bytes.len() / 4;
@@ -445,38 +483,42 @@ fn load_texture(desc: &TextureDesc, bin: &[u8]) -> Result<LoadedTexture> {
     let srgb = desc.colorspace.eq_ignore_ascii_case("srgb");
     let pixel_count = (desc.width * desc.height) as usize;
 
-    // Channels == 4 is the common path (the exporter always writes RGBA).
-    // Decode the bin bytes into the final Vec<f32> in one pass and, when the
-    // source is sRGB, apply the transfer curve in place. The previous loader
-    // always did a second pass that copied raw → out just to emit [r, g, b,
-    // a] unchanged, which at classroom scale was ~1GB of redundant memcpy.
-    let data = match desc.channels {
+    let data: Cow<'a, [f32]> = match desc.channels {
+        4 if !srgb => {
+            // Linear 4-channel: borrow straight from the bin. No host-side
+            // memcpy, no allocation. This is the dominant cost saving on
+            // junk_shop-class scenes (5+ GB of normal/roughness/metallic
+            // maps that would otherwise pay a full Vec<f32> copy).
+            cast_f32_slice(bytes)
+        }
         4 => {
-            let mut data = read_f32_vec(bytes);
-            if srgb {
-                for c in data.chunks_exact_mut(4) {
-                    c[0] = srgb_to_linear(c[0]);
-                    c[1] = srgb_to_linear(c[1]);
-                    c[2] = srgb_to_linear(c[2]);
-                    // alpha passes through unchanged
-                }
+            // sRGB 4-channel: the linearisation has to write into a fresh
+            // buffer regardless. Folding copy+convert into a single pass
+            // skips the redundant `read_f32_vec` allocation that used to
+            // run before the in-place conversion.
+            let src = cast_f32_slice(bytes);
+            let mut out = Vec::with_capacity(src.len());
+            for c in src.chunks_exact(4) {
+                out.push(srgb_to_linear(c[0]));
+                out.push(srgb_to_linear(c[1]));
+                out.push(srgb_to_linear(c[2]));
+                out.push(c[3]);
             }
-            data
+            Cow::Owned(out)
         }
         3 => {
-            // 3-channel sources still require RGBA expansion; no way to skip
-            // the second pass here. Blender images from the addon are always
-            // 4-channel, so this path is only hit by hand-written test
-            // scenes.
-            let raw = read_f32_vec(bytes);
+            // 3-channel sources still require RGBA expansion. Blender
+            // images from the addon are always 4-channel, so this path is
+            // only hit by hand-written test scenes.
+            let src = cast_f32_slice(bytes);
             let mut out = Vec::with_capacity(pixel_count * 4);
-            for c in raw.chunks_exact(3) {
+            for c in src.chunks_exact(3) {
                 let r = if srgb { srgb_to_linear(c[0]) } else { c[0] };
                 let g = if srgb { srgb_to_linear(c[1]) } else { c[1] };
                 let b = if srgb { srgb_to_linear(c[2]) } else { c[2] };
                 out.extend_from_slice(&[r, g, b, 1.0]);
             }
-            out
+            Cow::Owned(out)
         }
         _ => {
             return Err(anyhow!(

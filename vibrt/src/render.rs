@@ -290,8 +290,8 @@ pub fn render_to_pixels(
     let mut meshes_gpu: Vec<MeshGpu> = Vec::new();
 
     for m in &scene.meshes {
-        let d_verts = stream.clone_htod(&m.vertices).cuda()?;
-        let d_indices = stream.clone_htod(&m.indices).cuda()?;
+        let d_verts = stream.clone_htod(&m.vertices[..]).cuda()?;
+        let d_indices = stream.clone_htod(&m.indices[..]).cuda()?;
         let verts_ptr = dptr_f32(&d_verts, &stream);
         let idx_ptr = dptr_u32(&d_indices, &stream);
 
@@ -333,7 +333,7 @@ pub fn render_to_pixels(
         .context("accel build")?;
 
         let d_normals = if !m.normals.is_empty() {
-            let s = stream.clone_htod(&m.normals).cuda()?;
+            let s = stream.clone_htod(&m.normals[..]).cuda()?;
             let p = dptr_f32(&s, &stream);
             _f32_buffers.push(s);
             p
@@ -341,7 +341,7 @@ pub fn render_to_pixels(
             0
         };
         let d_uvs = if !m.uvs.is_empty() {
-            let s = stream.clone_htod(&m.uvs).cuda()?;
+            let s = stream.clone_htod(&m.uvs[..]).cuda()?;
             let p = dptr_f32(&s, &stream);
             _f32_buffers.push(s);
             p
@@ -349,7 +349,7 @@ pub fn render_to_pixels(
             0
         };
         let d_mat_indices = if !m.material_indices.is_empty() {
-            let s = stream.clone_htod(&m.material_indices).cuda()?;
+            let s = stream.clone_htod(&m.material_indices[..]).cuda()?;
             let p = dptr_u32(&s, &stream);
             _u32_buffers.push(s);
             p
@@ -357,7 +357,7 @@ pub fn render_to_pixels(
             0
         };
         let d_vertex_colors = if !m.vertex_colors.is_empty() {
-            let s = stream.clone_htod(&m.vertex_colors).cuda()?;
+            let s = stream.clone_htod(&m.vertex_colors[..]).cuda()?;
             let p = dptr_f32(&s, &stream);
             _f32_buffers.push(s);
             p
@@ -365,7 +365,7 @@ pub fn render_to_pixels(
             0
         };
         let d_tangents = if !m.tangents.is_empty() {
-            let s = stream.clone_htod(&m.tangents).cuda()?;
+            let s = stream.clone_htod(&m.tangents[..]).cuda()?;
             let p = dptr_f32(&s, &stream);
             _f32_buffers.push(s);
             p

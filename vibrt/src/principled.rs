@@ -30,7 +30,7 @@ pub fn upload_textures(
 ) -> Result<Vec<(optix_sys::CUdeviceptr, i32, i32)>> {
     let mut out = Vec::with_capacity(textures.len());
     for tex in textures {
-        let slice = stream.clone_htod(&tex.data).cuda()?;
+        let slice = stream.clone_htod(&tex.data[..]).cuda()?;
         let ptr = dptr(&slice, stream);
         out.push((ptr, tex.width as i32, tex.height as i32));
         bufs.push(slice);
