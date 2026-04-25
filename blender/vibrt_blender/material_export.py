@@ -2497,15 +2497,31 @@ def _from_principled(node, writer, textures) -> dict:
         else:
             p["transmission"] = _warn_linked_scalar(node, trans_name)
 
+    # Principled emission: same texture-driven idiom as the standalone
+    # Emission node (e.g. Cycles 4.x Emissive Color = Image Texture). Prefer
+    # the per-pixel `emission_tex` path so a baked display / billboard image
+    # keeps its spatial detail; otherwise fold to a constant.
+    emit_sock = None
+    strength = 1.0
     if "Emission" in node.inputs:
-        p["emission"] = _emission_constant_color(node, node.inputs["Emission"])
+        emit_sock = node.inputs["Emission"]
     elif "Emission Color" in node.inputs:
-        color = _emission_constant_color(node, node.inputs["Emission Color"])
+        emit_sock = node.inputs["Emission Color"]
         if "Emission Strength" in node.inputs:
             strength = _warn_linked_scalar(node, "Emission Strength")
+    if emit_sock is not None:
+        emit_img = None
+        emit_chain = ()
+        if emit_sock.is_linked:
+            emit_img, emit_chain = _socket_linked_image_with_chain(emit_sock)
+        if emit_img is not None:
+            p["emission_tex"] = export_image_texture(
+                emit_img, writer, textures, "srgb", chain=emit_chain
+            )
+            p["emission"] = [strength, strength, strength]
         else:
-            strength = 1.0
-        p["emission"] = [c * strength for c in color]
+            color = _emission_constant_color(node, emit_sock)
+            p["emission"] = [c * strength for c in color]
 
     _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
 
