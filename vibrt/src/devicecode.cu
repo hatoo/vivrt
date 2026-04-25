@@ -825,6 +825,12 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
                     m->transmission_tex_h, m->transmission_tex_channels, uv);
     e.transmission = e.transmission * t.x;
   }
+  if (m->emission_tex != nullptr) {
+    float3 t =
+        sample_rgba(m->emission_tex, m->emission_tex_w,
+                    m->emission_tex_h, m->emission_tex_channels, uv);
+    e.emission = e.emission * t;
+  }
   e.metallic = fminf(fmaxf(e.metallic, 0.0f), 1.0f);
   e.transmission = fminf(fmaxf(e.transmission, 0.0f), 1.0f);
   // No separate roughness floor — the alpha clamp below is the sampler's

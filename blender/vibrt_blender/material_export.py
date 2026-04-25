@@ -2771,6 +2771,17 @@ def _from_add(node, writer, textures, mat_name: str) -> dict:
     out = dict(p1)
     out["emission"] = [a + b for a, b in zip(p1["emission"], p2["emission"])]
     out["transmission"] = max(p1["transmission"], p2["transmission"])
+    e1 = p1.get("emission_tex")
+    e2 = p2.get("emission_tex")
+    if e1 is not None and e2 is not None:
+        _warn(
+            f"add-emit-tex:{node.as_pointer()}",
+            f"{_node_tag(node)}: both Add Shader inputs have an emission "
+            "texture — only the first is kept (one emission_tex slot)",
+        )
+        out["emission_tex"] = e1
+    elif e2 is not None:
+        out["emission_tex"] = e2
     return out
 
 
@@ -2792,11 +2803,25 @@ def _from_transparent(node, writer, textures) -> dict:
 def _from_emission(node, writer, textures) -> dict:
     p = _default_params()
     color_sock = node.inputs["Color"]
-    color = _emission_constant_color(node, color_sock)
     if "Strength" in node.inputs:
         strength = _warn_linked_scalar(node, "Strength")
     else:
         strength = 1.0
+    # Per-pixel path first: a Color chain that resolves to a single image
+    # texture (typical for billboards, displays, emissive labels) drives
+    # `emission_tex` so the spatial detail survives. Otherwise we collapse
+    # the chain to a constant — `_emission_constant_color` warns when the
+    # collapse is lossy.
+    if color_sock.is_linked:
+        img, chain = _socket_linked_image_with_chain(color_sock)
+        if img is not None:
+            p["emission_tex"] = export_image_texture(
+                img, writer, textures, "srgb", chain=chain
+            )
+            p["emission"] = [strength, strength, strength]
+            p["base_color"] = [0.0, 0.0, 0.0]
+            return p
+    color = _emission_constant_color(node, color_sock)
     p["emission"] = [c * strength for c in color]
     p["base_color"] = [0.0, 0.0, 0.0]
     return p

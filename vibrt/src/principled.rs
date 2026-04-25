@@ -330,6 +330,7 @@ pub fn make_material_data(
     let (r_ptr, r_w, r_h, r_c) = lookup(mat.roughness_tex);
     let (m_ptr, m_w, m_h, m_c) = lookup(mat.metallic_tex);
     let (t_ptr, t_w, t_h, t_c) = lookup(mat.transmission_tex);
+    let (e_ptr, e_w, e_h, e_c) = lookup(mat.emission_tex);
     let (b_ptr, b_w, b_h, b_c) = lookup(mat.bump_tex);
 
     PrincipledGpu {
@@ -359,6 +360,10 @@ pub fn make_material_data(
         transmission_tex_w: t_w,
         transmission_tex_h: t_h,
         transmission_tex_channels: t_c,
+        emission_tex: e_ptr,
+        emission_tex_w: e_w,
+        emission_tex_h: e_h,
+        emission_tex_channels: e_c,
         uv_transform: mat.uv_transform,
         normal_strength: mat.normal_strength,
         bump_strength: mat.bump_strength,

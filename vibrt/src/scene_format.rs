@@ -111,6 +111,11 @@ pub struct PrincipledMaterial {
     pub metallic_tex: Option<u32>,
     #[serde(default)]
     pub transmission_tex: Option<u32>,
+    /// Multiplied into the constant `emission` so a single image (e.g. an
+    /// emissive billboard or display panel) drives per-pixel emission. Used
+    /// when the Cycles graph wires a TexImage directly into Emission.Color.
+    #[serde(default)]
+    pub emission_tex: Option<u32>,
     /// 2x3 row-major affine UV transform [a,b,tu, c,d,tv]: uv' = M · (uv, 1).
     /// Default identity.
     #[serde(default = "identity_uv_transform")]
