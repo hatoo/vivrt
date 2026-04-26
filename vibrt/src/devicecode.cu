@@ -1737,7 +1737,16 @@ static __device__ float3 direct_light_volume(float3 P, float3 wi_world,
     if (es.pdf > 0.0f) {
       float3 vis = shadow_transmittance(P, es.dir, 1e20f, vstack);
       if (luminance(vis) > 0.0f) {
-        add(es.dir, es.L * (1.0f / es.pdf), vis);
+        // MIS-weight against phase sampling. After a phase-sampled scatter
+        // a missed ray hitting the envmap will be MIS-weighted in the
+        // miss-path block (uses prev_bsdf_pdf = phase pdf). To make the
+        // estimator unbiased we apply the matching light-side weight here.
+        float cos_t = dot3(wi_world, es.dir);
+        float ph_pdf = phase_hg_eval(g, cos_t);
+        float w = power_heuristic(es.pdf, ph_pdf);
+        // `add` multiplies by phase_eval, which equals ph_pdf, so the
+        // contribution is throughput * phase * vis * L * w / pdf_light.
+        add(es.dir, es.L * (w / es.pdf), vis);
       }
     }
   }
@@ -2227,10 +2236,27 @@ extern "C" __global__ void __raygen__rg() {
     float3 dir0 = normalize3(U * px0 + V * py0 + W);
     PathVertex v;
     v.hit = 0;
-    unsigned int hi, lo;
-    pack_ptr(&v, hi, lo);
-    optixTrace(params.traversable, eye, dir0, 1e-4f, 1e20f, 0.0f,
-               OptixVisibilityMask(0x01), OPTIX_RAY_FLAG_NONE, 0, 2, 0, hi, lo);
+    // Skip volume-only boundaries on the AOV ray — the denoiser guides
+    // should describe the *visible* surface (the wall behind a smoke
+    // cube), not the invisible volume container. Capped to a few
+    // iterations so a pathological scene can't loop forever.
+    float3 origin = eye;
+    for (int i = 0; i < VOL_STACK_MAX + 2; i++) {
+      v.hit = 0;
+      unsigned int hi, lo;
+      pack_ptr(&v, hi, lo);
+      optixTrace(params.traversable, origin, dir0, 1e-4f, 1e20f, 0.0f,
+                 OptixVisibilityMask(0x01), OPTIX_RAY_FLAG_NONE, 0, 2, 0, hi, lo);
+      if (v.hit == 0)
+        break;
+      if (v.mat == nullptr || v.mat->volume == nullptr ||
+          v.mat->volume_only == 0)
+        break;
+      float p_scale =
+          fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
+      float eps = fmaxf(1e-4f, p_scale * 1e-5f);
+      origin = v.P + dir0 * eps;
+    }
     float3 alb = make_float3(0, 0, 0);
     float3 nrm = make_float3(0, 0, 0);
     if (v.hit != 0) {
