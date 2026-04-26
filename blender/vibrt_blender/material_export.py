@@ -116,6 +116,30 @@ def _node_tag(node) -> str:
     return f"{node.name!r} ({node.bl_idname})"
 
 
+def _follow_reroutes(sock):
+    """Skip any chain of `NodeReroute` nodes feeding `sock`.
+
+    Reroute (the visual "dot" on a noodle wire) has no functional effect — it
+    forwards its single input socket through to its single output socket
+    untouched. Returns the upstream socket the chain actually originates from,
+    or `sock` unchanged when no Reroute is present. If the chain ends at an
+    unlinked Reroute input, returns that unlinked socket so the caller's
+    `is_linked` check reads "no input" — same as if the wire weren't there.
+
+    Long Reroute chains are common (artists chain them to keep noodles tidy),
+    so the loop walks through all of them.
+    """
+    while sock is not None and getattr(sock, "is_linked", False):
+        up = sock.links[0].from_node
+        if up.bl_idname != "NodeReroute":
+            return sock
+        inner = up.inputs[0]
+        if not inner.is_linked:
+            return inner
+        sock = inner
+    return sock
+
+
 # Integer percentage applied to final-written texture dimensions, or None/100
 # for no-op. Intermediate caches (linear RGB, mean RGBA, premix) still operate
 # at full resolution; the downsample only affects what lands in scene.bin.
@@ -408,6 +432,7 @@ def _warn_linked_scalar(node, input_name: str) -> float:
     sock = node.inputs.get(input_name)
     if sock is None:
         return 0.0
+    sock = _follow_reroutes(sock)
     if not sock.is_linked:
         return _socket_f(sock)
     resolved = _resolve_exact_scalar(sock)
@@ -432,6 +457,7 @@ def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
     """
     if depth > 8:
         return None
+    sock = _follow_reroutes(sock)
     if not sock.is_linked:
         dv = getattr(sock, "default_value", None)
         if dv is None:
@@ -547,6 +573,7 @@ def _image_mean_rgba(image) -> tuple[list[float], float] | None:
 def _resolve_constant_socket(sock, depth: int = 0):
     if depth > 8:
         return None
+    sock = _follow_reroutes(sock)
     if not sock.is_linked:
         return _socket_rgb(sock)
     link = sock.links[0]
@@ -667,7 +694,10 @@ def _view_dependent_ior(sock, depth: int = 0) -> float | None:
     inputs; if multiple branches are view-dependent we take the first
     (rare enough in practice to not matter).
     """
-    if depth > 8 or not sock.is_linked:
+    if depth > 8:
+        return None
+    sock = _follow_reroutes(sock)
+    if not sock.is_linked:
         return None
     src = sock.links[0].from_node
     bl = src.bl_idname
@@ -704,6 +734,7 @@ def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
     """
     if depth > 8:
         return None
+    sock = _follow_reroutes(sock)
     if not sock.is_linked:
         dv = getattr(sock, "default_value", None)
         if dv is None:
@@ -1020,8 +1051,10 @@ def _resolve_volume_coeffs(node):
         return sigma_s, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], anisotropy
 
     if bl == "ShaderNodeAddShader":
-        a = node.inputs[0].links[0].from_node if node.inputs[0].is_linked else None
-        b = node.inputs[1].links[0].from_node if node.inputs[1].is_linked else None
+        in_a = _follow_reroutes(node.inputs[0])
+        in_b = _follow_reroutes(node.inputs[1])
+        a = in_a.links[0].from_node if in_a.is_linked else None
+        b = in_b.links[0].from_node if in_b.is_linked else None
         ca = _resolve_volume_coeffs(a) if a else None
         cb = _resolve_volume_coeffs(b) if b else None
         if ca is None and cb is None:
@@ -1059,8 +1092,10 @@ def _resolve_volume_coeffs(node):
         else:
             fac = float(fac_sock.default_value)
         # Inputs[1] = A, Inputs[2] = B for a Mix Shader node.
-        a = node.inputs[1].links[0].from_node if node.inputs[1].is_linked else None
-        b = node.inputs[2].links[0].from_node if node.inputs[2].is_linked else None
+        in_a = _follow_reroutes(node.inputs[1])
+        in_b = _follow_reroutes(node.inputs[2])
+        a = in_a.links[0].from_node if in_a.is_linked else None
+        b = in_b.links[0].from_node if in_b.is_linked else None
         ca = _resolve_volume_coeffs(a) if a else None
         cb = _resolve_volume_coeffs(b) if b else None
         if ca is None and cb is None:
@@ -1090,7 +1125,10 @@ def _resolve_volume(volume_socket) -> dict | None:
     are all zero (vacuum — no point shipping it), or when no supported
     volume node is reachable.
     """
-    if volume_socket is None or not volume_socket.is_linked:
+    if volume_socket is None:
+        return None
+    volume_socket = _follow_reroutes(volume_socket)
+    if not volume_socket.is_linked:
         return None
     src = volume_socket.links[0].from_node
     coeffs = _resolve_volume_coeffs(src)
@@ -1391,6 +1429,7 @@ def _socket_linked_image_with_chain(sock, depth: int = 0, group_stack=None):
     """
     if group_stack is None:
         group_stack = tuple(_GROUP_STACK)
+    sock = _follow_reroutes(sock)
     if not sock.is_linked:
         return None, ()
     if depth > 12:
@@ -1903,7 +1942,10 @@ def _find_base_color_attribute(sock, depth: int = 0) -> str | None:
     spatial vertex-mask signal is more faithful than synthesising a constant
     stand-in for the non-attribute side.
     """
-    if depth > 6 or not sock.is_linked:
+    if depth > 6:
+        return None
+    sock = _follow_reroutes(sock)
+    if not sock.is_linked:
         return None
     src = sock.links[0].from_node
     if src.bl_idname == "ShaderNodeAttribute":
@@ -2186,7 +2228,10 @@ def _tex_node_uv_transform(tex_node) -> list[float]:
     """Extract the UV affine feeding a TexImage.Vector. Returns identity when
     the Vector is unlinked (TexImage falls back to the mesh's default UV)."""
     vec_sock = tex_node.inputs.get("Vector")
-    if vec_sock is None or not vec_sock.is_linked:
+    if vec_sock is None:
+        return list(_IDENTITY_UV)
+    vec_sock = _follow_reroutes(vec_sock)
+    if not vec_sock.is_linked:
         return list(_IDENTITY_UV)
     src = vec_sock.links[0].from_node
     if src.bl_idname == "ShaderNodeMapping":
@@ -2217,6 +2262,7 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
     """
     if group_stack is None:
         group_stack = tuple(_GROUP_STACK)
+    sock = _follow_reroutes(sock)
     if not sock.is_linked:
         # Just a constant colour — no graph needed, caller can use base_color.
         return None
@@ -2226,6 +2272,7 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
     def emit(emit_sock) -> int | None:
         if len(nodes) >= _GRAPH_MAX_NODES:
             return None
+        emit_sock = _follow_reroutes(emit_sock)
         if not emit_sock.is_linked:
             rgb = _socket_rgb(emit_sock)
             idx = len(nodes)
@@ -2512,7 +2559,10 @@ def _normal_perturbation(normal_sock):
     feed the perturbation; callers run them through the chain machinery to
     bake any colour transforms into the resulting linear texture.
     """
-    if normal_sock is None or not normal_sock.is_linked:
+    if normal_sock is None:
+        return None, 1.0, None, 1.0
+    normal_sock = _follow_reroutes(normal_sock)
+    if not normal_sock.is_linked:
         return None, 1.0, None, 1.0
     src = normal_sock.links[0].from_node
     if src.bl_idname == "ShaderNodeNormalMap":
@@ -2956,7 +3006,8 @@ def _from_add(node, writer, textures, mat_name: str) -> dict:
     contributions. Transmission takes the max so Add(Glass, Emission) still
     refracts.
     """
-    in1, in2 = node.inputs[0], node.inputs[1]
+    in1 = _follow_reroutes(node.inputs[0])
+    in2 = _follow_reroutes(node.inputs[1])
     n1 = in1.links[0].from_node if in1.is_linked else None
     n2 = in2.links[0].from_node if in2.is_linked else None
     p1 = _resolve_shader(n1, writer, textures, mat_name) if n1 else _default_params()
@@ -3047,13 +3098,14 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
     A linked Factor is not bakeable into scalar params, so we warn and lerp at
     fac=0.5 — the least-biased collapse (and no side is silently dropped).
     """
-    in1, in2 = node.inputs[1], node.inputs[2]
+    in1 = _follow_reroutes(node.inputs[1])
+    in2 = _follow_reroutes(node.inputs[2])
     n1 = in1.links[0].from_node if in1.is_linked else None
     n2 = in2.links[0].from_node if in2.is_linked else None
     p1 = _resolve_shader(n1, writer, textures, mat_name) if n1 else _default_params()
     p2 = _resolve_shader(n2, writer, textures, mat_name) if n2 else _default_params()
 
-    fac_sock = node.inputs[0]
+    fac_sock = _follow_reroutes(node.inputs[0])
     view_ior = _view_dependent_ior(fac_sock) if fac_sock.is_linked else None
     if view_ior is not None:
         # Fresnel/LayerWeight-driven MixShader is Blender's clearcoat
@@ -3131,6 +3183,7 @@ def _from_group(node, writer, textures, mat_name: str) -> dict:
         _warn(f"group-noout:{tree.name}", f"group {tree.name!r} has no output node")
         return _default_params()
     for sock in group_output.inputs:
+        sock = _follow_reroutes(sock)
         if sock.is_linked:
             inner = sock.links[0].from_node
             # Push so chain traversal inside the inner BSDF can follow
@@ -3187,7 +3240,8 @@ def export_material(
         # a pure-volume container (return defaults + volume + volume_only).
         volume_sock = out_node.inputs.get("Volume")
         volume = _resolve_volume(volume_sock)
-        surface_linked = out_node.inputs["Surface"].is_linked
+        surface_sock = _follow_reroutes(out_node.inputs["Surface"])
+        surface_linked = surface_sock.is_linked
 
         displacement = out_node.inputs.get("Displacement")
         if displacement is not None and displacement.is_linked:
@@ -3209,7 +3263,7 @@ def export_material(
             params["volume_only"] = True
             return params
 
-        surface = out_node.inputs["Surface"].links[0].from_node
+        surface = surface_sock.links[0].from_node
         params = _resolve_shader(surface, writer, textures, mat.name)
 
         # Per-material UV transform: read it off the TexImage nodes rather
