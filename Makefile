@@ -1,47 +1,30 @@
-# Regenerate test scenes (and optionally render previews) from their
-# procedural generators or from .blend files.
+# Render previews from .blend test scenes via the in-process addon path,
+# and build / install the addon itself. The standalone vibrt CLI binary
+# is gone — everything goes through Blender + the bundled
+# vibrt_native.pyd extension.
 #
 # Usage:
-#   make                      # regenerate every test_scenes/*/scene.json
-#   make veach_mis            # regenerate one scene by directory name
-#   make previews             # regenerate scenes and render preview.png for each
-#   make veach_mis-preview    # render preview for one scene
-#   make classroom-preview    # export + render a .blend-based scene
-#   make classroom-cycles     # render a .blend-based scene with Cycles (reference)
-#   make cycles-previews      # render every .blend scene with Cycles
-#   make addon                # rebuild blender/vibrt_blender.zip (Python only)
-#   make addon-with-native    # also build the PyO3 extension and bundle it
-#   make dev-install          # build vibrt_native.pyd, stage it next to the
-#                             # addon source, junction the addon dir into
-#                             # Blender's user-addons folder
-#   make clean                # remove generated scene.json, scene.bin,
-#                             # preview.png, addon zip, staged .pyd
+#   make previews             # render preview.png for each .blend scene
+#   make junk_shop-preview    # render one scene
+#   make junk_shop-cycles     # Cycles reference render of the same scene
+#   make cycles-previews      # all .blend scenes via Cycles
+#   make addon                # blender/vibrt_blender.zip (Python only — won't render)
+#   make addon-with-native    # also build + bundle vibrt_native.pyd
+#   make dev-install          # build .pyd, stage, junction into Blender's user-addons
+#   make clean                # remove preview.png, addon zip, staged .pyd
 #
 # Overridable:
 #   PYTHON  (default: py)
-#   VIBRT   (default: ./target/release/vibrt.exe)
 #   SPP     (default: 128)
-#   PCT     (unset): render resolution percentage for .blend scenes, e.g. PCT=25
-#   TEXTURE_PCT (unset): downsample exported textures to N%, e.g. TEXTURE_PCT=25
+#   PCT     (unset): render resolution percentage, e.g. PCT=25
 #   DENOISE (unset): set to 1 to run the OptiX AI denoiser on the output
 
-PYTHON      ?= py
-VIBRT       ?= ./target/release/vibrt.exe
-SPP         ?= 128
-PCT         ?=
-TEXTURE_PCT ?=
-DENOISE     ?=
+PYTHON  ?= py
+SPP     ?= 128
+PCT     ?=
+DENOISE ?=
 
-SCENE_SCRIPTS := $(wildcard test_scenes/*/make_scene.py)
-SCENES        := $(patsubst test_scenes/%/make_scene.py,%,$(SCENE_SCRIPTS))
-SCENE_JSONS   := $(SCENE_SCRIPTS:make_scene.py=scene.json)
-SCENE_BINS    := $(SCENE_SCRIPTS:make_scene.py=scene.bin)
-PREVIEW_PNGS  := $(SCENE_SCRIPTS:make_scene.py=preview.png)
-
-PREVIEW_TARGETS := $(addsuffix -preview,$(SCENES))
-
-# .blend-based scenes: one entry per test_scenes/<name>/ directory that is
-# driven by a .blend file. Listed explicitly so a missing entry is obvious.
+# .blend-based scenes: one entry per test_scenes/<name>/ directory.
 BLEND_SCENE_classroom := test_scenes/classroom/classroom/classroom.blend
 BLEND_SCENE_bmw27     := test_scenes/bmw27/bmw27/bmw27_gpu.blend
 BLEND_SCENE_junk_shop := test_scenes/junk_shop/junk_shop/junk_shop.blend
@@ -52,49 +35,41 @@ BLEND_PREVIEW_TARGETS := $(addsuffix -preview,$(BLEND_SCENES))
 BLEND_CYCLES_PNGS     := $(foreach s,$(BLEND_SCENES),test_scenes/$(s)/preview_cycles.png)
 BLEND_CYCLES_TARGETS  := $(addsuffix -cycles,$(BLEND_SCENES))
 
-PCT_FLAG         := $(if $(strip $(PCT)),--percentage $(PCT))
-TEXTURE_PCT_FLAG := $(if $(strip $(TEXTURE_PCT)),--texture-pct $(TEXTURE_PCT))
-DENOISE_FLAG     := $(if $(strip $(DENOISE)),--denoise)
+PCT_FLAG     := $(if $(strip $(PCT)),--percentage $(PCT))
+DENOISE_FLAG := $(if $(strip $(DENOISE)),--denoise)
 
 ADDON_ZIP     := blender/vibrt_blender.zip
 ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
 
-.PHONY: all scenes previews cycles-previews addon addon-with-native dev-install clean vibrt-build FORCE $(SCENES) $(PREVIEW_TARGETS) $(BLEND_PREVIEW_TARGETS) $(BLEND_CYCLES_TARGETS)
+.PHONY: all previews cycles-previews addon addon-with-native dev-install clean native-build FORCE \
+        $(BLEND_PREVIEW_TARGETS) $(BLEND_CYCLES_TARGETS)
 
 FORCE:
 
-# Build the Rust binary that previews depend on. Cargo is incremental, so
-# this is a no-op when nothing changed.
-vibrt-build:
-	cargo build --release -p vibrt
+# Build the PyO3 extension and stage it next to the addon source. Cargo is
+# incremental, so this is a no-op when nothing changed. `make dev-install`
+# does the full pipeline (build + stage + junction); this target is the
+# build-only step the preview rules depend on.
+native-build:
+	$(PYTHON) blender/build_addon.py --with-native --stage-only
 
-all: scenes
+all: previews
 
-scenes: $(SCENE_JSONS)
-previews: $(PREVIEW_PNGS) $(BLEND_PREVIEW_PNGS)
+previews: $(BLEND_PREVIEW_PNGS)
 cycles-previews: $(BLEND_CYCLES_PNGS)
 addon: $(ADDON_ZIP)
 
-# Shorthand: `make <scene>` regenerates scene.json;
-#            `make <scene>-preview` renders preview.png.
-$(SCENES): %: test_scenes/%/scene.json
-$(PREVIEW_TARGETS): %-preview: test_scenes/%/preview.png
 $(BLEND_PREVIEW_TARGETS): %-preview: test_scenes/%/preview.png
 $(BLEND_CYCLES_TARGETS): %-cycles: test_scenes/%/preview_cycles.png
 
-# Running make_scene.py writes scene.json and scene.bin side-by-side.
-test_scenes/%/scene.json: test_scenes/%/make_scene.py
-	cd $(dir $<) && $(PYTHON) make_scene.py
-
-test_scenes/%/preview.png: test_scenes/%/scene.json vibrt-build FORCE
-	$(VIBRT) $< --spp $(SPP) --output $@ $(DENOISE_FLAG)
-
-# .blend scenes go via scripts/render_blend.py, which spawns Blender to export
-# then runs vibrt. Rebuilds when the .blend or the addon's Python sources
-# change (the latter because material_export.py changes the exported scene).
+# Each .blend scene's preview goes through scripts/render_blend.py, which
+# spawns Blender headless, force-loads the working-tree addon, and
+# triggers a single F12 render via vibrt_native. Depends on the addon
+# Python sources (so material/exporter changes invalidate previews) and
+# the staged .pyd (built via native-build).
 define BLEND_PREVIEW_RULE
-test_scenes/$(1)/preview.png: $$(BLEND_SCENE_$(1)) $$(ADDON_SOURCES) scripts/render_blend.py scripts/_blender_export.py vibrt-build FORCE
-	$$(PYTHON) scripts/render_blend.py $$< --output $$@ --spp $$(SPP) --vibrt $$(VIBRT) $$(PCT_FLAG) $$(TEXTURE_PCT_FLAG) $$(DENOISE_FLAG)
+test_scenes/$(1)/preview.png: $$(BLEND_SCENE_$(1)) $$(ADDON_SOURCES) scripts/render_blend.py scripts/_blender_render.py native-build FORCE
+	$$(PYTHON) scripts/render_blend.py $$< --output $$@ --spp $$(SPP) $$(PCT_FLAG) $$(DENOISE_FLAG)
 endef
 $(foreach s,$(BLEND_SCENES),$(eval $(call BLEND_PREVIEW_RULE,$(s))))
 
@@ -108,10 +83,10 @@ $(foreach s,$(BLEND_SCENES),$(eval $(call BLEND_CYCLES_RULE,$(s))))
 $(ADDON_ZIP): $(ADDON_SOURCES) blender/build_addon.py
 	$(PYTHON) blender/build_addon.py
 
-# Bundle the PyO3 extension so the addon's in-process render path is
-# available out of the box. Falls through to the same zip target with the
-# extra `--with-native` flag, which invokes `cargo build --features python`
-# and copies `vibrt_native.dll` (or platform equivalent) into the zip.
+# Same zip target with `--with-native`: invokes `cargo build --features python`
+# and copies `vibrt_native.dll` (or platform equivalent) into the zip so the
+# addon can render out of the box. The bare `addon` target produces a zip
+# that won't render — use this one for distribution.
 addon-with-native: $(ADDON_SOURCES) blender/build_addon.py
 	$(PYTHON) blender/build_addon.py --with-native
 
@@ -119,16 +94,14 @@ addon-with-native: $(ADDON_SOURCES) blender/build_addon.py
 #   1. Build the Rust crate with the `python` feature so vibrt_native.dll
 #      lands in target/release/.
 #   2. Stage it as `blender/vibrt_blender/vibrt_native.pyd` (the dev-junction
-#      target). Without this the addon falls back to the subprocess path.
+#      target). Without this the addon refuses to render.
 #   3. Junction the addon dir into Blender's user-addons folder.
-#
-# Pass `MAKEFLAGS=--no-print-directory` if the cargo output is too noisy.
 dev-install:
 	$(PYTHON) blender/build_addon.py --with-native --stage-only
 	$(PYTHON) blender/dev_install.py
 
 clean:
-	rm -f $(SCENE_JSONS) $(SCENE_BINS) $(PREVIEW_PNGS) $(BLEND_PREVIEW_PNGS) $(BLEND_CYCLES_PNGS) $(ADDON_ZIP) \
+	rm -f $(BLEND_PREVIEW_PNGS) $(BLEND_CYCLES_PNGS) $(ADDON_ZIP) \
 	      blender/vibrt_blender/vibrt_native.pyd \
 	      blender/vibrt_blender/vibrt_native.so \
 	      blender/vibrt_blender/vibrt_native.dylib

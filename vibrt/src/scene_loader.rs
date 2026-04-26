@@ -5,9 +5,7 @@ use crate::scene_format::*;
 use crate::transform;
 use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;
-use serde::Deserialize;
 use std::borrow::Cow;
-use std::path::{Path, PathBuf};
 
 pub struct LoadedMesh<'bin> {
     /// f32 x 3 per vertex. Borrowed directly from the source bin when the
@@ -59,40 +57,6 @@ pub struct LoadedScene<'bin> {
     pub envmap_rgb: Option<(Vec<f32>, u32, u32)>,
 }
 
-/// Read scene.json + scene.bin paths into the storage the caller owns, so
-/// the resulting [`LoadedScene`] can borrow from them.
-///
-/// Used by the CLI binary; the in-process Python path skips this entirely
-/// and calls [`load_scene_from_bytes`] with a Python-owned buffer.
-///
-/// Caller pattern:
-/// ```ignore
-/// let mut json_text = String::new();
-/// let mut bin = Vec::new();
-/// let scene = load_scene_from_path(&input, &mut json_text, &mut bin)?;
-/// ```
-pub fn load_scene_from_path<'a>(
-    json_path: &Path,
-    json_text: &'a mut String,
-    bin: &'a mut Vec<u8>,
-) -> Result<LoadedScene<'a>> {
-    *json_text = std::fs::read_to_string(json_path)
-        .with_context(|| format!("reading {}", json_path.display()))?;
-    // Probe just the `binary` field so we don't pay a full SceneFile parse
-    // twice. The full parse happens inside load_scene_from_bytes.
-    #[derive(Deserialize)]
-    struct BinaryRef {
-        binary: String,
-    }
-    let probe: BinaryRef = serde_json::from_str(json_text)
-        .context("parsing scene.json (locating .bin reference)")?;
-    let scene_dir: PathBuf = json_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let binary_path = scene_dir.join(&probe.binary);
-    *bin = std::fs::read(&binary_path)
-        .with_context(|| format!("reading {}", binary_path.display()))?;
-    load_scene_from_bytes(json_text, bin, &[])
-}
-
 /// Parse an in-memory scene.json + scene.bin pair into a [`LoadedScene`].
 ///
 /// Mesh and texture payloads are borrowed from `bin` wherever possible;
@@ -126,7 +90,7 @@ pub fn load_scene_from_bytes<'a>(
     let textures = file
         .textures
         .par_iter()
-        .map(|t| load_texture(t, bin, texture_arrays))
+        .map(|t| load_texture(t, texture_arrays))
         .collect::<Result<Vec<_>>>()?;
     let mut meshes = file
         .meshes
@@ -486,33 +450,21 @@ fn load_mesh<'a>(desc: &MeshDesc, bin: &'a [u8]) -> Result<LoadedMesh<'a>> {
 
 fn load_texture<'a>(
     desc: &TextureDesc,
-    bin: &'a [u8],
     texture_arrays: &[&'a [f32]],
 ) -> Result<LoadedTexture<'a>> {
-    // Two source paths:
-    // - `array_index`: borrow directly from the caller's f32 slice. Used
-    //   by the in-process FFI exporter so the texture pixels don't bounce
-    //   through a giant bytearray.
-    // - `pixels`: BlobRef into the bin. Used by the disk path (CLI
-    //   tooling, `make`-driven exports) and by hand-written test scenes.
-    let src: Cow<'a, [f32]> = match (desc.array_index, &desc.pixels) {
-        (Some(idx), _) => {
-            let arr = texture_arrays.get(idx as usize).ok_or_else(|| {
-                anyhow!(
-                    "texture.array_index = {} out of range (have {} arrays)",
-                    idx,
-                    texture_arrays.len()
-                )
-            })?;
-            Cow::Borrowed(*arr)
-        }
-        (None, Some(blob)) => cast_f32_slice(slice_bin(bin, *blob)?),
-        (None, None) => {
-            return Err(anyhow!(
-                "texture has neither `pixels` nor `array_index` — one is required"
-            ))
-        }
-    };
+    // Texture pixels always travel as a caller-owned f32 slice (parked in
+    // a `Vec<PyBuffer<f32>>` on the Python side). `array_index` picks the
+    // right one — pixel data was removed from the bin.
+    let arr = texture_arrays
+        .get(desc.array_index as usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "texture.array_index = {} out of range (have {} arrays)",
+                desc.array_index,
+                texture_arrays.len()
+            )
+        })?;
+    let src: Cow<'a, [f32]> = Cow::Borrowed(*arr);
     let expected = (desc.width * desc.height * desc.channels) as usize;
     if src.len() != expected {
         return Err(anyhow!(

@@ -1,16 +1,15 @@
 //! In-process Rust API for the vibrt renderer.
 //!
-//! The binary (`src/main.rs`) is a thin CLI wrapper that calls into this
-//! library. The Blender addon links the same library directly via PyO3 (under
-//! the `python` feature) so it can hand scene buffers to Rust without going
-//! through the disk roundtrip.
+//! The Blender addon is the only consumer: it links this library via PyO3
+//! (under the `python` feature) and hands scene buffers to Rust in-memory.
+//! There is no standalone CLI binary — the disk-loading path was removed
+//! along with the addon's subprocess fallback.
 
 #![allow(clippy::missing_transmute_annotations)]
 
 pub mod camera;
 pub mod color_fold;
 pub mod gpu_types;
-pub mod image_io;
 pub mod pipeline;
 pub mod principled;
 pub mod render;
@@ -22,7 +21,7 @@ pub mod transform;
 mod python;
 
 pub use render::{render_to_pixels, Progress, RenderOptions, RenderOutput, StdoutProgress};
-pub use scene_loader::{load_scene_from_bytes, load_scene_from_path, LoadedScene};
+pub use scene_loader::{load_scene_from_bytes, LoadedScene};
 
 /// Adapter that turns a `cudarc::driver::DriverError` into our `anyhow::Error`.
 /// Sits at the crate root so `principled.rs` and `render.rs` can both `use crate::CudaResultExt`.

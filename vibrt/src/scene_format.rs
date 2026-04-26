@@ -1,19 +1,17 @@
-//! JSON schema for Blender → vibrt-blender scene files.
+//! JSON schema for the vibrt scene format.
 //!
-//! The scene is described by two files in the same directory:
-//! - `scene.json` (this schema)
-//! - `scene.bin` (opaque binary blobs; referenced by `BlobRef`)
+//! Produced by `blender/vibrt_blender/exporter.py::export_scene_to_memory`
+//! and consumed by `scene_loader::load_scene_from_bytes`. The Python side
+//! drives `vibrt_native.render(scene_json, scene_bin, ...)` directly — the
+//! schema is not designed for on-disk archival; texture pixels travel
+//! across PyO3 as a separate `Vec<PyBuffer<f32>>` rather than living in
+//! the bin (see `TextureDesc::array_index`).
 
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct SceneFile {
     pub version: u32,
-    /// Filename of the sibling .bin blob. Resolved relative to the JSON path
-    /// by `load_scene_from_path`; ignored by `load_scene_from_bytes` (the
-    /// in-process renderer hands the buffer directly).
-    #[allow(dead_code)]
-    pub binary: String,
     pub render: RenderSettings,
     pub camera: CameraDesc,
     #[serde(default)]
@@ -422,17 +420,10 @@ pub struct TextureDesc {
     pub channels: u32,
     /// "srgb" | "linear"
     pub colorspace: String,
-    /// f32 little-endian pixels, width*height*channels floats. Either this
-    /// or `array_index` must be present. The disk path always emits
-    /// `pixels`; the in-process FFI exporter emits `array_index` so the
-    /// pixel data can be passed across PyO3 as a separate `PyBuffer<f32>`
-    /// list, skipping the bin's concatenation memcpy entirely.
-    #[serde(default)]
-    pub pixels: Option<BlobRef>,
-    /// Index into the caller-supplied `texture_arrays` slice. Mutually
-    /// exclusive with `pixels`.
-    #[serde(default)]
-    pub array_index: Option<u32>,
+    /// Index into the caller-supplied `texture_arrays` slice. Pixel data
+    /// always travels alongside the scene as a separate list of f32
+    /// buffers — the bin no longer carries texture pixels.
+    pub array_index: u32,
 }
 
 #[derive(Deserialize)]

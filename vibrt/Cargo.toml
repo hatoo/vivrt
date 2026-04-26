@@ -4,35 +4,30 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-# Keep the lib name distinct from the binary so their .pdb / artifact names
-# don't collide on Windows (cargo issue #6313). Renaming to "vibrt_native"
-# also gives the cdylib the right filename for the Python extension out of
-# the box — `target/release/vibrt_native.dll` only needs to be renamed to
-# `vibrt_native.pyd` for Blender to import it as `vibrt_blender.vibrt_native`.
+# `vibrt_native` matches the Python extension's import name — the PyO3
+# cdylib lands at `target/release/vibrt_native.dll` (Windows) and only
+# needs to be renamed to `vibrt_native.pyd` for Blender to import it as
+# `vibrt_blender.vibrt_native`. The crate ships ONLY this library now;
+# the standalone CLI binary has been removed in favour of running the
+# renderer in-process under Blender via the bundled extension.
 name = "vibrt_native"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
-[[bin]]
-name = "vibrt"
-path = "src/main.rs"
-
 [features]
-# Build the PyO3 extension. Off by default so plain `cargo build` keeps
-# producing only the CLI. `cargo build --release --features python` adds
-# `target/release/vibrt_native.dll`, which `build_addon.py` ships as
-# `vibrt_blender/vibrt_native.pyd`.
+# Build the PyO3 extension. Off by default so plain `cargo build` produces
+# only the rlib. `cargo build --release --features python` produces the
+# cdylib at `target/release/vibrt_native.dll`, which `build_addon.py`
+# stages as `vibrt_blender/vibrt_native.pyd`.
 python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]
 optix = { path = "../optix" }
 optix-sys = { path = "../optix-sys" }
 cudarc = { version = "0.19", default-features = false, features = ["driver", "dynamic-loading", "cuda-version-from-build-system", "nvrtc"] }
-clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-image = { version = "0.25", default-features = false, features = ["png", "exr"] }
 bytemuck = "1"
 rayon = "1"
 pyo3 = { version = "0.22", features = ["abi3-py311", "extension-module"], optional = true }
