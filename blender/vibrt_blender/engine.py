@@ -55,7 +55,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         denoise: bool,
     ) -> None:
         self.update_stats("vibrt", "Exporting scene...")
-        json_str, bin_bytes = exporter.export_scene_to_memory(depsgraph)
+        json_str, bin_bytes, texture_arrays = exporter.export_scene_to_memory(depsgraph)
 
         self.update_stats("vibrt", "Rendering...")
         pixels = runner.run_render_inproc(
@@ -64,6 +64,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             self.report,
             self.test_break,
             denoise=denoise,
+            texture_arrays=texture_arrays,
         )
         # `pixels` is float32 (h, w, 4), bottom-left origin (matches the
         # `.raw` path's encoding — see image_io::save_image's `.raw` branch).

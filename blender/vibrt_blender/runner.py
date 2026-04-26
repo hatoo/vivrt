@@ -54,6 +54,7 @@ def run_render_inproc(
     report,
     is_break,
     denoise: bool = False,
+    texture_arrays=None,
 ):
     """Render `(scene.json, scene.bin)` in-process via `vibrt_native`.
 
@@ -62,6 +63,11 @@ def run_render_inproc(
     `Image.pixels`). Raises `ImportError` if the extension isn't available;
     raises `RuntimeError` for vibrt errors; raises `KeyboardInterrupt` if
     the user aborted via Esc.
+
+    `texture_arrays`, when supplied, is the per-texture pixel-array list
+    produced by `exporter.export_scene_to_memory`. The Rust loader resolves
+    each `TextureDesc.array_index` against it, so texture pixels can be
+    handed across PyO3 directly instead of being concatenated into the bin.
     """
     native = find_native_module()
     if native is None:
@@ -83,7 +89,10 @@ def run_render_inproc(
             return False
 
     opts = {"denoise": bool(denoise)}
-    return native.render(scene_json, scene_bin, opts, log_cb, cancel_cb)
+    return native.render(
+        scene_json, scene_bin, opts, log_cb, cancel_cb,
+        texture_arrays=texture_arrays,
+    )
 
 
 def run_render(

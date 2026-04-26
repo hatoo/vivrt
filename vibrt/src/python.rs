@@ -100,8 +100,19 @@ fn parse_options(opts: &Bound<'_, PyDict>) -> PyResult<RenderOptions> {
 /// `memoryview`, numpy array, ...). Using a `bytearray` from
 /// `exporter.export_scene_to_memory` skips the `bytes()` finalisation copy
 /// that bouncing through `bytes` would otherwise pay (~12 GB on junk_shop).
+///
+/// `texture_arrays` is the optional per-texture pixel-array list that the
+/// in-process exporter produces. Each entry is a contiguous f32 RGBA
+/// buffer; `TextureDesc.array_index` in `scene_json` indexes into it. When
+/// the list is empty (or omitted), every texture descriptor must carry a
+/// `pixels` BlobRef pointing into `scene_bin` instead — the disk-path
+/// fallback. Splitting textures off the bin sidesteps the bytearray-
+/// growth memcpy spikes; on junk_shop that's ~6 s saved.
 #[pyfunction]
-#[pyo3(signature = (scene_json, scene_bin, opts, log_cb = None, cancel_cb = None))]
+#[pyo3(signature = (
+    scene_json, scene_bin, opts, log_cb = None, cancel_cb = None,
+    texture_arrays = None,
+))]
 fn render<'py>(
     py: Python<'py>,
     scene_json: &str,
@@ -109,6 +120,7 @@ fn render<'py>(
     opts: &Bound<'py, PyDict>,
     log_cb: Option<PyObject>,
     cancel_cb: Option<PyObject>,
+    texture_arrays: Option<Vec<PyBuffer<f32>>>,
 ) -> PyResult<Bound<'py, PyArray3<f32>>> {
     let ro = parse_options(opts)?;
     let mut progress = PyProgress {
@@ -131,13 +143,31 @@ fn render<'py>(
     // PyBuffer) is dropped at function exit.
     let bin_slice: &[u8] = unsafe { std::slice::from_raw_parts(bin_ptr, bin_len) };
 
+    // Resolve texture arrays the same way: each PyBuffer<f32> is pinned for
+    // the duration of this call. Build `&[&[f32]]` so scene_loader can
+    // borrow without needing to know about PyO3.
+    let arrays = texture_arrays.unwrap_or_default();
+    let mut tex_slices: Vec<&[f32]> = Vec::with_capacity(arrays.len());
+    for (i, b) in arrays.iter().enumerate() {
+        if !b.is_c_contiguous() {
+            return Err(PyRuntimeError::new_err(format!(
+                "texture_arrays[{}] must be C-contiguous",
+                i
+            )));
+        }
+        let p = b.buf_ptr() as *const f32;
+        let n = b.item_count();
+        // SAFETY: same buffer-protocol pinning argument as `bin_slice`.
+        tex_slices.push(unsafe { std::slice::from_raw_parts(p, n) });
+    }
+
     // Run the whole pipeline without the GIL so CUDA driver threads don't
     // deadlock against the Python interpreter. The `&str` borrow is fine
     // across allow_threads because Python-owned strings are immutable; the
-    // pinned PyBuffer makes `bin_slice` similarly safe.
+    // pinned PyBuffers make `bin_slice` and `tex_slices` similarly safe.
     let render_result: anyhow::Result<RenderOutput> = py.allow_threads(|| {
         let t_load = std::time::Instant::now();
-        let scene = load_scene_from_bytes(scene_json, bin_slice)?;
+        let scene = load_scene_from_bytes(scene_json, bin_slice, &tex_slices)?;
         progress.log(&format!("Scene load: {:.2?}", t_load.elapsed()));
         render_to_pixels(&scene, &ro, &mut progress)
     });

@@ -221,9 +221,16 @@ def export_image_texture(
         # we skip the per-image `np.empty(w*h*4)` allocation. Fall back to a
         # fresh alloc if export_image_texture was reached without a surrounding
         # `begin_export()` (e.g. test harness calling it directly).
+        #
+        # When the writer parks textures into a per-array list (in-process FFI
+        # path), the buffer must outlive this call — allocate fresh each time
+        # so the next image's foreach_get doesn't trample the previous one.
         n = width * height * 4
-        _ensure_reusable_pixels(n)
-        pixels = _REUSABLE_PIXELS[:n]
+        if getattr(writer, "_defer_textures", False):
+            pixels = np.empty(n, dtype=np.float32)
+        else:
+            _ensure_reusable_pixels(n)
+            pixels = _REUSABLE_PIXELS[:n]
         t_px = time.perf_counter()
         image.pixels.foreach_get(pixels)
         _STATS["pixel_read_s"] += time.perf_counter() - t_px
@@ -249,8 +256,11 @@ def export_image_texture(
         "height": int(height),
         "channels": 4,
         "colorspace": colorspace,
-        "pixels": writer.write_f32(pixels),
         "_key": key,
+        # `write_texture_pixels` either returns `{"pixels": BlobRef}` (disk
+        # mode) or `{"array_index": i}` (in-process FFI mode). Spread it
+        # so the right field lands on the TextureDesc.
+        **writer.write_texture_pixels(pixels),
     }
     textures.append(desc)
     dt = time.perf_counter() - t_enter
@@ -287,8 +297,8 @@ def _export_prebaked(pb: "_PreBakedTexture", writer, textures: list) -> int:
         "height": h,
         "channels": 4,
         "colorspace": "linear",
-        "pixels": writer.write_f32(pixels),
         "_key": pb.cache_key,
+        **writer.write_texture_pixels(pixels),
     }
     textures.append(desc)
     return len(textures) - 1

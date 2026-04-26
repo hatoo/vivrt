@@ -422,8 +422,17 @@ pub struct TextureDesc {
     pub channels: u32,
     /// "srgb" | "linear"
     pub colorspace: String,
-    /// f32 little-endian pixels, width*height*channels floats
-    pub pixels: BlobRef,
+    /// f32 little-endian pixels, width*height*channels floats. Either this
+    /// or `array_index` must be present. The disk path always emits
+    /// `pixels`; the in-process FFI exporter emits `array_index` so the
+    /// pixel data can be passed across PyO3 as a separate `PyBuffer<f32>`
+    /// list, skipping the bin's concatenation memcpy entirely.
+    #[serde(default)]
+    pub pixels: Option<BlobRef>,
+    /// Index into the caller-supplied `texture_arrays` slice. Mutually
+    /// exclusive with `pixels`.
+    #[serde(default)]
+    pub array_index: Option<u32>,
 }
 
 #[derive(Deserialize)]

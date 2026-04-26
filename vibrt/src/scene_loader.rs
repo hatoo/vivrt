@@ -90,7 +90,7 @@ pub fn load_scene_from_path<'a>(
     let binary_path = scene_dir.join(&probe.binary);
     *bin = std::fs::read(&binary_path)
         .with_context(|| format!("reading {}", binary_path.display()))?;
-    load_scene_from_bytes(json_text, bin)
+    load_scene_from_bytes(json_text, bin, &[])
 }
 
 /// Parse an in-memory scene.json + scene.bin pair into a [`LoadedScene`].
@@ -98,7 +98,19 @@ pub fn load_scene_from_path<'a>(
 /// Mesh and texture payloads are borrowed from `bin` wherever possible;
 /// only sRGB textures and displacement-modified mesh vertices end up with
 /// owned `Vec`s. The returned scene's lifetime is tied to `bin`'s.
-pub fn load_scene_from_bytes<'a>(json_text: &str, bin: &'a [u8]) -> Result<LoadedScene<'a>> {
+///
+/// `texture_arrays` is the optional list of caller-owned f32 slices that
+/// `TextureDesc::array_index` references. The in-process FFI exporter
+/// uses this to skip the bin's texture-concatenation memcpy: each
+/// texture's pixel buffer is passed directly across PyO3 instead of
+/// being re-stitched into a giant bytearray. The CLI / disk path passes
+/// an empty slice — every texture there ships with a `pixels` BlobRef
+/// pointing into the bin.
+pub fn load_scene_from_bytes<'a>(
+    json_text: &str,
+    bin: &'a [u8],
+    texture_arrays: &[&'a [f32]],
+) -> Result<LoadedScene<'a>> {
     let file: SceneFile = serde_json::from_str(json_text).context("parsing scene.json")?;
 
     if file.version != 1 {
@@ -114,7 +126,7 @@ pub fn load_scene_from_bytes<'a>(json_text: &str, bin: &'a [u8]) -> Result<Loade
     let textures = file
         .textures
         .par_iter()
-        .map(|t| load_texture(t, bin))
+        .map(|t| load_texture(t, bin, texture_arrays))
         .collect::<Result<Vec<_>>>()?;
     let mut meshes = file
         .meshes
@@ -472,14 +484,40 @@ fn load_mesh<'a>(desc: &MeshDesc, bin: &'a [u8]) -> Result<LoadedMesh<'a>> {
     })
 }
 
-fn load_texture<'a>(desc: &TextureDesc, bin: &'a [u8]) -> Result<LoadedTexture<'a>> {
-    let bytes = slice_bin(bin, desc.pixels)?;
+fn load_texture<'a>(
+    desc: &TextureDesc,
+    bin: &'a [u8],
+    texture_arrays: &[&'a [f32]],
+) -> Result<LoadedTexture<'a>> {
+    // Two source paths:
+    // - `array_index`: borrow directly from the caller's f32 slice. Used
+    //   by the in-process FFI exporter so the texture pixels don't bounce
+    //   through a giant bytearray.
+    // - `pixels`: BlobRef into the bin. Used by the disk path (CLI
+    //   tooling, `make`-driven exports) and by hand-written test scenes.
+    let src: Cow<'a, [f32]> = match (desc.array_index, &desc.pixels) {
+        (Some(idx), _) => {
+            let arr = texture_arrays.get(idx as usize).ok_or_else(|| {
+                anyhow!(
+                    "texture.array_index = {} out of range (have {} arrays)",
+                    idx,
+                    texture_arrays.len()
+                )
+            })?;
+            Cow::Borrowed(*arr)
+        }
+        (None, Some(blob)) => cast_f32_slice(slice_bin(bin, *blob)?),
+        (None, None) => {
+            return Err(anyhow!(
+                "texture has neither `pixels` nor `array_index` — one is required"
+            ))
+        }
+    };
     let expected = (desc.width * desc.height * desc.channels) as usize;
-    let got_floats = bytes.len() / 4;
-    if got_floats != expected {
+    if src.len() != expected {
         return Err(anyhow!(
             "texture pixel count mismatch: got {}, expected {} (w={} h={} c={})",
-            got_floats,
+            src.len(),
             expected,
             desc.width,
             desc.height,
@@ -492,11 +530,10 @@ fn load_texture<'a>(desc: &TextureDesc, bin: &'a [u8]) -> Result<LoadedTexture<'
 
     let data: Cow<'a, [f32]> = match desc.channels {
         4 if !srgb => {
-            // Linear 4-channel: borrow straight from the bin. No host-side
-            // memcpy, no allocation. This is the dominant cost saving on
-            // junk_shop-class scenes (5+ GB of normal/roughness/metallic
-            // maps that would otherwise pay a full Vec<f32> copy).
-            cast_f32_slice(bytes)
+            // Linear 4-channel: borrow straight from the source (bin or
+            // caller-supplied array). No host-side memcpy, no allocation.
+            // This is the dominant cost saving on junk_shop-class scenes.
+            src
         }
         4 => {
             // sRGB 4-channel: the linearisation has to write into a fresh
@@ -505,7 +542,6 @@ fn load_texture<'a>(desc: &TextureDesc, bin: &'a [u8]) -> Result<LoadedTexture<'
             // pow-2.4 and dominates load_scene on its own. par_chunks_mut
             // gives each worker a contiguous range so there's no false
             // sharing on the output buffer.
-            let src = cast_f32_slice(bytes);
             let mut out: Vec<f32> = vec![0.0; src.len()];
             const CHUNK: usize = 1 << 16; // 64K floats = 16K pixels per task
             out.par_chunks_mut(CHUNK)
@@ -524,7 +560,6 @@ fn load_texture<'a>(desc: &TextureDesc, bin: &'a [u8]) -> Result<LoadedTexture<'
             // 3-channel sources still require RGBA expansion. Blender
             // images from the addon are always 4-channel, so this path is
             // only hit by hand-written test scenes.
-            let src = cast_f32_slice(bytes);
             let mut out = Vec::with_capacity(pixel_count * 4);
             for c in src.chunks_exact(3) {
                 let r = if srgb { srgb_to_linear(c[0]) } else { c[0] };

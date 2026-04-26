@@ -135,8 +135,15 @@ class BinWriter:
     Unified by `tell()` and `write_f32`/`write_u32` returning the same
     `{"offset", "len"}` BlobRef. Pad bytes (16-byte alignment) are written
     after every blob.
+
+    `defer_textures=True` enables a separate "texture array" sink: calls to
+    `write_texture_pixels` append the numpy array to an external list and
+    return `{"array_index": i}` instead of writing into the bin. This is
+    only useful for in-memory consumption (PyO3 FFI) — disk readers don't
+    have access to the array list.
     """
-    __slots__ = ("f", "_mode", "_buf", "_mv", "_off", "_pad_used")
+    __slots__ = ("f", "_mode", "_buf", "_mv", "_off", "_pad_used",
+                 "_defer_textures", "_texture_arrays")
 
     _PAD = b"\x00" * 16
 
@@ -144,12 +151,14 @@ class BinWriter:
     _MODE_BYTESIO = "bytesio"
     _MODE_BYTEARRAY = "bytearray"
 
-    def __init__(self, f):
+    def __init__(self, f, *, defer_textures: bool = False):
         self.f = f
         self._buf = None
         self._mv = None
         self._off = 0
         self._pad_used = 0
+        self._defer_textures = defer_textures
+        self._texture_arrays = [] if defer_textures else None
         if isinstance(f, bytearray):
             # Bytearray sink: pre-sized buffer + memoryview slice writes.
             self._mode = self._MODE_BYTEARRAY
@@ -161,6 +170,12 @@ class BinWriter:
                 self._mode = self._MODE_FILE
             except (AttributeError, OSError):
                 self._mode = self._MODE_BYTESIO
+
+    @property
+    def texture_arrays(self):
+        """List of f32 numpy arrays accumulated when `defer_textures=True`.
+        Returns None on writers that concatenate textures into the bin."""
+        return self._texture_arrays
 
     def tell(self) -> int:
         if self._mode == self._MODE_BYTEARRAY:
@@ -184,11 +199,19 @@ class BinWriter:
         if needed <= cur:
             return
         new_cap = max(needed, cur * 2 if cur else needed)
+        # Release the existing memoryview before the resize — Python's
+        # bytearray refuses to grow while a memoryview is pinning it
+        # ("Existing exports of data: object cannot be re-sized"). We then
+        # re-acquire after the extend completes. Previous version of this
+        # method silently relied on the up-front pre-sized bytearray never
+        # actually triggering the grow path; once we switched to a small
+        # initial allocation that's no longer true.
+        if self._mv is not None:
+            self._mv.release()
+            self._mv = None
         # `bytearray.extend` over a zero-filled region in one shot — single
         # realloc, single memset.
         self._buf.extend(b"\x00" * (new_cap - cur))
-        # memoryview must be re-acquired after extend; the previous one is
-        # invalidated by the resize.
         self._mv = memoryview(self._buf)
 
     def _write_blob(self, arr_or_bytes, length: int) -> None:
@@ -238,6 +261,40 @@ class BinWriter:
         if pad:
             self._write_blob(self._PAD[:pad], pad)
         return {"offset": off, "len": length}
+
+    def write_texture_pixels(self, arr) -> dict:
+        """Texture-pixel sink. Returns a dict that the caller spreads onto
+        the surrounding TextureDesc:
+
+        - non-defer mode: `{"pixels": {"offset", "len"}}` — same on-disk
+          layout the Rust loader has always read.
+        - defer mode: `{"array_index": i}` — Rust resolves this against
+          the caller-supplied `texture_arrays` slice.
+
+        Why this exists: on a heavy scene (junk_shop ~12 GB of f32 RGBA
+        pixels) the cost of concatenating all textures into a single
+        bytearray is dominated by repeated reallocs as the bytearray
+        doubles. Handing each texture's numpy array directly to Rust over
+        the PyO3 buffer protocol skips both the concatenation memcpy and
+        the realloc spikes — the bin then only carries mesh / index / VC
+        blobs, totalling a few hundred MB on the largest scenes.
+
+        `arr` must be a contiguous float32 RGBA buffer of length
+        `width*height*4` (the format the renderer expects per texture).
+        """
+        import numpy as np
+        if not self._defer_textures:
+            return {"pixels": self.write_f32(arr)}
+        # Don't `np.ascontiguousarray` here unless we have to — the caller
+        # already produces contiguous f32 in `export_image_texture`. PyO3
+        # PyBuffer<f32> on the Rust side checks contiguity.
+        if not isinstance(arr, np.ndarray):
+            arr = np.asarray(arr, dtype=np.float32)
+        if arr.dtype != np.float32 or not arr.flags.c_contiguous:
+            arr = np.ascontiguousarray(arr, dtype=np.float32)
+        i = len(self._texture_arrays)
+        self._texture_arrays.append(arr)
+        return {"array_index": i}
 
 
 def _find_displacement(obj_eval, writer, textures):
@@ -850,36 +907,39 @@ def export_scene(
 def export_scene_to_memory(
     depsgraph: bpy.types.Depsgraph,
     texture_pct: int | None = None,
-) -> tuple[str, bytearray]:
-    """Build scene.json (string) + scene.bin (bytearray) in RAM.
+) -> tuple[str, bytearray, list]:
+    """Build scene.json (string) + scene.bin (bytearray) + texture array
+    list in RAM.
 
     Used by the in-process Python renderer (`runner.run_render_inproc`) so
-    the 11+ GB texture buffer never has to spill to disk on its way to
-    `vibrt_native.render`. The returned `(json_str, bin_buf)` are handed
-    straight across the FFI boundary.
+    none of the texture-pixel data has to bounce through disk on its way
+    to `vibrt_native.render`. The returned `(json_str, bin_buf,
+    texture_arrays)` are handed straight across the FFI boundary.
 
-    The bin buffer is a `bytearray`, not `bytes`, so the renderer can read
-    it via the buffer protocol without forcing a final `bytes()` copy
-    (~12 GB of memcpy on junk_shop). vibrt_native.render is bytearray-aware.
+    `texture_arrays[i]` is the f32 RGBA buffer for the texture whose JSON
+    descriptor's `pixels` field is `{"array_index": i}`. The bin buffer
+    only carries mesh / index / vertex-color / colour-graph LUT blobs; on
+    junk_shop that's ~50 MB instead of ~12 GB, so no realloc spikes.
+
+    vibrt_native.render takes an optional `texture_arrays` parameter and
+    resolves `array_index` references against it; without that parameter
+    the loader falls back to BlobRef-only behaviour for backwards
+    compatibility with the disk path.
     """
-    # Start with a small buffer and let `BinWriter` double on overflow.
-    # Pre-sizing via a `bpy.data.images` walk is tempting but costs ~7 s on
-    # junk_shop — reading `img.size` materialises image headers from disk
-    # for every datablock, including the orphan / Render Result / Viewer
-    # Node images Blender keeps around. The realloc cost from growing into
-    # ~12 GB through a few doublings is well under a second and far cheaper
-    # than the prescan.
-    buf = bytearray(4 * 1024 * 1024)
-    writer = BinWriter(buf)
+    # Mesh / index data fits in tens of MB even on the heaviest scenes,
+    # so a 16 MB seed is enough for the bytearray to never realloc.
+    buf = bytearray(16 * 1024 * 1024)
+    writer = BinWriter(buf, defer_textures=True)
     scene_dict = _export_into(depsgraph, writer, texture_pct, "<in-memory>")
     written = writer.tell()
-    # Release the memoryview before trimming — bytearray refuses to resize
-    # while a `memoryview` is keeping its buffer pinned ("Existing exports of
-    # data: object cannot be re-sized").
     writer.close()
     if len(buf) != written:
         del buf[written:]
-    return json.dumps(scene_dict, indent=2), buf
+    return (
+        json.dumps(scene_dict, indent=2),
+        buf,
+        writer.texture_arrays,
+    )
 
 
 def _export_into(
