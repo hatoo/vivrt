@@ -856,11 +856,14 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
     tmp = bpy.data.scenes.new("__vibrt_sky_bake_scene")
     tmp.world = world
     tmp.render.engine = "CYCLES"
-    # Sky Texture is smooth — a handful of samples is enough; this is the
-    # render budget for the bake itself, not the user's final render.
+    # Sky Texture is smooth — modest spp + no adaptive sampling so the
+    # disc gets sampled enough to land in the centroid we extract; at
+    # adaptive Cycles cuts off as soon as the diffuse sky converges,
+    # leaving the disc dim.
     try:
-        tmp.cycles.samples = 16
+        tmp.cycles.samples = 64
         tmp.cycles.use_denoising = False
+        tmp.cycles.use_adaptive_sampling = False
     except Exception:
         pass
     tmp.render.resolution_x = int(w)
@@ -901,7 +904,17 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
     cam_data.panorama_type = 'EQUIRECTANGULAR'
     cam = bpy.data.objects.new("__vibrt_sky_bake_cam", cam_data)
     cam.location = (0.0, 0.0, 0.0)
-    cam.rotation_euler = (0.0, 0.0, 0.0)
+    # Rotate the camera so its local +Y (Cycles' equirect "latitude axis")
+    # points at world -Z. Without this rotation the bake puts the sky on
+    # the equator (Cycles' default panorama latitude axis is camera +Y,
+    # which under identity rotation = world +Y → not the zenith axis the
+    # kernel expects). Rotating by -90° around world X takes camera +Y
+    # → world -Z (the nadir direction), which after Cycles' bottom-up
+    # storage and our `world_background()` indexing leaves world +Z at
+    # buffer y=0 — i.e. the zenith maps to image-y=0 just like the
+    # kernel's `theta = v * π` mapping reads it.
+    import math
+    cam.rotation_euler = (-math.pi / 2.0, 0.0, 0.0)
     tmp.collection.objects.link(cam)
     tmp.camera = cam
 
