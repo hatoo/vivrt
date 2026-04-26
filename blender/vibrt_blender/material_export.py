@@ -115,23 +115,6 @@ def _node_tag(node) -> str:
     return f"{node.name!r} ({node.bl_idname})"
 
 
-# Reusable flat float32 buffer shared across `export_image_texture` calls
-# within a single `export_scene`. Lazily grown on first foreach_get; subsequent
-# textures reuse the buffer when it fits, saving the per-texture allocation.
-# Not a cache — contents are overwritten on every texture, and the buffer is
-# released when `end_export()` runs. Blender's RenderEngine.render is serial
-# on the main thread, so no locking needed.
-#
-# Lazy sizing matters: a previous version of `begin_export` walked
-# `bpy.data.images` and read `img.size` to pre-allocate the maximum. On
-# scenes with many image datablocks (junk_shop has 148, of which 142 are
-# referenced) that scan can take ~7 s on its own — Blender materialises
-# image headers from disk on first `.size` access. Lazy growth folds those
-# header reads into the per-texture export, which already has to touch
-# every used image. Unused images (Render Result, Viewer Node, orphan
-# datablocks) are never inspected.
-_REUSABLE_PIXELS = None
-
 # Integer percentage applied to final-written texture dimensions, or None/100
 # for no-op. Intermediate caches (linear RGB, mean RGBA, premix) still operate
 # at full resolution; the downsample only affects what lands in scene.bin.
@@ -139,34 +122,13 @@ _TEXTURE_PCT = None
 
 
 def begin_export(texture_pct: int | None = None) -> None:
-    """Reset per-export state. The reusable foreach_get buffer is allocated
-    lazily on first use."""
-    global _REUSABLE_PIXELS, _TEXTURE_PCT
-    _REUSABLE_PIXELS = None
+    """Reset per-export state."""
+    global _TEXTURE_PCT
     _TEXTURE_PCT = texture_pct
 
 
-def _ensure_reusable_pixels(n: int):
-    """Allocate or grow the reusable foreach_get buffer to at least `n`
-    float32 entries."""
-    import numpy as np
-    global _REUSABLE_PIXELS
-    if _REUSABLE_PIXELS is None or _REUSABLE_PIXELS.size < n:
-        # Round up to a power of two so subsequent slightly-larger images
-        # don't trigger another realloc; capped at 8K×8K×4 to bound RAM.
-        n = max(1, n)
-        cap = 1
-        while cap < n:
-            cap <<= 1
-        cap = min(cap, 8192 * 8192 * 4)
-        cap = max(cap, n)
-        _REUSABLE_PIXELS = np.empty(cap, dtype=np.float32)
-
-
 def end_export() -> None:
-    """Release the reusable buffer so peak RAM drops back once export is done."""
-    global _REUSABLE_PIXELS, _TEXTURE_PCT
-    _REUSABLE_PIXELS = None
+    global _TEXTURE_PCT
     _TEXTURE_PCT = None
 
 
@@ -217,20 +179,14 @@ def export_image_texture(
         width, height = 1, 1
         pixels = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
     else:
-        # foreach_get writes into a view of the module-level reusable buffer so
-        # we skip the per-image `np.empty(w*h*4)` allocation. Fall back to a
-        # fresh alloc if export_image_texture was reached without a surrounding
-        # `begin_export()` (e.g. test harness calling it directly).
-        #
-        # When the writer parks textures into a per-array list (in-process FFI
-        # path), the buffer must outlive this call — allocate fresh each time
-        # so the next image's foreach_get doesn't trample the previous one.
+        # Allocate a fresh per-texture buffer. The pixels travel across PyO3
+        # into Rust as a `PyBuffer<f32>`, so the numpy array must outlive
+        # this function — sharing a module-level scratch buffer would make
+        # every appended `texture_arrays` entry alias the LAST texture's
+        # data (visible as e.g. every render texture-sampling normal-map
+        # values 0.5/0.5/1.0).
         n = width * height * 4
-        if getattr(writer, "_defer_textures", False):
-            pixels = np.empty(n, dtype=np.float32)
-        else:
-            _ensure_reusable_pixels(n)
-            pixels = _REUSABLE_PIXELS[:n]
+        pixels = np.empty(n, dtype=np.float32)
         t_px = time.perf_counter()
         image.pixels.foreach_get(pixels)
         _STATS["pixel_read_s"] += time.perf_counter() - t_px
