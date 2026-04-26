@@ -1398,6 +1398,15 @@ _CONSTANT_LEAF_NODES = frozenset((
     # typically wired (Fresnel-blended clearcoat / edge tint).
     "ShaderNodeFresnel",
     "ShaderNodeLayerWeight",
+    # Per-vertex / per-particle signals we can't bake to a texture but want
+    # to silently default rather than dropping the surrounding chain. The
+    # mean-colour path in `_node_mean_color` gives them a neutral grey so
+    # the upstream Mix/HSV stack still folds. (lone_monk's `column marble`
+    # has Vertex Color in a Mix; `leather - book - cover 1` and
+    # `grass blade` thread Particle Info into the colour chain.)
+    "ShaderNodeVertexColor",
+    "ShaderNodeParticleInfo",
+    "ShaderNodeHairInfo",
 ))
 
 
@@ -1479,6 +1488,24 @@ def _node_mean_color(node, output_sock) -> list[float] | None:
         # Without evaluating the sky model, daylight-sky zenith colour is a
         # reasonable average for folding into a MixShader / Emission.
         return [0.5, 0.65, 0.85]
+    if bl == "ShaderNodeVertexColor":
+        # No way to know the actual per-vertex distribution at export time;
+        # missing layer defaults to white in Cycles. The renderer's own
+        # vertex_color path (driven by `_find_base_color_attribute`) handles
+        # the dominant-attribute case; this neutral keeps a Mix surrounding
+        # a stray VertexColor leaf from collapsing to black.
+        return [1.0, 1.0, 1.0]
+    if bl == "ShaderNodeParticleInfo":
+        # `Random` (0..1), `Age` / `Lifetime` and the like are per-particle
+        # signals we can't bake. Mid-grey for colour-shaped folds; zero for
+        # vector outputs (Velocity / Location).
+        if name in ("Velocity", "Angular Velocity", "Location"):
+            return [0.0, 0.0, 0.0]
+        return [0.5, 0.5, 0.5]
+    if bl == "ShaderNodeHairInfo":
+        # Strand intercept / random / length all live in [0..1]; the kernel
+        # has no per-strand attribute mechanism so fold to 0.5.
+        return [0.5, 0.5, 0.5]
     return None
 
 
@@ -1692,16 +1719,101 @@ def _node_color_transform(node, chain_input_name=None):
     return None
 
 
-def _combine_color_transform(node, chain_input_name=None):
-    """Bake CombineColor / CombineRGB when one channel is texture-driven and
-    the other two fold to constants.
+def _resolve_channel_extract(sock, expected_separate_node, depth: int = 0):
+    """If `sock` is fed by a chain that ultimately extracts a single
+    channel of `expected_separate_node` (a ShaderNodeSeparate{Color,RGB}),
+    optionally through a few per-channel transforms (Invert / Math),
+    return `(channel_idx, transforms)`:
+      - channel_idx ∈ {0, 1, 2} is which RGB channel of the Separate node's
+        input is read.
+      - transforms is a list of (id_tuple, apply_fn) operating on a scalar
+        array (the extracted channel, sampled per-pixel).
 
-    The chain delivers an RGB texture but only one channel of that texture
-    is actually wanted (the channel matching `chain_input_name`); the
-    output Color slots that channel into its corresponding output index
-    and uses the resolved constants for the other two. Modes other than
-    RGB (HSV, HSL) are skipped — the GPU shader has no HSL/HSV machinery
-    and folding constants there isn't worth replicating.
+    Otherwise `None`. Used by `_combine_color_transform` to fold the
+    "Invert G channel-only" idiom (Separate → Invert(G) → Combine).
+    """
+    if depth > 6:
+        return None
+    sock = _follow_reroutes(sock)
+    if not sock.is_linked:
+        return None
+    src = sock.links[0].from_node
+    bl = src.bl_idname
+    from_socket = sock.links[0].from_socket
+    if bl in ("ShaderNodeSeparateColor", "ShaderNodeSeparateRGB"):
+        # Compare by C-level pointer — bpy returns fresh Python wrappers
+        # for the same underlying node depending on how the chain reached
+        # it, so `is` doesn't work.
+        if src.as_pointer() != expected_separate_node.as_pointer():
+            return None
+        if bl == "ShaderNodeSeparateRGB":
+            ch_map = {"R": 0, "G": 1, "B": 2}
+        else:
+            ch_map = {"Red": 0, "Green": 1, "Blue": 2}
+        ch = ch_map.get(from_socket.name)
+        if ch is None:
+            return None
+        return ch, []
+    if bl == "ShaderNodeInvert":
+        inner = _resolve_channel_extract(src.inputs["Color"], expected_separate_node, depth + 1)
+        if inner is None:
+            return None
+        ch, xforms = inner
+        # Honour the Fac socket so an artist who dialed the inversion
+        # back to half-strength still gets ≈the right curve.
+        fac = _resolve_constant_scalar(src.inputs.get("Fac")) if src.inputs.get("Fac") else 1.0
+        if fac is None:
+            return None
+        def apply_invert(s):
+            import numpy as np
+            return s * (1.0 - fac) + (1.0 - s) * fac
+        return ch, xforms + [("InvertCh", round(float(fac), 6), apply_invert)]
+    if bl == "ShaderNodeMath":
+        inner = None
+        for inp in src.inputs:
+            r = _resolve_channel_extract(inp, expected_separate_node, depth + 1)
+            if r is not None:
+                inner = (inp, r)
+                break
+        if inner is None:
+            return None
+        chain_inp, (ch, xforms) = inner
+        op = getattr(src, "operation", "ADD")
+        # Resolve the other operand(s) to constants.
+        others = []
+        for inp in src.inputs:
+            if inp is chain_inp:
+                continue
+            v = _resolve_constant_scalar(inp) if inp.is_linked else _socket_f(inp)
+            if v is None:
+                return None
+            others.append(v)
+        b = others[0] if others else 0.0
+        if op == "ADD":
+            apply = lambda s, b=b: s + b
+        elif op == "SUBTRACT":
+            apply = lambda s, b=b: s - b
+        elif op == "MULTIPLY":
+            apply = lambda s, b=b: s * b
+        elif op == "DIVIDE":
+            apply = lambda s, b=b: s / b if b != 0 else s
+        else:
+            return None
+        return ch, xforms + [(f"Math:{op}", round(float(b), 6), apply)]
+    return None
+
+
+def _combine_color_transform(node, chain_input_name=None):
+    """Bake CombineColor / CombineRGB.
+
+    Two supported shapes:
+      1. One linked input (the chain), the other two fold to constants. The
+         chain's value lives in its corresponding output channel and the
+         constants fill the rest.
+      2. All three inputs trace back through SeparateRGB extractions of the
+         same texture (the chain's source image), with optional per-channel
+         transforms (Invert / Math). This is the canonical "Invert G"
+         normal-map convention swap (lone_monk's `wood - table` group).
     """
     import numpy as np
     mode = getattr(node, "mode", "RGB")
@@ -1712,7 +1824,6 @@ def _combine_color_transform(node, chain_input_name=None):
             f"effect not baked",
         )
         return None
-    # CombineColor uses Red/Green/Blue, CombineRGB uses R/G/B.
     if node.bl_idname == "ShaderNodeCombineRGB":
         names = ("R", "G", "B")
     else:
@@ -1722,6 +1833,53 @@ def _combine_color_transform(node, chain_input_name=None):
     )
     if chain_idx < 0:
         return None
+
+    # Try shape 2 first (channel-extract collapse). Find the SeparateRGB
+    # node our chain's input traces back through; if all three combine
+    # inputs reach the *same* SeparateRGB, we've got the per-channel
+    # idiom and can collapse.
+    chain_sock = node.inputs.get(names[chain_idx])
+    sep_node = None
+    if chain_sock is not None and chain_sock.is_linked:
+        cur = _follow_reroutes(chain_sock)
+        for _ in range(8):
+            if not cur.is_linked:
+                break
+            n = cur.links[0].from_node
+            if n.bl_idname in ("ShaderNodeSeparateColor", "ShaderNodeSeparateRGB"):
+                sep_node = n
+                break
+            nxt = next((i for i in n.inputs if i.is_linked), None)
+            if nxt is None:
+                break
+            cur = _follow_reroutes(nxt)
+    if sep_node is not None:
+        per_ch: list[tuple] = []
+        ok_all = True
+        for i, n in enumerate(names):
+            sock = node.inputs.get(n)
+            if sock is None or not sock.is_linked:
+                ok_all = False
+                break
+            r = _resolve_channel_extract(sock, sep_node)
+            if r is None:
+                ok_all = False
+                break
+            per_ch.append(r)
+        if ok_all:
+            id_tuple = ("CombineCh",
+                tuple((ch, tuple(t[0] for t in xforms)) for ch, xforms in per_ch))
+            def apply_per_channel(rgb):
+                out = np.empty_like(rgb)
+                for i, (ch, xforms) in enumerate(per_ch):
+                    s = rgb[..., ch]
+                    for _, _, fn in xforms:
+                        s = fn(s)
+                    out[..., i] = s
+                return out.astype(np.float32)
+            return id_tuple, apply_per_channel
+
+    # Shape 1: one chain socket, others fold to constants.
     consts: list[float | None] = [None, None, None]
     for i, n in enumerate(names):
         if i == chain_idx:
@@ -1745,9 +1903,6 @@ def _combine_color_transform(node, chain_input_name=None):
                 tuple(round(float(c), 6) if c is not None else None for c in consts))
 
     def apply(rgb):
-        # The chain delivers a 3-channel texture (the same texture sampled by
-        # the upstream nodes). We pick the chain_idx-th channel and assemble
-        # the output color with the constants in the other slots.
         out = np.empty_like(rgb)
         for i in range(3):
             if i == chain_idx:
@@ -2813,6 +2968,39 @@ def _normal_perturbation(normal_sock):
         # Direct TexImage on Normal input: synthesise a fake socket-like by
         # wrapping the node's output back into normal_sock itself.
         return normal_sock, 1.0, None, 1.0
+    if src.bl_idname in ("ShaderNodeMix", "ShaderNodeMixRGB"):
+        # `Mix(NormalMap, NormalMap)` / `Mix(NormalMap, Bump)` is the typical
+        # "blend two perturbations" idiom (lone_monk's leather book covers).
+        # The kernel only carries one normal/bump texture per material, so
+        # we walk both Mix branches and pick the side whose `fac` weight is
+        # higher — falling back to A when fac == 0.5. Strength is scaled by
+        # the chosen Mix factor so a lightly-blended detail bump fades.
+        if src.bl_idname == "ShaderNodeMixRGB":
+            fac_sock = src.inputs.get("Fac")
+            a_sock = src.inputs.get("Color1")
+            b_sock = src.inputs.get("Color2")
+        else:
+            fac_sock, a_sock, b_sock = _mix_rgba_sockets(src)
+        if fac_sock is None or a_sock is None or b_sock is None:
+            _warn(
+                f"normal-mix-sock:{src.as_pointer()}",
+                f"Normal input driven by {_node_tag(src)}: could not pick A/B "
+                f"sockets — perturbation ignored",
+            )
+            return None, 1.0, None, 1.0
+        fac = (
+            _resolve_constant_scalar(fac_sock) if fac_sock.is_linked
+            else _socket_f(fac_sock)
+        )
+        if fac is None:
+            fac = 0.5
+        # Pick the side that carries more weight in the blend. Forward each
+        # side back through `_normal_perturbation` so a Mix(NormalMap, Bump)
+        # still picks up Strength / Distance from whichever wins.
+        pick = a_sock if fac < 0.5 else b_sock
+        weight = (1.0 - fac) if fac < 0.5 else fac
+        n2, ns2, b2, bs2 = _normal_perturbation(pick)
+        return n2, ns2 * weight, b2, bs2 * weight
     _warn(
         f"normal-src:{src.bl_idname}",
         f"Normal input driven by {_node_tag(src)} — not handled (expected "
