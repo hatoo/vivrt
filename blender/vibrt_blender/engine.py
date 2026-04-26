@@ -22,6 +22,16 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
     bl_label = "vibrt"
     bl_use_preview = False
     bl_use_shading_nodes_custom = False
+    # Skip Blender's post-process compositor pipeline. Cycles-authored
+    # scenes (lone_monk, classroom) often hang Glare / Lens-Distortion /
+    # Mix(Image, Noisy Image) / Mist-driven exposure nodes off the Render
+    # Layers output. We only populate Combined — the Noisy / Mist /
+    # denoising-data passes the compositor expects don't exist for us, so
+    # the Mix nodes wind up averaging our render with zero and the Glare
+    # bleed lifts every shadow into a uniform mid-grey haze. Letting
+    # Blender skip the compositor entirely keeps the renderer's raw
+    # Filmic-encoded output as-is.
+    bl_use_postprocess = False
 
     def update(self, data=None, depsgraph=None):
         # `update()` is Blender's "prepare-to-render" hook. We use it to
