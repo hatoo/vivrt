@@ -862,24 +862,14 @@ def export_scene_to_memory(
     it via the buffer protocol without forcing a final `bytes()` copy
     (~12 GB of memcpy on junk_shop). vibrt_native.render is bytearray-aware.
     """
-    # Pre-size the buffer in one allocation so bytearray's growth strategy
-    # doesn't end up doing exponential reallocs as it crosses 11 GB. Estimate
-    # = sum of pixel bytes (16/pixel for RGBA f32, scaled by texture_pct)
-    # plus 25% headroom for meshes / colour-graph LUTs / etc. If the estimate
-    # is short, BytearrayWriter falls back to growing — same cost as today;
-    # if it's long, we trim with `del buf[written:]` (a metadata change, not
-    # a realloc).
-    pct = (texture_pct or 100) / 100.0
-    estimated = 0
-    for img in bpy.data.images:
-        w, h = int(img.size[0]), int(img.size[1])
-        if w > 0 and h > 0:
-            sw = max(1, int(round(w * pct)))
-            sh = max(1, int(round(h * pct)))
-            estimated += sw * sh * 16
-    estimated = int(estimated * 1.25) + 4 * 1024 * 1024
-
-    buf = bytearray(estimated) if estimated > 0 else bytearray()
+    # Start with a small buffer and let `BinWriter` double on overflow.
+    # Pre-sizing via a `bpy.data.images` walk is tempting but costs ~7 s on
+    # junk_shop — reading `img.size` materialises image headers from disk
+    # for every datablock, including the orphan / Render Result / Viewer
+    # Node images Blender keeps around. The realloc cost from growing into
+    # ~12 GB through a few doublings is well under a second and far cheaper
+    # than the prescan.
+    buf = bytearray(4 * 1024 * 1024)
     writer = BinWriter(buf)
     scene_dict = _export_into(depsgraph, writer, texture_pct, "<in-memory>")
     written = writer.tell()
@@ -909,6 +899,12 @@ def _export_into(
     t0 = time.perf_counter()
     material_export.reset_stats()
     mesh_s = 0.0
+    hair_s = 0.0
+    iter_body_s = 0.0  # cumulative time spent inside the depsgraph loop body
+    alloc_s = 0.0      # begin_export / end_export buffer init
+    pre_loop_s = 0.0   # everything before the depsgraph iteration
+    post_loop_s = 0.0  # everything after the loop end
+    t_pre = time.perf_counter()
     slow_meshes: list[tuple] = []
     scene = depsgraph.scene_eval
     rd = scene.render
@@ -932,16 +928,14 @@ def _export_into(
     cam_obj = None
     lights_json: list[dict] = []
 
-    # Upper bound for the largest texture foreach_get destination. Walking
-    # `bpy.data.images` covers every image datablock loaded into the .blend —
-    # over-allocating on unused images is preferable to per-texture reallocs
-    # and doesn't pin memory beyond `material_export.end_export()` below.
-    max_pixel_count = 1
-    for img in bpy.data.images:
-        w, h = int(img.size[0]), int(img.size[1])
-        if w > 0 and h > 0:
-            max_pixel_count = max(max_pixel_count, w * h)
-    material_export.begin_export(max_pixel_count, texture_pct=texture_pct)
+    # The reusable foreach_get buffer is now grown lazily on first use, so we
+    # no longer pre-walk `bpy.data.images`. That walk used to cost ~7 s on
+    # junk_shop because reading `img.size` materialises image headers from
+    # disk for every datablock — including unused ones (orphan textures,
+    # the Render Result / Viewer Node images Blender always keeps around).
+    t_alloc = time.perf_counter()
+    material_export.begin_export(texture_pct=texture_pct)
+    alloc_s += time.perf_counter() - t_alloc
 
     try:
         # Single-arm `try/finally` so we always reach `material_export.end_export()`.
@@ -970,7 +964,10 @@ def _export_into(
                 material_index[mat.name] = mid
                 return mid
 
+            pre_loop_s = time.perf_counter() - t_pre
+            t_loop_start = time.perf_counter()
             for inst in depsgraph.object_instances:
+                t_iter = time.perf_counter()
                 obj = inst.object
                 if inst.is_instance:
                     obj_eval = obj
@@ -1053,6 +1050,7 @@ def _export_into(
                         ps.settings.type == "HAIR"
                         for ps in obj_eval.particle_systems
                     ):
+                        t_hair = time.perf_counter()
                         hair_pair = hair_export.export_hair(
                             obj,
                             obj_eval,
@@ -1061,6 +1059,7 @@ def _export_into(
                             resolve_material,
                             obj_eval.name,
                         )
+                        hair_s += time.perf_counter() - t_hair
                         if hair_pair is not None:
                             hair_mesh, hair_obj = hair_pair
                             hair_mesh_id = len(meshes)
@@ -1075,6 +1074,10 @@ def _export_into(
                     depsgraph
                 ):
                     cam_obj = obj_eval
+                iter_body_s += time.perf_counter() - t_iter
+            loop_total_s = time.perf_counter() - t_loop_start
+            depsgraph_iter_s = max(0.0, loop_total_s - iter_body_s)
+            t_post = time.perf_counter()
 
             if cam_obj is None and scene.camera is not None:
                 cam_obj = scene.camera.evaluated_get(depsgraph)
@@ -1088,7 +1091,9 @@ def _export_into(
 
             bin_size = writer.tell()
     finally:
+        t_dealloc = time.perf_counter()
         material_export.end_export()
+        alloc_s += time.perf_counter() - t_dealloc
 
     # `bin_write_s` used to measure the final `f.write(bytearray)` dump (~200ms
     # on classroom-size scenes). With streaming writes it's essentially the
@@ -1125,6 +1130,7 @@ def _export_into(
     json_dump_s = 0.0
     json_write_s = 0.0
 
+    post_loop_s = time.perf_counter() - t_post
     dt = time.perf_counter() - t0
     stats = material_export.pop_stats()
     material_s = stats["material_self_s"]
@@ -1133,9 +1139,19 @@ def _export_into(
     bake_chain_s = stats["bake_chain_s"]
     accounted = (
         mesh_s + material_s + texture_s + pixel_read_s + bake_chain_s
+        + hair_s + alloc_s + depsgraph_iter_s + pre_loop_s + post_loop_s
         + world_s + json_dump_s + bin_write_s + json_write_s
     )
     other_s = max(0.0, dt - accounted)
+    # `loop_overhead` is the time spent inside the depsgraph loop body that
+    # *isn't* mesh / hair / material / texture / pixel / bake. It's the
+    # iteration scaffolding itself: obj.evaluated_get, material_slots access,
+    # _try_emissive_quad_as_rect_light, dict appends, etc. Useful for
+    # pinpointing whether a slow export is texture-bound vs scaffolding-bound.
+    loop_children = (
+        mesh_s + hair_s + material_s + texture_s + pixel_read_s + bake_chain_s
+    )
+    loop_overhead_s = max(0.0, iter_body_s - loop_children)
     tex_pct_str = (
         f", texture_pct={texture_pct}%"
         if texture_pct is not None and texture_pct != 100 else ""
@@ -1153,9 +1169,10 @@ def _export_into(
         f"bake_chain={bake_chain_s:.2f}s"
     )
     print(
-        f"[vibrt]   world={world_s:.2f}s  json_dump={json_dump_s:.2f}s  "
-        f"bin_write={bin_write_s:.2f}s  json_write={json_write_s:.2f}s  "
-        f"other={other_s:.2f}s"
+        f"[vibrt]   hair={hair_s:.2f}s  loop_overhead={loop_overhead_s:.2f}s  "
+        f"depsgraph_iter={depsgraph_iter_s:.2f}s  alloc={alloc_s:.2f}s  "
+        f"pre_loop={pre_loop_s:.2f}s  post_loop={post_loop_s:.2f}s  "
+        f"world={world_s:.2f}s  other={other_s:.2f}s"
     )
     if slow_meshes:
         desc = ", ".join(f"{n}({t:.0f}k tri, {d:.2f}s)" for n, t, d in

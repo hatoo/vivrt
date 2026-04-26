@@ -116,11 +116,20 @@ def _node_tag(node) -> str:
 
 
 # Reusable flat float32 buffer shared across `export_image_texture` calls
-# within a single `export_scene`. Sized up front to the largest image datablock
-# so each texture's foreach_get writes into a slice view instead of allocating
-# a fresh per-texture buffer. Not a cache — contents are overwritten on every
-# texture and the buffer is released when `end_export()` runs. Blender's
-# RenderEngine.render is serial on the main thread, so no locking needed.
+# within a single `export_scene`. Lazily grown on first foreach_get; subsequent
+# textures reuse the buffer when it fits, saving the per-texture allocation.
+# Not a cache — contents are overwritten on every texture, and the buffer is
+# released when `end_export()` runs. Blender's RenderEngine.render is serial
+# on the main thread, so no locking needed.
+#
+# Lazy sizing matters: a previous version of `begin_export` walked
+# `bpy.data.images` and read `img.size` to pre-allocate the maximum. On
+# scenes with many image datablocks (junk_shop has 148, of which 142 are
+# referenced) that scan can take ~7 s on its own — Blender materialises
+# image headers from disk on first `.size` access. Lazy growth folds those
+# header reads into the per-texture export, which already has to touch
+# every used image. Unused images (Render Result, Viewer Node, orphan
+# datablocks) are never inspected.
 _REUSABLE_PIXELS = None
 
 # Integer percentage applied to final-written texture dimensions, or None/100
@@ -129,15 +138,29 @@ _REUSABLE_PIXELS = None
 _TEXTURE_PCT = None
 
 
-def begin_export(max_pixel_count: int, texture_pct: int | None = None) -> None:
-    """Allocate the reusable foreach_get buffer for the upcoming export."""
-    import numpy as np
+def begin_export(texture_pct: int | None = None) -> None:
+    """Reset per-export state. The reusable foreach_get buffer is allocated
+    lazily on first use."""
     global _REUSABLE_PIXELS, _TEXTURE_PCT
-    # `max(1, ...)` so a scene with no images still produces a valid view
-    # should export_image_texture be invoked for an empty image.
-    n = max(1, int(max_pixel_count)) * 4
-    _REUSABLE_PIXELS = np.empty(n, dtype=np.float32)
+    _REUSABLE_PIXELS = None
     _TEXTURE_PCT = texture_pct
+
+
+def _ensure_reusable_pixels(n: int):
+    """Allocate or grow the reusable foreach_get buffer to at least `n`
+    float32 entries."""
+    import numpy as np
+    global _REUSABLE_PIXELS
+    if _REUSABLE_PIXELS is None or _REUSABLE_PIXELS.size < n:
+        # Round up to a power of two so subsequent slightly-larger images
+        # don't trigger another realloc; capped at 8K×8K×4 to bound RAM.
+        n = max(1, n)
+        cap = 1
+        while cap < n:
+            cap <<= 1
+        cap = min(cap, 8192 * 8192 * 4)
+        cap = max(cap, n)
+        _REUSABLE_PIXELS = np.empty(cap, dtype=np.float32)
 
 
 def end_export() -> None:
@@ -199,10 +222,8 @@ def export_image_texture(
         # fresh alloc if export_image_texture was reached without a surrounding
         # `begin_export()` (e.g. test harness calling it directly).
         n = width * height * 4
-        if _REUSABLE_PIXELS is not None and _REUSABLE_PIXELS.size >= n:
-            pixels = _REUSABLE_PIXELS[:n]
-        else:
-            pixels = np.empty(n, dtype=np.float32)
+        _ensure_reusable_pixels(n)
+        pixels = _REUSABLE_PIXELS[:n]
         t_px = time.perf_counter()
         image.pixels.foreach_get(pixels)
         _STATS["pixel_read_s"] += time.perf_counter() - t_px
