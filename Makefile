@@ -11,6 +11,7 @@
 #   make addon                # blender/vibrt_blender.zip (Python only — won't render)
 #   make addon-with-native    # also build + bundle vibrt_native.pyd
 #   make dev-install          # build .pyd, stage, junction into Blender's user-addons
+#   make test                 # run pure-Python unit tests (color_fold, ...)
 #   make clean                # remove preview.png, addon zip, staged .pyd
 #
 # Overridable:
@@ -41,10 +42,15 @@ DENOISE_FLAG := $(if $(strip $(DENOISE)),--denoise)
 ADDON_ZIP     := blender/vibrt_blender.zip
 ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
 
-.PHONY: all previews cycles-previews addon addon-with-native dev-install clean native-build FORCE \
+.PHONY: all previews cycles-previews addon addon-with-native dev-install clean native-build test FORCE \
         $(BLEND_PREVIEW_TARGETS) $(BLEND_CYCLES_TARGETS)
 
 FORCE:
+
+# Pure-Python unit tests (no Blender / CUDA required). Currently covers
+# the export-time const folder for color graphs.
+test:
+	$(PYTHON) blender/vibrt_blender/test_color_fold.py
 
 # Build the PyO3 extension and stage it next to the addon source. Cargo is
 # incremental, so this is a no-op when nothing changed. `make dev-install`

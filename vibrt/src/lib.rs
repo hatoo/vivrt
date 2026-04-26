@@ -8,7 +8,6 @@
 #![allow(clippy::missing_transmute_annotations)]
 
 pub mod camera;
-pub mod color_fold;
 pub mod gpu_types;
 pub mod pipeline;
 pub mod principled;

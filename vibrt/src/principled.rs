@@ -56,9 +56,9 @@ pub fn upload_color_graph(
     bufs: &mut Vec<CudaSlice<u32>>,
     f_bufs: &mut Vec<CudaSlice<f32>>,
 ) -> Result<ColorGraphGpu> {
-    // Collapse fully-constant subgraphs before any GPU work (incl. LUT upload).
-    let folded = crate::color_fold::fold_constants(graph);
-    let graph = &folded;
+    // Constant subgraphs were folded to `const` nodes by the Python exporter
+    // (`vibrt_blender/color_fold.py`) before serialisation. The graph
+    // arriving here already has them collapsed.
     if graph.nodes.len() > 255 {
         return Err(anyhow!(
             "color_graph has {} nodes (max 255)",

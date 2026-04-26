@@ -14,7 +14,13 @@ cargo build --release -p vibrt                      # rlib only — useful when 
 make dev-install                                    # build .pyd, stage next to addon source, junction into Blender's user addons
 ```
 
-There is no `cargo test` suite. Verification is done by rendering test scenes:
+Pure-Python unit tests live alongside the Blender addon and run under plain CPython (no Blender required):
+
+```bash
+make test            # blender/vibrt_blender/test_*.py — currently color_fold
+```
+
+There is no `cargo test` suite. End-to-end render verification is by rendering test scenes:
 
 ```bash
 make junk_shop-preview      # vibrt render of test_scenes/junk_shop/junk_shop/junk_shop.blend
@@ -59,6 +65,7 @@ This is a workspace with three Rust crates and a Python Blender addon. The data 
 - **`engine.py`** — `VibrtRenderEngine(bpy.types.RenderEngine)`. F12 entry point. The addon renders **only** through the bundled `vibrt_native.pyd`; if the extension isn't importable the engine reports an error and stops. There is no subprocess fallback.
 - **`exporter.py`** — the bulk of the export logic. Single entry point `export_scene_to_memory(depsgraph, texture_pct=None) -> (json_str, bytearray, list[ndarray])`. The `BinWriter` writes mesh / index / vertex-color / colour-graph LUT blobs into a `bytearray` via `memoryview` slice assignment (with auto-grow on overflow); textures go through `write_texture_pixels` and are parked into a separate per-texture array list. The bin runs at tens of MB even on heavy scenes; texture data (~12 GB on junk_shop) lives entirely in the per-texture array list and travels across PyO3 as `Vec<PyBuffer<f32>>`.
 - **`material_export.py`** — Principled BSDF + node-graph compilation. Bakes RGBCurve/HueSat/Gamma/Invert/Clamp/ColorRamp/BrightContrast/Mix(MIX/MULTIPLY/ADD/SUBTRACT, constant side) into texture pixels; emits residual sequences as a small "colour graph" the device code interprets. Detects pure-emissive single-quad meshes and promotes them to area_rect lights so NEE can importance-sample them.
+- **`color_fold.py`** — export-time constant folder for the JSON color graph. A node whose every input resolves to `{"type": "const"}` is evaluated host-side and rewritten in-place; the GPU interpreter sees a shorter chain. Op evaluators (mix/math/invert/hue_sat/rgb_curve/bright_contrast) mirror `devicecode.cu` branch-for-branch and are unit-tested in `test_color_fold.py` (no bpy dependency, runs under plain CPython via `make test`).
 - **`hair_export.py`** — particle-system hair → ribbon mesh tessellation. (`rendered_child_count` is per-parent, not total — easy off-by-N if you forget.)
 - **`runner.py`** — `find_native_module()` and `run_render_inproc()`. The latter is a thin wrapper over `vibrt_native.render(...)` that forwards `texture_arrays`.
 - **`build_addon.py`** — packages `vibrt_blender.zip`. `--with-native` builds the cdylib via cargo and stages it as `vibrt_native.pyd`/`.so`/`.dylib`. `--stage-only` does the build + copy without zipping (used by `make dev-install` for the junctioned-addon workflow). A no-`--with-native` zip won't actually render — the addon errors out without the extension.

@@ -2494,7 +2494,13 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
     out_idx = emit(sock)
     if out_idx is None or not nodes:
         return None
-    return {"nodes": nodes, "output": out_idx}
+    # Const-fold before serialising: a node whose every input resolves to a
+    # `const` is evaluated on the host and rewritten in-place, so the GPU
+    # interpreter sees a shorter chain. The Rust side used to do this in
+    # `vibrt/src/color_fold.rs`; moving it here keeps the eval logic on a
+    # single side of the FFI and is unit-tested in `test_color_fold.py`.
+    from . import color_fold
+    return color_fold.fold_constants({"nodes": nodes, "output": out_idx})
 
 
 def _normal_perturbation(normal_sock):
