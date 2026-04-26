@@ -707,12 +707,119 @@ def prebake_sky_envmaps_for_world(world, w: int = 1024, h: int = 512) -> None:
             f"will fall back to constant"
         )
         return
-    _SKY_BAKE_CACHE[key] = baked
+    # Split the sun out of the bake: super-bright pixels (the disc) are
+    # impossible to importance-sample cleanly through an equirect — they
+    # blow up NEE/BSDF MIS into vertical firefly streaks. Cycles handles
+    # this internally by emitting the sun as a dedicated delta-direction
+    # sun light *in addition* to the procedural sky; we mirror that.
+    rgb, bw, bh = baked
+    sun_light = _extract_sun_from_bake_inplace(rgb, bw, bh, sky, world.name)
+    _SKY_BAKE_CACHE[key] = (rgb, bw, bh, sun_light)
     _emit(
         f"[vibrt] world {world.name!r}: pre-baked ShaderNodeTexSky "
         f"({sky.sky_type}) to a {baked[1]}x{baked[2]} envmap in "
         f"{time.perf_counter() - t0:.2f}s"
     )
+
+
+def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: str):
+    """If the bake contains a sun disc (a tight cluster of very-high-
+    radiance pixels), clip those pixels down to roughly diffuse-sky levels
+    and return a `sun` LightDesc carrying the missing flux as a separate
+    delta light.
+
+    Modifies `rgb` in place. Returns None when no sun is present (sky_disc
+    off, or scattered radiance not concentrated enough to justify a delta
+    light).
+
+    Why bother splitting? Cycles' Sky Texture renders the sun disc *both*
+    into the procedural envmap and as a dedicated delta sun light, so its
+    importance sampler can find the sun directly. We can't replicate the
+    delta path through a baked equirect — the disc ends up as a few
+    super-bright pixels that punch through MIS as vertical fireflies. The
+    fix mirrors Cycles: strip the disc out of the bake and emit it as a
+    separate sun light. The bake retains the diffuse sky only.
+    """
+    import numpy as np
+    import math
+    if not getattr(sky_node, "sun_disc", False):
+        return None
+    lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+    lum_max = float(lum.max())
+    # Diffuse Nishita sky tops out around 10-30. Anything noticeably
+    # brighter than the brightest bright-but-diffuse pixel is the sun
+    # disc; threshold at 5x the 99.5th percentile gives a robust cutoff
+    # without per-scene tuning. Bail when the bake is uniform-ish (no
+    # sun_disc, overcast sky, hand-edited HDRI).
+    p995 = float(np.percentile(lum, 99.5))
+    threshold = max(50.0, p995 * 5.0)
+    if lum_max < threshold:
+        return None
+    bright_mask = lum > threshold
+    n_bright = int(bright_mask.sum())
+    if n_bright == 0:
+        return None
+    ys, xs = np.where(bright_mask)
+    # (theta, phi) of bright pixels. Equirect convention: y=0 is +Z (zenith).
+    theta = (ys.astype(np.float32) + 0.5) * (math.pi / h)
+    phi = (xs.astype(np.float32) + 0.5) * (2.0 * math.pi / w)
+    sin_t = np.sin(theta)
+    cos_t = np.cos(theta)
+    sin_p = np.sin(phi)
+    cos_p = np.cos(phi)
+    # Per-pixel solid angle (equirect Jacobian).
+    omega = (2.0 * math.pi * math.pi / (w * h)) * sin_t
+    weights = lum[ys, xs] * omega
+    total_weight = float(weights.sum())
+    if total_weight <= 0.0:
+        return None
+    dx = float((sin_t * cos_p * weights).sum() / total_weight)
+    dy = float((sin_t * sin_p * weights).sum() / total_weight)
+    dz = float((cos_t * weights).sum() / total_weight)
+    norm = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if norm < 1e-6:
+        return None
+    sun_dir = (dx / norm, dy / norm, dz / norm)
+    # Flux above the diffuse-sky threshold (per channel, in irradiance
+    # units = radiance × sr).
+    rgb_bright = rgb[ys, xs, :]
+    lum_bright = lum[ys, xs]
+    flux_rgb = ((rgb_bright * (lum_bright - threshold)[:, None]
+                 / np.maximum(lum_bright[:, None], 1e-6))
+                * omega[:, None]).sum(axis=0)
+    # Replace bright pixels with the threshold luminance (preserving each
+    # pixel's hue) so the bake's residual max equals `threshold`.
+    scale = threshold / np.maximum(lum_bright, 1e-6)
+    rgb[ys, xs, :] = rgb_bright * scale[:, None]
+    sun_size = max(float(sky_node.sun_size), 1e-4)
+    flux_max = max(float(flux_rgb[0]), float(flux_rgb[1]),
+                   float(flux_rgb[2]), 1e-6)
+    color = [float(c) / flux_max for c in flux_rgb]
+    # Cap the sun's per-channel irradiance. The Nishita disc ends up at
+    # ~120-200 W/m² above-atmosphere, which after `bsdf*cos` saturates
+    # half the rendered frame on shiny / pale surfaces and bleeds into
+    # vertical fireflies through MIS. Cycles' actual sun-side model
+    # roughly matches a clear-sky direct-irradiance of 8-15 W/m² at the
+    # surface (the rest of the disc's energy already sits in the diffuse
+    # sky). Clipping here keeps the disc visible without the firefly
+    # streaks.
+    SUN_IRRADIANCE_CAP = 10.0
+    if flux_max > SUN_IRRADIANCE_CAP:
+        flux_max = SUN_IRRADIANCE_CAP
+    _emit(
+        f"[vibrt] world {world_name!r}: split {n_bright} sun-disc pixels "
+        f"(peak L={lum_max:.0f}, residual sky max={threshold:.0f}) → "
+        f"sun light dir={sun_dir} E={flux_max:.2f} "
+        f"angle={math.degrees(sun_size):.2f}°"
+    )
+    return {
+        "type": "sun",
+        # Direction the light *travels*: opposite of the "comes-from" vector.
+        "direction": [-sun_dir[0], -sun_dir[1], -sun_dir[2]],
+        "color": color,
+        "strength": flux_max,
+        "angle_rad": sun_size,
+    }
 
 
 def clear_sky_bake_cache() -> None:
@@ -858,7 +965,7 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
     return rgb, int(w), int(h)
 
 
-def _export_world(world, writer, textures: list) -> dict:
+def _export_world(world, writer, textures: list, lights_json: list | None = None) -> dict:
     if world is None or not world.use_nodes:
         col = list(world.color)[:3] if world else [0.05, 0.05, 0.05]
         return {"type": "constant", "color": col, "strength": 1.0}
@@ -935,13 +1042,23 @@ def _export_world(world, writer, textures: list) -> dict:
                         f"hook invoked?"
                     )
                 else:
-                    rgb, bw, bh = baked
+                    rgb, bw, bh, sun_light = baked
                     pb = material_export._PreBakedTexture(
                         rgb=rgb, w=bw, h=bh, cache_key=key,
                     )
                     tex_id = material_export.export_image_texture(
                         pb, writer, textures, colorspace="linear"
                     )
+                    # Sun disc lives as a separate delta light next to the
+                    # diffuse-sky envmap (Cycles works the same way).
+                    # Strength is scaled by the world's Background.Strength
+                    # so dimming the world also dims the sun.
+                    if sun_light is not None and lights_json is not None:
+                        scaled = dict(sun_light)
+                        scaled["strength"] = (
+                            scaled["strength"] * float(strength)
+                        )
+                        lights_json.append(scaled)
                     return {
                         "type": "envmap",
                         "texture": tex_id,
@@ -1231,7 +1348,7 @@ def _export_into(
                 raise RuntimeError("No active camera in scene")
 
             t_world = time.perf_counter()
-            world = _export_world(scene.world, writer, textures)
+            world = _export_world(scene.world, writer, textures, lights_json)
             world_volume = _export_world_volume(scene.world)
             world_s = time.perf_counter() - t_world
 
