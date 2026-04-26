@@ -246,9 +246,24 @@ def _iter_strands(psys, scene_eval, obj_eval, log_tag: str):
 
     rng = random.Random(hash((log_tag, n_per_parent, child_radius)) & 0xFFFFFFFF)
     total_children = n_per_parent * len(parents)
+    # `child_length` is a multiplier on each child strand's length
+    # relative to its parent (Blender Python doc: ParticleSettings.
+    # child_length). Lone_monk's grass strands are 2.55 m long with
+    # child_length = 0.79; without this scaling our children stay
+    # 2.5 m tall and the courtyard fills with vertical green stalks
+    # the size of a person. `child_length_threshold` randomises the
+    # range below `child_length` (0 = uniform), which we use as
+    # a per-child low-end lerp seed.
+    child_length = float(getattr(settings, "child_length", 1.0) or 0.0)
+    child_length = max(0.0, min(1.0, child_length))
+    child_length_thresh = float(
+        getattr(settings, "child_length_threshold", 0.0) or 0.0
+    )
+    child_length_thresh = max(0.0, min(1.0, child_length_thresh))
     _emit(
         f"[vibrt] hair {log_tag}: {len(parents)} parent + {total_children} "
-        f"children ({n_per_parent}/parent) @ {root_w*1000:.1f}-{tip_w*1000:.1f}mm"
+        f"children ({n_per_parent}/parent) @ {root_w*1000:.1f}-{tip_w*1000:.1f}mm "
+        f"child_length={child_length:.2f}"
     )
     for parent in parents:
         # Root tangent → in-plane basis (u, v). Children are "Simple" Cycles
@@ -269,11 +284,25 @@ def _iter_strands(psys, scene_eval, obj_eval, log_tag: str):
         v = v / max(np.linalg.norm(v), 1e-12)
         u = u.astype(np.float32)
         v = v.astype(np.float32)
+        root = parent[0]
         for _ in range(n_per_parent):
             theta = rng.uniform(0.0, 2.0 * math.pi)
             r = child_radius * math.sqrt(rng.random())
             offset = u * (r * math.cos(theta)) + v * (r * math.sin(theta))
-            yield parent + offset[None, :], root_w, tip_w
+            # Per-child length lerp: jitter inside [child_length *
+            # (1 - threshold), child_length], tip-anchored on the root.
+            jitter = (
+                rng.uniform(1.0 - child_length_thresh, 1.0)
+                if child_length_thresh > 0.0 else 1.0
+            )
+            scale = child_length * jitter
+            if scale < 1.0:
+                # Linearly interpolate each key towards the root so the
+                # strand keeps its curve shape but gets shorter.
+                shrunk = root + (parent - root) * scale
+            else:
+                shrunk = parent
+            yield shrunk + offset[None, :], root_w, tip_w
 
 
 def _pick_hair_material(obj_eval) -> tuple[int, object | None]:
@@ -332,6 +361,33 @@ def export_hair(
     """
     hair_psys = [
         ps for ps in obj_eval.particle_systems if ps.settings.type == "HAIR"
+    ]
+    if not hair_psys:
+        return None
+
+    # Only emit ribbons for particle systems whose render_type is PATH —
+    # that's the "render strands as connected hair curves" mode our
+    # tessellator targets. OBJECT and COLLECTION render-types replace
+    # each particle with a separate mesh instance (lone_monk's grass /
+    # bushes use COLLECTION → `grass blades` / `leaves bush` source
+    # meshes), and turning those into 4 m vertical ribbons fills the
+    # courtyard with stretched leaf cards. Until proper instancing is
+    # in place, skip the system rather than mis-rendering it.
+    instancing_psys = [
+        ps for ps in hair_psys
+        if ps.settings.render_type in ("OBJECT", "COLLECTION")
+    ]
+    if instancing_psys:
+        names = ", ".join(p.name for p in instancing_psys)
+        _emit(
+            f"[vibrt] hair {log_tag}: skipping {len(instancing_psys)} "
+            f"object/collection-instancing system(s) [{names}] — only "
+            f"PATH-rendered hair is supported (Cycles instances "
+            f"`render_type=OBJECT/COLLECTION` particles into the source "
+            f"meshes; we'd need a separate instancing path)"
+        )
+    hair_psys = [
+        ps for ps in hair_psys if ps.settings.render_type == "PATH"
     ]
     if not hair_psys:
         return None
