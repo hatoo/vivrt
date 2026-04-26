@@ -28,6 +28,8 @@ import random
 
 import numpy as np
 
+from ._log import log as _emit
+
 
 def _strand_axes(points: np.ndarray) -> np.ndarray:
     """Per-key tangent direction along a strand of shape (N, 3).
@@ -188,7 +190,7 @@ def _iter_strands(psys, scene_eval, obj_eval, log_tag: str):
         keys.foreach_get("co", co)
         parents.append(co.reshape(-1, 3))
     if not parents:
-        print(
+        _emit(
             f"[vibrt] warn: hair {log_tag}: 0 parent strands "
             f"(particle_systems may need 'Hair Dynamics' baked) — skipped"
         )
@@ -216,7 +218,7 @@ def _iter_strands(psys, scene_eval, obj_eval, log_tag: str):
         yield parent, root_w, tip_w
 
     if n_per_parent <= 0:
-        print(
+        _emit(
             f"[vibrt] hair {log_tag}: no rendered children "
             f"({len(parents)} parent strand(s) only)"
         )
@@ -224,7 +226,7 @@ def _iter_strands(psys, scene_eval, obj_eval, log_tag: str):
 
     rng = random.Random(hash((log_tag, n_per_parent, child_radius)) & 0xFFFFFFFF)
     total_children = n_per_parent * len(parents)
-    print(
+    _emit(
         f"[vibrt] hair {log_tag}: {len(parents)} parent + {total_children} "
         f"children ({n_per_parent}/parent) @ {root_w*1000:.1f}-{tip_w*1000:.1f}mm"
     )
@@ -362,7 +364,7 @@ def export_hair(
         # Should be impossible because every strand contributes 6*(N-1)
         # corners — emit a warning and bail rather than producing a malformed
         # mesh.
-        print(
+        _emit(
             f"[vibrt] warn: hair {log_tag}: corner count {n_corners} "
             f"not divisible by 3 — skipped"
         )
@@ -386,7 +388,7 @@ def export_hair(
         "transform": [mw[i][j] for i in range(4) for j in range(4)],
         "cast_shadow": getattr(obj, "visible_shadow", True),
     }
-    print(
+    _emit(
         f"[vibrt] hair {log_tag}: emitted {n_corners // 3} triangles "
         f"({n_corners // 6} segments) using material slot #{slot_idx}"
     )

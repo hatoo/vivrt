@@ -10,10 +10,11 @@ is not used by the addon itself.
 
 from __future__ import annotations
 
+import time
+
 import bpy
 
-from . import exporter
-from . import runner
+from . import _log, exporter, runner
 
 
 class VibrtRenderEngine(bpy.types.RenderEngine):
@@ -49,21 +50,57 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         height: int,
         denoise: bool,
     ) -> None:
-        self.update_stats("vibrt", "Exporting scene...")
-        json_str, mesh_blobs, texture_arrays = exporter.export_scene_to_memory(depsgraph)
+        # Surface every log line — exporter timing breakdowns,
+        # material/mesh warnings, the renderer's per-bucket timings — into
+        # Blender's Info panel and stdout. `self.report` mirrors INFO
+        # messages to stdout for free.
+        def _to_info(msg: str) -> None:
+            s = msg.rstrip()
+            if s:
+                self.report({"INFO"}, s)
 
-        self.update_stats("vibrt", "Rendering...")
-        pixels = runner.run_render_inproc(
-            json_str,
-            mesh_blobs,
-            self.report,
-            self.test_break,
-            denoise=denoise,
-            texture_arrays=texture_arrays,
-        )
-        # `pixels` is float32 (h, w, 4), bottom-left origin.
-        self.update_stats("vibrt", "Loading result...")
-        _push_pixels_into_render_result(self, pixels, width, height)
+        with _log.redirect(_to_info):
+            self.update_stats("vibrt", "Exporting scene...")
+            self.report({"INFO"}, f"vibrt: rendering {width}x{height} in-process")
+            t_export = time.perf_counter()
+            json_str, mesh_blobs, texture_arrays = (
+                exporter.export_scene_to_memory(depsgraph)
+            )
+            n_blobs = len(mesh_blobs)
+            n_arrays = len(texture_arrays)
+            mesh_mb = sum(b.nbytes for b in mesh_blobs) / 1024 / 1024
+            tex_mb = sum(a.nbytes for a in texture_arrays) / 1024 / 1024
+            self.report(
+                {"INFO"},
+                f"vibrt: export {time.perf_counter() - t_export:.2f}s "
+                f"({n_blobs} mesh blobs / {mesh_mb:.1f} MB, "
+                f"{n_arrays} textures / {tex_mb:.1f} MB)",
+            )
+
+            self.update_stats("vibrt", "Rendering...")
+            t_render = time.perf_counter()
+            pixels = runner.run_render_inproc(
+                json_str,
+                mesh_blobs,
+                self.report,
+                self.test_break,
+                denoise=denoise,
+                texture_arrays=texture_arrays,
+            )
+            self.report(
+                {"INFO"},
+                f"vibrt: render returned {pixels.shape} in "
+                f"{time.perf_counter() - t_render:.2f}s",
+            )
+
+            # `pixels` is float32 (h, w, 4), bottom-left origin.
+            self.update_stats("vibrt", "Loading result...")
+            t_blit = time.perf_counter()
+            _push_pixels_into_render_result(self, pixels, width, height)
+            self.report(
+                {"INFO"},
+                f"vibrt: blit to Combined pass {time.perf_counter() - t_blit:.2f}s",
+            )
 
 
 def _push_pixels_into_render_result(engine, pixels, width: int, height: int):

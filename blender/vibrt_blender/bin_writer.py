@@ -42,23 +42,27 @@ class BinWriter:
         """f32 RGBA numpy arrays accumulated by `write_texture_pixels`."""
         return self._texture_arrays
 
-    def write_f32(self, xs) -> dict:
-        """Append a contiguous float32 blob and return its array_index."""
+    def write_f32(self, xs) -> int:
+        """Append a contiguous float32 blob and return its array_index.
+
+        Mesh / index / vertex-color fields on `MeshDesc` are plain `u32`
+        on the Rust side, so the index is returned bare — JSON ends up
+        with `"vertices": 5` not `"vertices": {"array_index": 5}`."""
         arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.float32)
         if arr.dtype != np.float32 or not arr.flags.c_contiguous:
             arr = np.ascontiguousarray(arr, dtype=np.float32)
         i = len(self._blobs)
         self._blobs.append(arr)
-        return {"array_index": i}
+        return i
 
-    def write_u32(self, xs) -> dict:
+    def write_u32(self, xs) -> int:
         """Append a contiguous uint32 blob and return its array_index."""
         arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.uint32)
         if arr.dtype != np.uint32 or not arr.flags.c_contiguous:
             arr = np.ascontiguousarray(arr, dtype=np.uint32)
         i = len(self._blobs)
         self._blobs.append(arr)
-        return {"array_index": i}
+        return i
 
     def write_texture_pixels(self, arr) -> dict:
         """Park a contiguous float32 RGBA buffer into the per-texture array

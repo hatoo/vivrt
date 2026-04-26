@@ -19,7 +19,8 @@ import time
 
 import bpy
 
-from . import hair_export, material_export
+from . import _log, hair_export, material_export
+from ._log import log as _emit
 
 
 def _matrix_to_row_major(m) -> list[float]:
@@ -154,14 +155,14 @@ def _find_displacement(obj_eval, writer, textures):
         if src.bl_idname == "ShaderNodeDisplacement":
             if "Scale" in src.inputs:
                 if src.inputs["Scale"].is_linked:
-                    print(
+                    _emit(
                         f"[vibrt] warn: {tag}: Displacement Scale input is "
                         f"linked — using constant default ({src.inputs['Scale'].default_value})"
                     )
                 strength = float(src.inputs["Scale"].default_value)
             height_sock = src.inputs.get("Height")
             if height_sock is None or not height_sock.is_linked:
-                print(
+                _emit(
                     f"[vibrt] warn: {tag}: Displacement.Height is not connected "
                     f"— displacement ignored"
                 )
@@ -177,7 +178,7 @@ def _find_displacement(obj_eval, writer, textures):
             )
             return tex_id, strength
         else:
-            print(
+            _emit(
                 f"[vibrt] warn: {tag}: Displacement output driven by "
                 f"{src.bl_idname} (expected ShaderNodeDisplacement or "
                 f"ShaderNodeTexImage) — displacement ignored"
@@ -244,7 +245,7 @@ def _resolve_height_texture(sock, writer, textures, tag, depth: int = 0):
                 if i != chain_idx
             ]
             if None in others:
-                print(
+                _emit(
                     f"[vibrt] warn: {tag}: Displacement.Height Math({op}) "
                     f"has non-constant side — displacement ignored"
                 )
@@ -271,7 +272,7 @@ def _resolve_height_texture(sock, writer, textures, tag, depth: int = 0):
             return _resolve_height_texture(
                 inputs[chain_idx], writer, textures, tag, depth + 1
             )
-        print(
+        _emit(
             f"[vibrt] warn: {tag}: Displacement.Height Math op={op!r} not "
             f"handled (only MULTIPLY / ADD) — displacement ignored"
         )
@@ -283,7 +284,7 @@ def _resolve_height_texture(sock, writer, textures, tag, depth: int = 0):
     # Mix / Separate nodes as pass-throughs, matching colour-chain semantics.
     img, chain = material_export._socket_linked_image_with_chain(sock)
     if img is None:
-        print(
+        _emit(
             f"[vibrt] warn: {tag}: Displacement.Height driven by "
             f"{up.bl_idname} — couldn't resolve an image, displacement ignored"
         )
@@ -334,7 +335,7 @@ def _export_mesh(
             try:
                 mesh.calc_normals_split()
             except RuntimeError as exc:
-                print(
+                _emit(
                     f"[vibrt] warn: mesh {obj_eval.name!r}: "
                     f"calc_normals_split failed ({exc}) — using existing split normals"
                 )
@@ -474,7 +475,7 @@ def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
         return 1.0, (1.0, 1.0, 1.0)
     src = surf.links[0].from_node
     if src.bl_idname != "ShaderNodeEmission":
-        print(
+        _emit(
             f"[vibrt] warn: light {light.name!r}: Surface driven by "
             f"{src.bl_idname} (expected ShaderNodeEmission) — using "
             f"light.energy × light.color unchanged"
@@ -494,7 +495,7 @@ def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
             inner = up.inputs.get("Strength")
             strength = float(inner.default_value) if inner is not None and not inner.is_linked else 1.0
         else:
-            print(
+            _emit(
                 f"[vibrt] warn: light {light.name!r}: Emission Strength is "
                 f"driven by {up.bl_idname} (expected ShaderNodeLightFalloff) "
                 f"— using strength=1.0"
@@ -510,7 +511,7 @@ def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
         # collapses to its neutral constant instead of being thrown away.
         rgb = material_export._socket_constant_rgb(c_sock)
         if rgb is None:
-            print(
+            _emit(
                 f"[vibrt] warn: light {light.name!r}: Emission Color chain "
                 f"isn't foldable to a constant — using light.color unchanged"
             )
@@ -565,7 +566,7 @@ def _export_light(obj, writer, textures: list) -> dict | None:
         elif light.shape == "RECTANGLE":
             size = [float(light.size), float(light.size_y)]
         else:
-            print(
+            _emit(
                 f"[vibrt] warn: area light {obj.name!r}: shape={light.shape!r} "
                 f"not supported (only SQUARE/RECTANGLE) — approximating as SQUARE"
             )
@@ -591,7 +592,7 @@ def _export_light(obj, writer, textures: list) -> dict | None:
             # on the Rust side (camera_visible=1) draws them as geometry.
             "camera_visible": 1 if getattr(obj, "visible_camera", True) else 0,
         }
-    print(
+    _emit(
         f"[vibrt] warn: light {obj.name!r}: type={light.type!r} not supported "
         f"(only POINT/SUN/SPOT/AREA) — light dropped"
     )
@@ -610,13 +611,13 @@ def _export_world(world, writer, textures: list) -> dict:
             None,
         )
     if out is None:
-        print(
+        _emit(
             f"[vibrt] warn: world {world.name!r}: no ShaderNodeOutputWorld — "
             f"world treated as black"
         )
         return {"type": "constant", "color": [0, 0, 0], "strength": 0.0}
     if not out.inputs["Surface"].is_linked:
-        print(
+        _emit(
             f"[vibrt] warn: world {world.name!r}: World Output Surface is "
             f"not connected — world treated as black"
         )
@@ -626,7 +627,7 @@ def _export_world(world, writer, textures: list) -> dict:
     if src.bl_idname == "ShaderNodeBackground":
         strength_sock = src.inputs["Strength"]
         if strength_sock.is_linked:
-            print(
+            _emit(
                 f"[vibrt] warn: world {world.name!r}: Background Strength is "
                 f"linked — using constant default ({strength_sock.default_value})"
             )
@@ -637,7 +638,7 @@ def _export_world(world, writer, textures: list) -> dict:
             linked = color_sock.links[0].from_node
             if linked.bl_idname == "ShaderNodeTexEnvironment":
                 if linked.image is None:
-                    print(
+                    _emit(
                         f"[vibrt] warn: world {world.name!r}: "
                         f"ShaderNodeTexEnvironment has no image assigned — "
                         f"falling back to constant background"
@@ -668,19 +669,19 @@ def _export_world(world, writer, textures: list) -> dict:
                         float(temp_sock.default_value)
                     )
                 else:
-                    print(
+                    _emit(
                         f"[vibrt] warn: world {world.name!r}: Blackbody "
                         f"Temperature is linked — using constant default"
                     )
             else:
-                print(
+                _emit(
                     f"[vibrt] warn: world {world.name!r}: Background Color "
                     f"driven by {linked.bl_idname} (expected "
                     f"ShaderNodeTexEnvironment) — using constant default"
                 )
         return {"type": "constant", "color": col, "strength": float(strength)}
 
-    print(
+    _emit(
         f"[vibrt] warn: world {world.name!r}: World Output Surface driven by "
         f"{src.bl_idname} (expected ShaderNodeBackground) — world treated as black"
     )
@@ -869,7 +870,7 @@ def _export_into(
                         if mesh is None:
                             continue
                         if dt_mesh > 0.25:
-                            ntri = mesh["indices"]["len"] // 12  # 4 bytes/u32, 3 per tri
+                            ntri = writer.mesh_blobs[mesh["indices"]].nbytes // 12  # 4 bytes/u32, 3 per tri
                             slow_meshes.append((obj_eval.name, ntri, dt_mesh))
                             slow_meshes.sort(key=lambda e: e[2], reverse=True)
                             del slow_meshes[5:]
@@ -949,7 +950,7 @@ def _export_into(
     bin_write_s = 0.0
 
     spp = max(1, int(scene.vibrt_spp))
-    print(f"[vibrt] spp={spp}")
+    _emit(f"[vibrt] spp={spp}")
     scene_json = {
         "version": 1,
         "render": {
@@ -1002,19 +1003,19 @@ def _export_into(
         f", texture_pct={texture_pct}%"
         if texture_pct is not None and texture_pct != 100 else ""
     )
-    print(
+    _emit(
         f"[vibrt] export {dt:.2f}s "
         f"({len(meshes)} mesh, {len(objects)} obj, "
         f"{len(textures)} tex, {len(materials)} mat, "
         f"{bin_size/1024/1024:.1f}MB bin, {stats['pixel_bytes']/1024/1024:.1f}MB px"
         f"{tex_pct_str})"
     )
-    print(
+    _emit(
         f"[vibrt]   mesh={mesh_s:.2f}s  material={material_s:.2f}s  "
         f"texture={texture_s:.2f}s  pixel_read={pixel_read_s:.2f}s  "
         f"bake_chain={bake_chain_s:.2f}s"
     )
-    print(
+    _emit(
         f"[vibrt]   hair={hair_s:.2f}s  loop_overhead={loop_overhead_s:.2f}s  "
         f"depsgraph_iter={depsgraph_iter_s:.2f}s  alloc={alloc_s:.2f}s  "
         f"pre_loop={pre_loop_s:.2f}s  post_loop={post_loop_s:.2f}s  "
@@ -1023,13 +1024,13 @@ def _export_into(
     if slow_meshes:
         desc = ", ".join(f"{n}({t:.0f}k tri, {d:.2f}s)" for n, t, d in
                          ((nm, ntri / 1000.0, dd) for nm, ntri, dd in slow_meshes))
-        print(f"[vibrt]   slow meshes: {desc}")
+        _emit(f"[vibrt]   slow meshes: {desc}")
     if stats["slow_textures"]:
         desc = ", ".join(
             f"{n}({w}x{h}, {d:.2f}s)" for n, w, h, d in stats["slow_textures"]
         )
-        print(f"[vibrt]   slow textures: {desc}")
+        _emit(f"[vibrt]   slow textures: {desc}")
     if stats["slow_materials"]:
         desc = ", ".join(f"{n}({d:.2f}s)" for n, d in stats["slow_materials"])
-        print(f"[vibrt]   slow materials: {desc}")
+        _emit(f"[vibrt]   slow materials: {desc}")
     return scene_json

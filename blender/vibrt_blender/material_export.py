@@ -107,7 +107,8 @@ def _warn(key: str, msg: str) -> None:
         return
     _LOGGED_WARNINGS.add(full_key)
     prefix = f"material {_CURRENT_MATERIAL!r}: " if _CURRENT_MATERIAL else ""
-    print(f"[vibrt] warn: {prefix}{msg}")
+    from ._log import log as _emit
+    _emit(f"[vibrt] warn: {prefix}{msg}")
 
 
 def _node_tag(node) -> str:

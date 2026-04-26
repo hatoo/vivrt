@@ -33,23 +33,24 @@ class BinWriterTests(unittest.TestCase):
         self.assertEqual(w.texture_arrays, [])
 
     def test_write_f32_returns_array_index(self):
+        # Mesh writer returns a bare int — `MeshDesc.vertices` etc. are
+        # `u32` fields on the Rust side, no enclosing dict.
         w = BinWriter()
-        ref = w.write_f32([1.0, 2.0, 3.0])
-        self.assertEqual(ref, {"array_index": 0})
+        self.assertEqual(w.write_f32([1.0, 2.0, 3.0]), 0)
 
     def test_write_f32_indexes_increment(self):
         w = BinWriter()
-        self.assertEqual(w.write_f32([0.0]), {"array_index": 0})
-        self.assertEqual(w.write_f32([1.0]), {"array_index": 1})
-        self.assertEqual(w.write_f32([2.0]), {"array_index": 2})
+        self.assertEqual(w.write_f32([0.0]), 0)
+        self.assertEqual(w.write_f32([1.0]), 1)
+        self.assertEqual(w.write_f32([2.0]), 2)
         self.assertEqual(len(w.mesh_blobs), 3)
 
     def test_write_u32_indexes_increment_with_f32(self):
         # f32 and u32 share the mesh_blobs index space.
         w = BinWriter()
-        self.assertEqual(w.write_f32([0.0]), {"array_index": 0})
-        self.assertEqual(w.write_u32([1, 2, 3]), {"array_index": 1})
-        self.assertEqual(w.write_f32([2.0]), {"array_index": 2})
+        self.assertEqual(w.write_f32([0.0]), 0)
+        self.assertEqual(w.write_u32([1, 2, 3]), 1)
+        self.assertEqual(w.write_f32([2.0]), 2)
 
     def test_write_f32_preserves_data(self):
         w = BinWriter()
@@ -96,10 +97,11 @@ class BinWriterTests(unittest.TestCase):
     def test_write_texture_pixels_separate_index_space(self):
         # texture_arrays is independent of mesh_blobs.
         w = BinWriter()
-        self.assertEqual(w.write_f32([0.0]), {"array_index": 0})
+        self.assertEqual(w.write_f32([0.0]), 0)
+        # write_texture_pixels returns a dict because TextureDesc spreads it.
         self.assertEqual(w.write_texture_pixels(np.zeros(16, dtype=np.float32)),
                          {"array_index": 0})  # texture index, not mesh
-        self.assertEqual(w.write_u32([1, 2]), {"array_index": 1})
+        self.assertEqual(w.write_u32([1, 2]), 1)
         self.assertEqual(w.write_texture_pixels(np.ones(16, dtype=np.float32)),
                          {"array_index": 1})
 
