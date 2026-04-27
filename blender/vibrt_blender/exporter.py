@@ -908,15 +908,13 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
     cam_data.panorama_type = 'EQUIRECTANGULAR'
     cam = bpy.data.objects.new("__vibrt_sky_bake_cam", cam_data)
     cam.location = (0.0, 0.0, 0.0)
-    # Rotate the camera so its local +Y (Cycles' equirect "latitude axis")
-    # points at world -Z. Without this rotation the bake puts the sky on
-    # the equator (Cycles' default panorama latitude axis is camera +Y,
-    # which under identity rotation = world +Y → not the zenith axis the
-    # kernel expects). Rotating by -90° around world X takes camera +Y
-    # → world -Z (the nadir direction), which after Cycles' bottom-up
-    # storage and our `world_background()` indexing leaves world +Z at
-    # buffer y=0 — i.e. the zenith maps to image-y=0 just like the
-    # kernel's `theta = v * π` mapping reads it.
+    # Rotate the bake camera so its +Y_local axis (Cycles equirect's
+    # latitude axis) points at world -Z. With foreach_get's bottom-up
+    # storage that puts buffer y=0 at the world +Z direction (zenith),
+    # which is what our kernel's `world_background` reads `theta=0` as.
+    # The longitude axis ends up offset / mirrored — we correct that
+    # below by rolling and flipping the bake to match the kernel's
+    # `phi = atan2(dir.y_world, dir.x_world)` convention.
     import math
     cam.rotation_euler = (-math.pi / 2.0, 0.0, 0.0)
     tmp.collection.objects.link(cam)
@@ -953,7 +951,14 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
         flat = np.empty(iw * ih * ch, dtype=np.float32)
         img_loaded.pixels.foreach_get(flat)
         arr = flat.reshape((ih, iw, ch))
-        rgb = np.ascontiguousarray(arr[..., :3], dtype=np.float32)
+        # Mirror the bake horizontally: with rotation_euler=(-π/2, 0, 0)
+        # the bake's elevation axis matches our kernel's `theta=v*π`
+        # exactly, but the longitude axis wraps the OPPOSITE way (Cycles'
+        # equirect uses atan2(x_local, -z_local) which goes the reverse
+        # of our `phi = atan2(y_world, x_world)`). The mirror lines the
+        # two up so the extracted sun direction matches the Sky
+        # Texture's authored sun_rotation.
+        rgb = np.ascontiguousarray(arr[:, ::-1, :3], dtype=np.float32)
     finally:
         try:
             if img_loaded is not None:
