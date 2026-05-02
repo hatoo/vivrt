@@ -1064,7 +1064,13 @@ struct MaterialEval {
   PrincipledGpu *mat; // raw material ptr for coat/sheen/sss params
 };
 
-static __device__ MaterialEval eval_material(const PathVertex &v) {
+// `min_alpha` is the path's "filter glossy" floor — Cycles' filter-glossy
+// settings inflate the BSDF roughness on indirect glossy bounces so that
+// near-mirror bounces can't resample a tiny solid angle and produce
+// fireflies. We approximate it by raising `alpha`, `alpha_x`, `alpha_y`
+// to at least this value. 0 = primary ray (no inflation).
+static __device__ MaterialEval eval_material(const PathVertex &v,
+                                              float min_alpha = 0.0f) {
   MaterialEval e;
   PrincipledGpu *m = v.mat;
   e.mat = m;
@@ -1125,6 +1131,13 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
   // numerical safeguard; forcing a minimum roughness on top of it would
   // silently turn artist-authored mirrors into slightly-rough dielectrics.
   e.alpha = fmaxf(e.roughness * e.roughness, 1e-4f);
+  // Filter-glossy: the path tracer raises `min_alpha` once it's already
+  // taken at least one glossy / specular bounce so that subsequent
+  // near-mirror evals can't refocus the radiance into a tiny solid
+  // angle. Approximates Cycles' Light Paths > Filter Glossy. min_alpha=0
+  // (primary ray) leaves alpha untouched.
+  if (min_alpha > e.alpha)
+    e.alpha = min_alpha;
 
   float3 Ns = v.Ns;
   // Composite tangent-space perturbation: start from (0,0,1), apply bump
@@ -2172,6 +2185,13 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
   unsigned int diffuse_bounces = 0;
   unsigned int glossy_bounces = 0;
   unsigned int transmission_bounces = 0;
+  // Filter-glossy floor for the path. Camera ray sees the BSDF at its
+  // authored roughness; once a glossy / transmission bounce is taken the
+  // floor rises so subsequent surfaces can't refocus the radiance into a
+  // sharper lobe than was already established. Cycles' default Light
+  // Paths > Filter Glossy of 1.0 corresponds roughly to alpha_min ≈ 0.05
+  // after the first glossy bounce.
+  float min_alpha = 0.0f;
   VolumeStack vstack;
   vstack.depth = 0;
 
@@ -2319,7 +2339,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
       continue;
     }
 
-    MaterialEval e = eval_material(v);
+    MaterialEval e = eval_material(v, min_alpha);
     // Flip normal if ray hit backside (for dielectric transmission). Mirror
     // the bitangent instead of rebuilding the frame so the authored tangent
     // rotation (anisotropy axis) survives on back-faces; negating one axis
@@ -2378,10 +2398,21 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
       glossy_bounces++;
       if (glossy_bounces > params.max_glossy_bounces)
         break;
+      // Bump the filter-glossy floor. 0.05 corresponds to roughness ≈
+      // 0.22, enough to materially widen a near-mirror lobe but not so
+      // wide it noticeably softens artist-authored matte gloss (whose
+      // roughness is already well above 0.22).
+      min_alpha = fmaxf(min_alpha, 0.05f);
     } else if (bs.lobe == LOBE_TRANSMISSION) {
       transmission_bounces++;
       if (transmission_bounces > params.max_transmission_bounces)
         break;
+      // Glass / refraction lobes also count for filter-glossy: each
+      // round-trip through pabellon's water plane was refocusing the
+      // sky reflection into a near-delta cone for the second bounce
+      // and beyond, lifting the foreground pool floor's apparent
+      // brightness well above Cycles' reference.
+      min_alpha = fmaxf(min_alpha, 0.05f);
     }
 
     // Russian roulette after a few bounces
