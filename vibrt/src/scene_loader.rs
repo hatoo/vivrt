@@ -280,13 +280,20 @@ pub fn load_scene_from_bytes<'a>(
             (Some(extract_rgb(*texture)?), None, None)
         }
         Some(WorldDesc::Mixed { a, b, fac }) => {
-            // Load both layers' source textures, then host-rasterise a
-            // 1024×512 "mixed grid" by sampling each layer at every
-            // pixel direction (with its rotation + projection) and
-            // blending. The mixed grid is what the kernel reads at
-            // render time and what drives the importance-sampling CDF;
-            // the per-layer `envmap_layer_*_rgb` are kept around in
-            // case a future optimisation wants high-res lookups.
+            // Host-rasterise a "mixed grid" by sampling each layer at
+            // every pixel direction (with its rotation + projection) and
+            // blending. The grid is what the kernel reads at render
+            // time and what drives the importance-sampling CDF.
+            //
+            // Resolution matters: a 1024×512 grid leaves only ~30
+            // pixels covering a 0.5° sun disc, so a single-tap bilinear
+            // sample of the source texture often misses bright pixels
+            // entirely (the sun in pabellon's HDRI was effectively
+            // invisible at 1024×512). 2048×1024 gives a 1×4 px bright
+            // region per sun (still narrow but enough for the CDF to
+            // weight it). Source textures up to ~4k can drive this
+            // safely; the per-layer cap stays the input image's
+            // native resolution.
             let layer_a = extract_rgb(a.texture)?;
             let layer_b = extract_rgb(b.texture)?;
             let mixed = build_mixed_envmap_grid(
@@ -294,7 +301,7 @@ pub fn load_scene_from_bytes<'a>(
                 &a.projection, &a.extension,
                 &layer_b, &b.rotation, b.strength,
                 &b.projection, &b.extension,
-                *fac, 1024, 512,
+                *fac, 2048, 1024,
             );
             (Some(mixed), Some(layer_a), Some(layer_b))
         }
