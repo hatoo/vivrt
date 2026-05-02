@@ -3055,7 +3055,7 @@ def _resolve_shader(node, writer, textures, mat_name: str) -> dict:
     if bl == "ShaderNodeBsdfGlossy" or bl == "ShaderNodeBsdfAnisotropic":
         return _from_glossy(node, writer, textures)
     if bl == "ShaderNodeBsdfTranslucent":
-        return _from_diffuse(node, writer, textures)
+        return _from_translucent(node, writer, textures)
     if bl == "ShaderNodeBsdfTransparent":
         return _from_transparent(node, writer, textures)
     if bl == "ShaderNodeBsdfSheen" or bl == "ShaderNodeBsdfVelvet":
@@ -3277,6 +3277,25 @@ def _from_principled(node, writer, textures) -> dict:
                     )
         elif alpha_val < 1.0:
             p["alpha_threshold"] = alpha_val
+    return p
+
+
+def _from_translucent(node, writer, textures) -> dict:
+    """ShaderNodeBsdfTranslucent → diffuse with backlit-SSS turned on so
+    a thin sheet (lotus leaf, cloth, etc.) actually picks up some
+    illumination on the side away from the light source. The previous
+    fallback routed Translucent through `_from_diffuse`, which left
+    `sss_weight=0` and made the BSDF return zero for any NoL<0
+    direction — back-lit lotus leaves rendered black even when the sun
+    was right behind them. Same chain Cycles uses, just collapsed onto
+    the existing wrap-Lambert SSS path.
+    """
+    p = _from_diffuse(node, writer, textures)
+    p["sss_weight"] = 1.0
+    # Wide isotropic radius — Translucent has no spatial scattering
+    # parameter and the SSS-wrap term only uses radius for the per-channel
+    # tint ratio, so equal channels keep the colour the user authored.
+    p["sss_radius"] = [1.0, 1.0, 1.0]
     return p
 
 
