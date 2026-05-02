@@ -3683,6 +3683,101 @@ def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures
     return out
 
 
+def _try_alpha_cutout_emission_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures):
+    """Detect `MixShader(Transparent, Emission, fac=texture)` (or its
+    Emission/Transparent reverse) — Cycles' canonical billboard-flame /
+    sprite idiom — and emit a single emissive surface with the
+    emission texture in `emission_tex` and the cutout alpha in
+    `base_color_tex`. Returns None if the pattern doesn't fit.
+
+    Used by pabellon's `candle_flame` material: a flame texture whose
+    RGB is the glow colour and whose alpha masks the billboard
+    silhouette. Without this, the flame collapsed onto whichever side
+    of the MixShader our generic fallback picked, dropping either the
+    emission or the cutout.
+    """
+    import numpy as np
+    if n1 is None or n2 is None:
+        return None
+    # Identify Emission and Transparent sides.
+    if n1.bl_idname == "ShaderNodeEmission" and n2.bl_idname == "ShaderNodeBsdfTransparent":
+        em_node, em_params, em_idx = n1, p1, 1
+    elif n2.bl_idname == "ShaderNodeEmission" and n1.bl_idname == "ShaderNodeBsdfTransparent":
+        em_node, em_params, em_idx = n2, p2, 2
+    else:
+        return None
+    # Need a bakeable opacity texture as the factor.
+    mask_img, mask_chain = _socket_linked_image_with_chain(fac_sock)
+    if mask_img is None or not isinstance(mask_img, bpy.types.Image):
+        return None
+    if mask_img.size[0] == 0 or mask_img.size[1] == 0:
+        mask_img.update()
+    mw, mh = int(mask_img.size[0]), int(mask_img.size[1])
+    if mw == 0 or mh == 0:
+        return None
+    # Read the mask. The factor socket may be the texture's Color or
+    # Alpha; both behave the same for a billboard mask (unlit black
+    # background, lit foreground). Sample alpha-channel if available.
+    mask_pix = np.empty(mw * mh * 4, dtype=np.float32)
+    mask_img.pixels.foreach_get(mask_pix)
+    if mask_chain:
+        mask_pix, _ = _bake_chain(
+            mask_pix, mw, mh,
+            "srgb" if mask_img.colorspace_settings.name.lower().startswith("srgb")
+            else "linear",
+            mask_chain,
+        )
+    mask_rgba = mask_pix.reshape((mh, mw, 4))
+    # Use the texture's alpha channel when the factor socket is the
+    # image's Alpha output; fall back to luminance otherwise.
+    fac_link = fac_sock.links[0] if fac_sock.is_linked else None
+    if fac_link is not None and fac_link.from_socket.name == "Alpha":
+        alpha = mask_rgba[..., 3]
+    else:
+        alpha = (
+            0.2126 * mask_rgba[..., 0]
+            + 0.7152 * mask_rgba[..., 1]
+            + 0.0722 * mask_rgba[..., 2]
+        )
+    # MixShader: fac=0 → shader1, fac=1 → shader2. Emission at index 2
+    # already aligns with "1 picks lit"; index 1 needs flipping.
+    if em_idx == 1:
+        alpha = 1.0 - alpha
+    alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+
+    # Stash a black RGB + alpha-mask as base_color_tex so the kernel
+    # cuts the silhouette via `alpha_threshold`. The colour itself
+    # doesn't matter — the surface is emission-driven, base_color is
+    # fixed at black so unlit areas stay dark.
+    rgba = np.zeros((mh, mw, 4), dtype=np.float32)
+    rgba[..., 3] = alpha
+    cache_key = (
+        f"__flamecutout__{node.as_pointer()}__{mask_img.name}"
+    )
+    for i, t in enumerate(textures):
+        if t.get("_key") == cache_key:
+            mask_tex_id = i
+            break
+    else:
+        flat = np.ascontiguousarray(rgba, dtype=np.float32).reshape(-1)
+        desc = {
+            "width": int(mw),
+            "height": int(mh),
+            "channels": 4,
+            "colorspace": "linear",
+            "_key": cache_key,
+            **writer.write_texture_pixels(flat),
+        }
+        textures.append(desc)
+        mask_tex_id = len(textures) - 1
+
+    out = dict(em_params)
+    out["base_color_tex"] = mask_tex_id
+    out["base_color"] = [0.0, 0.0, 0.0]
+    out["alpha_threshold"] = 0.5
+    return out
+
+
 def _from_mix(node, writer, textures, mat_name: str) -> dict:
     """Shader Mix: lerp Principled params by the constant Factor.
 
@@ -3738,6 +3833,17 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
         # into its alpha channel and set `alpha_threshold` so the
         # kernel cuts holes through the ribbon.
         baked = _try_alpha_cutout_mixshader(
+            node, n1, n2, p1, p2, fac_sock, writer, textures
+        )
+        if baked is not None:
+            return baked
+        # Same idiom but with Emission instead of Principled — billboard
+        # flames / sprites / decals where the lit side is `Emission` and
+        # the cutout side is `Transparent`. Pabellon's `candle_flame`
+        # uses this pattern; without dedicated handling our generic
+        # fallback collapses to shader1's params and either drops the
+        # emission or the cutout silhouette.
+        baked = _try_alpha_cutout_emission_mixshader(
             node, n1, n2, p1, p2, fac_sock, writer, textures
         )
         if baked is not None:
