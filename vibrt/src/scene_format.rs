@@ -103,9 +103,14 @@ pub struct CameraDesc {
     /// when missing so heritage scenes still render to infinity.
     #[serde(default = "default_clip_end")]
     pub clip_end: f32,
-    /// Lens shift in sensor-normalised units (Blender's `Camera.shift_x` /
-    /// `shift_y`). Both are zero for un-shifted cameras; lone_monk's
-    /// `shift_y = 0.071` aims the frame slightly above the optical axis.
+    /// Lens shift in NDC fractions of the half-extent on each axis (i.e.
+    /// `cx / (2 * half_w)` and `cy / (2 * half_h)` of Blender's view
+    /// frame at z = -1). The device adds `2 * shift` to the NDC pixel
+    /// coordinate before projecting. The exporter computes this from
+    /// `cam.view_frame(scene=scene)` so it already accounts for
+    /// sensor_fit and the "shift is a fraction of the larger sensor
+    /// dimension" Blender convention — values here are NOT the raw
+    /// `Camera.shift_x/y` from Blender.
     #[serde(default)]
     pub shift_x: f32,
     #[serde(default)]

@@ -413,9 +413,35 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
         raise ValueError(
             f"vibrt only supports perspective cameras (got {cam.type})"
         )
-    # Blender's sensor_fit + sensor_width/height govern how angle maps to vertical
-    # FOV. Use the "vertical FOV" approximation from `angle_y`.
-    fov_y = cam.angle_y
+    # Derive the actual visible frame from Blender's view_frame(), which
+    # already folds in sensor_fit (AUTO/HORIZONTAL/VERTICAL), sensor size,
+    # lens, render resolution, pixel aspect, and lens shift. The four
+    # returned corners live in camera-local space at z=-clip_start; we
+    # normalise to the z=-1 plane and read off half-extents + center.
+    #
+    # Doing it this way is mandatory for sensor_fit=AUTO scenes where the
+    # image aspect crosses the sensor aspect (lone_monk: 1440x1080 image
+    # with a 36x24 sensor → AUTO resolves to HORIZONTAL, so cam.angle_y
+    # is NOT the actual vertical FOV — using it shrinks the frame by
+    # ~12%). The center cx/cy encodes shift in the same view-space units,
+    # which avoids re-deriving Blender's "shift is fraction of the larger
+    # sensor dimension" convention by hand (off by sw/sh on lone_monk).
+    frame = cam.view_frame(scene=scene)
+    norm = [(p.x / -p.z, p.y / -p.z) for p in frame]
+    xs = [n[0] for n in norm]
+    ys = [n[1] for n in norm]
+    half_w = (max(xs) - min(xs)) * 0.5
+    half_h = (max(ys) - min(ys)) * 0.5
+    cx = (max(xs) + min(xs)) * 0.5
+    cy = (max(ys) + min(ys)) * 0.5
+    fov_y = 2.0 * math.atan(half_h)
+    # Device pinhole: px = 2*idx.x/dim.x - 1 + 2*shift_x, then dir = U*px +
+    # V*py + W where U = right*half_w (and half_w = half_h*aspect on the
+    # device), V = up*half_h. Centre pixel (px=2*shift_x) lands in
+    # view-space at right*half_w*(2*shift_x), so to put the centre at
+    # (cx, cy) we send shift = c / (2 * half_extent).
+    shift_x_ndc = cx / (2.0 * half_w) if half_w > 0.0 else 0.0
+    shift_y_ndc = cy / (2.0 * half_h) if half_h > 0.0 else 0.0
     matrix = _matrix_to_row_major(cam_obj.matrix_world)
     if cam.dof.use_dof:
         # Cycles convention: aperture radius [m] = (focal_length_mm / 1000) / (2 * fstop)
@@ -448,12 +474,12 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
         # without honouring this the wall fills the entire frame.
         "clip_start": float(cam.clip_start),
         "clip_end": float(cam.clip_end),
-        # Lens shift (in sensor units; multiply by 2/sensor for NDC
-        # offset). Also drives Cycles' lone_monk view: shift_y=0.07
-        # tilts the rendered frame slightly upward so the arches above
-        # the alcove come into view.
-        "shift_x": float(cam.shift_x),
-        "shift_y": float(cam.shift_y),
+        # NDC shift: half the centre offset of the view frame, expressed
+        # as a fraction of the half-extent on each axis. The device adds
+        # `2 * shift` to the NDC coordinate before projecting, so this
+        # form lands a centre pixel at (cx, cy) in view-space.
+        "shift_x": float(shift_x_ndc),
+        "shift_y": float(shift_y_ndc),
     }
 
 
