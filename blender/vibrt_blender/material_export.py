@@ -3417,6 +3417,11 @@ def _from_glass(node, writer, textures) -> dict:
             p["roughness"] = 1.0
         else:
             p["roughness"] = _socket_f(node.inputs["Roughness"])
+    # Honour the Normal input — pabellon's `water` material drives this
+    # from a Bump node sampling a noise texture, which is what gives
+    # Cycles its rippled-water reflections. Without the bump the water
+    # plane reflects with mirror uniformity and looks unnaturally still.
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
     return p
 
 
