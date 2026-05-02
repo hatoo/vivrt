@@ -3453,7 +3453,10 @@ def _from_add(node, writer, textures, mat_name: str) -> dict:
     The renderer has one BSDF slot, so we can't actually add two lobes — the
     best faithful fallback is to keep p1's surface and sum the emissive
     contributions. Transmission takes the max so Add(Glass, Emission) still
-    refracts.
+    refracts. Special case: `Add(Diffuse, Translucent)` is the canonical
+    thin-leaf idiom (front lobe = diffuse, back lobe = translucent); we
+    promote it to the surface's wrap-Lambert SSS branch so back-lit leaves
+    don't render black.
     """
     in1 = _follow_reroutes(node.inputs[0])
     in2 = _follow_reroutes(node.inputs[1])
@@ -3461,6 +3464,27 @@ def _from_add(node, writer, textures, mat_name: str) -> dict:
     n2 = in2.links[0].from_node if in2.is_linked else None
     p1 = _resolve_shader(n1, writer, textures, mat_name) if n1 else _default_params()
     p2 = _resolve_shader(n2, writer, textures, mat_name) if n2 else _default_params()
+    # Asymmetric Translucent contribution: only one side has sss_weight>0
+    # because `_from_translucent` is the only path that sets it. Keep the
+    # opaque-surface side and turn the wrap-Lambert SSS lobe on so back-lit
+    # leaves get the translucent contribution our renderer can express.
+    p1_sss = p1.get("sss_weight", 0.0) > 0.0
+    p2_sss = p2.get("sss_weight", 0.0) > 0.0
+    if p1_sss != p2_sss:
+        surf = p2 if p1_sss else p1
+        translu = p1 if p1_sss else p2
+        out = dict(surf)
+        out["sss_weight"] = 1.0
+        # Per-channel mean-free-path → SSS tint via radius/max in the
+        # device code. The translucent side's base_color is the back-lit
+        # tint the user authored; if it was textured (base_color=[1,1,1])
+        # we fall back to a flat tint so the wrap term still fires.
+        bc = translu.get("base_color", [1.0, 1.0, 1.0])
+        if max(bc) > 1e-6:
+            out["sss_radius"] = list(bc)
+        out["emission"] = [a + b for a, b in zip(p1["emission"], p2["emission"])]
+        out["transmission"] = max(p1["transmission"], p2["transmission"])
+        return out
     out = dict(p1)
     out["emission"] = [a + b for a, b in zip(p1["emission"], p2["emission"])]
     out["transmission"] = max(p1["transmission"], p2["transmission"])
