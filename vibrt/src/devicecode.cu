@@ -2004,10 +2004,14 @@ extern "C" __global__ void __anyhit__ah() {
       m = hg->materials[mi];
   }
   // Shadow rays pass through transmissive surfaces (approximation of
-  // Cycles' transparent shadows — no color attenuation for now).
+  // Cycles' transparent shadows — no color attenuation for now). Also
+  // pass through translucent thin sheets (Add(Diffuse, Translucent) ⇒
+  // `sss_weight > 0`): otherwise the pool floor under pabellon's lotus
+  // pads renders fully shadowed, while Cycles' translucent BSDF lets
+  // ~50% of the sun through to the pebbles below.
   bool is_shadow_ray =
       (optixGetRayFlags() & OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT) != 0;
-  if (is_shadow_ray && m->transmission > 0.5f) {
+  if (is_shadow_ray && (m->transmission > 0.5f || m->sss_weight > 0.5f)) {
     optixIgnoreIntersection();
   }
   // Pure volume-container surfaces are invisible to *binary* shadow rays
