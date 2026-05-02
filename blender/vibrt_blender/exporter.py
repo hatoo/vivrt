@@ -969,7 +969,15 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
     # adaptive Cycles cuts off as soon as the diffuse sky converges,
     # leaving the disc dim.
     try:
-        tmp.cycles.samples = 64
+        # Sun discs in Sky Texture / HDRI hot spots cover tiny solid angles;
+        # 64 spp doesn't hit them often enough for the average pixel to
+        # carry the sun's full luminance, so the baked envmap rendered the
+        # sunset as a dim wash and the pool floor (lit only by what the
+        # bake captured) was way too dark. 256 spp + denoising disabled is
+        # a reasonable trade — adds a few extra seconds to the one-time
+        # update-step bake but produces a pool floor that's lit at roughly
+        # the right intensity for downstream NEE.
+        tmp.cycles.samples = 256
         tmp.cycles.use_denoising = False
         tmp.cycles.use_adaptive_sampling = False
     except Exception:
