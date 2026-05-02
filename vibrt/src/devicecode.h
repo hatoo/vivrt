@@ -199,6 +199,12 @@ struct LaunchParams {
   float *albedo_aov;
   float *normal_aov;
 
+  // Per-pixel primary-ray hit distance (camera-to-surface, in metres). Used
+  // to drive the addon's Mist / Z passes so that Cycles-authored compositors
+  // (mist haze, depth-driven masks) work on top of vibrt's output. Always
+  // allocated when present in LaunchParams; misses store `cam_clip_end`.
+  float *depth_aov;
+
   // Global homogeneous volume that fills the scene (atmospheric haze).
   // nullptr = vacuum. Always sits at the bottom of the volume stack.
   Volume *world_volume;

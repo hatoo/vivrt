@@ -15,7 +15,7 @@ use crate::{
     load_scene_from_bytes, render::RenderOutput, render_to_pixels, Progress, RenderOptions,
 };
 use numpy::ndarray::Array;
-use numpy::{IntoPyArray, PyArray3};
+use numpy::{IntoPyArray, PyArray2, PyArray3};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
 use pyo3::prelude::*;
@@ -92,8 +92,12 @@ fn parse_options(opts: &Bound<'_, PyDict>) -> PyResult<RenderOptions> {
     })
 }
 
-/// Render an in-memory scene and return a `(height, width, 4)` float32 numpy
-/// array.
+/// Render an in-memory scene and return a `(pixels, depth)` tuple where
+/// `pixels` is a `(height, width, 4)` float32 numpy array (linear RGBA,
+/// top-left origin) and `depth` is a `(height, width)` float32 array of
+/// per-pixel primary-ray hit distance from the camera (metres; misses
+/// store the camera's `clip_end`). The addon turns `depth` into Mist /
+/// Z passes so Cycles-authored compositors run on top of vibrt's output.
 ///
 /// `mesh_blobs` is the per-blob byte-buffer list referenced by
 /// `MeshDesc.vertices` / `.indices` / etc. — one numpy array per blob,
@@ -117,7 +121,7 @@ fn render<'py>(
     log_cb: Option<PyObject>,
     cancel_cb: Option<PyObject>,
     texture_arrays: Option<Vec<PyBuffer<f32>>>,
-) -> PyResult<Bound<'py, PyArray3<f32>>> {
+) -> PyResult<(Bound<'py, PyArray3<f32>>, Bound<'py, PyArray2<f32>>)> {
     let ro = parse_options(opts)?;
     let mut progress = PyProgress {
         log_cb,
@@ -178,7 +182,10 @@ fn render<'py>(
     let arr = Array::from_shape_vec((h, w, 4), out.pixels).map_err(|e| {
         PyRuntimeError::new_err(format!("pixel buffer reshape failed: {e}"))
     })?;
-    Ok(arr.into_pyarray_bound(py))
+    let depth = Array::from_shape_vec((h, w), out.depth).map_err(|e| {
+        PyRuntimeError::new_err(format!("depth buffer reshape failed: {e}"))
+    })?;
+    Ok((arr.into_pyarray_bound(py), depth.into_pyarray_bound(py)))
 }
 
 #[pymodule]

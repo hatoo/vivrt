@@ -32,11 +32,14 @@ def run_render_inproc(
     """Render `(scene.json, mesh_blobs, texture_arrays)` in-process via
     `vibrt_native`.
 
-    Returns a `(height, width, 4)` float32 numpy ndarray (linear RGBA, the
-    same buffer the GPU writes — bottom-left origin matching Blender's
-    `Image.pixels`). Raises `ImportError` if the extension isn't available;
-    raises `RuntimeError` for vibrt errors; raises `KeyboardInterrupt` if
-    the user aborted via Esc.
+    Returns a `(pixels, depth)` tuple where `pixels` is a
+    `(height, width, 4)` float32 ndarray (linear RGBA, top-left origin)
+    and `depth` is a `(height, width)` float32 ndarray of per-pixel
+    primary-ray hit distance from the camera, in metres (misses store
+    the camera's `clip_end`). The addon turns `depth` into Mist / Z
+    passes for the compositor. Raises `ImportError` if the extension
+    isn't available; raises `RuntimeError` for vibrt errors; raises
+    `KeyboardInterrupt` if the user aborted via Esc.
 
     `mesh_blobs` is the per-blob byte-buffer list (mesh / index / vertex-
     color / colour-graph LUT data). Each entry is a numpy array; the Rust

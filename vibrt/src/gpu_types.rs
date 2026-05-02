@@ -280,6 +280,11 @@ pub struct LaunchParams {
     /// scene. 0 means "vacuum"; non-null is a `VolumeGpu*`. Always part of
     /// the volume stack at depth 0.
     pub world_volume: optix_sys::CUdeviceptr,
+
+    /// Per-pixel primary-ray hit distance (single float). Drives the
+    /// addon's Mist / Z passes so Cycles-authored compositors run on top
+    /// of vibrt's output. Always allocated.
+    pub depth_aov: optix_sys::CUdeviceptr,
 }
 
 #[repr(C)]

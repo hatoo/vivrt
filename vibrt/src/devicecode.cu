@@ -2237,9 +2237,13 @@ extern "C" __global__ void __raygen__rg() {
   float3 V = make_f3(params.cam_v);
   float3 W = make_f3(params.cam_w);
 
-  // Denoiser guide AOVs: one un-jittered primary ray into the first surface.
-  // Keeps guides crisp (no sub-pixel averaging) and cheap (one trace/pixel).
-  if (params.albedo_aov != nullptr || params.normal_aov != nullptr) {
+  // Denoiser guide AOVs + Mist/Z support: one un-jittered primary ray into
+  // the first surface. Keeps guides crisp (no sub-pixel averaging) and
+  // cheap (one trace/pixel). The depth_aov drives the addon's Mist pass so
+  // Cycles-authored compositors (mist haze, depth-based masks) work on top
+  // of vibrt's output; misses store `cam_clip_end` so Mist saturates to 1.
+  if (params.albedo_aov != nullptr || params.normal_aov != nullptr ||
+      params.depth_aov != nullptr) {
     float px0 = (2.0f * ((float)idx.x + 0.5f) / (float)dim.x) - 1.0f
                 + 2.0f * params.cam_shift_x;
     float py0 = (2.0f * ((float)idx.y + 0.5f) / (float)dim.y) - 1.0f
@@ -2294,6 +2298,16 @@ extern "C" __global__ void __raygen__rg() {
       n[0] = nrm.x;
       n[1] = nrm.y;
       n[2] = nrm.z;
+    }
+    if (params.depth_aov != nullptr) {
+      float d;
+      if (v.hit != 0) {
+        float3 d3 = v.P - eye;
+        d = sqrtf(dot3(d3, d3));
+      } else {
+        d = params.cam_clip_end;
+      }
+      params.depth_aov[pixel] = d;
     }
   }
 

@@ -22,16 +22,14 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
     bl_label = "vibrt"
     bl_use_preview = False
     bl_use_shading_nodes_custom = False
-    # Skip Blender's post-process compositor pipeline. Cycles-authored
-    # scenes (lone_monk, classroom) often hang Glare / Lens-Distortion /
-    # Mix(Image, Noisy Image) / Mist-driven exposure nodes off the Render
-    # Layers output. We only populate Combined — the Noisy / Mist /
-    # denoising-data passes the compositor expects don't exist for us, so
-    # the Mix nodes wind up averaging our render with zero and the Glare
-    # bleed lifts every shadow into a uniform mid-grey haze. Letting
-    # Blender skip the compositor entirely keeps the renderer's raw
-    # Filmic-encoded output as-is.
-    bl_use_postprocess = False
+    # Run Blender's compositor over our output. We populate Combined plus
+    # Mist (from primary-ray hit distance + world.mist_settings), Z (same
+    # depth), and Noisy Image (= Combined, so any Mix(Image, Noisy Image)
+    # idiom is a no-op). lone_monk's tree (Mist factor mix → Glare → Lens
+    # Distortion) needs these to actually produce its hazy/airy look; with
+    # them present, scenes whose compositor is empty / trivial render the
+    # same way they did when this flag was False.
+    bl_use_postprocess = True
 
     def update(self, data=None, depsgraph=None):
         # `update()` is Blender's "prepare-to-render" hook. We use it to
@@ -56,6 +54,35 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
                 f"vibrt: sky pre-bake in update() failed: {ex}",
             )
 
+    def update_render_passes(self, scene=None, renderlayer=None):
+        """Tell Blender which passes we'll write so they exist on the
+        RenderResult and the compositor's `Render Layers` node exposes them.
+
+        Combined is registered unconditionally; Mist / Z follow the
+        view-layer's `use_pass_*` flags (mirroring Cycles); Noisy Image is
+        registered when denoising is on so any `Mix(Image, Noisy Image)`
+        compositor idiom finds a real socket. Falling through silently
+        when an attribute isn't present keeps this safe across Blender
+        versions where the API spelling drifts.
+        """
+        self.register_pass(scene, renderlayer, "Combined", 4, "RGBA", "COLOR")
+
+        rl = renderlayer
+        try:
+            if getattr(rl, "use_pass_mist", False):
+                self.register_pass(scene, renderlayer, "Mist", 1, "Z", "VALUE")
+            if getattr(rl, "use_pass_z", False):
+                self.register_pass(scene, renderlayer, "Z", 1, "Z", "VALUE")
+        except Exception:
+            pass
+
+        # Always expose Noisy Image (= Combined) so Cycles-authored
+        # `Mix(Image, Noisy Image)` denoise-blend nodes don't end up
+        # mixing Combined with all-zero. Cheap: it's the same buffer.
+        self.register_pass(
+            scene, renderlayer, "Noisy Image", 4, "RGBA", "COLOR"
+        )
+
     def render(self, depsgraph: bpy.types.Depsgraph):
         scene = depsgraph.scene_eval
         rd = scene.render
@@ -71,10 +98,35 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             )
             return
 
+        # If the scene's compositor wants Render-Layers passes we don't
+        # emit (AO / Shadow / Emit / Diffuse Color / ...), running it
+        # would mix Combined with all-zero buffers and ruin the output
+        # (classroom.blend's tree is a 100-node chain that does exactly
+        # this). Disable compositing for the render in that case and tell
+        # the user. We toggle on the original (non-eval) scene because
+        # `scene_eval.render` is read-only.
+        original_scene = depsgraph.scene
+        prev_use_compositing = original_scene.render.use_compositing
+        unsupported = _unsupported_compositor_passes(original_scene)
+        compositor_disabled_here = False
+        if unsupported and prev_use_compositing:
+            self.report(
+                {"WARNING"},
+                f"vibrt: compositor uses unsupported passes "
+                f"{sorted(unsupported)} — disabling compositor for this "
+                f"render. Re-enable manually if you've authored a tree "
+                f"that doesn't depend on those.",
+            )
+            original_scene.render.use_compositing = False
+            compositor_disabled_here = True
+
         try:
             self._render_in_process(depsgraph, width, height, denoise)
         except KeyboardInterrupt:
             self.report({"WARNING"}, "Render cancelled")
+        finally:
+            if compositor_disabled_here:
+                original_scene.render.use_compositing = prev_use_compositing
 
     def _render_in_process(
         self,
@@ -112,7 +164,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
 
             self.update_stats("vibrt", "Rendering...")
             t_render = time.perf_counter()
-            pixels = runner.run_render_inproc(
+            pixels, depth = runner.run_render_inproc(
                 json_str,
                 mesh_blobs,
                 self.report,
@@ -126,48 +178,155 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
                 f"{time.perf_counter() - t_render:.2f}s",
             )
 
-            # `pixels` is float32 (h, w, 4), bottom-left origin.
+            # `pixels` is float32 (h, w, 4), `depth` is float32 (h, w).
             self.update_stats("vibrt", "Loading result...")
             t_blit = time.perf_counter()
-            _push_pixels_into_render_result(self, pixels, width, height)
+            _push_pixels_into_render_result(
+                self,
+                pixels,
+                depth,
+                width,
+                height,
+                depsgraph.scene_eval,
+            )
             self.report(
                 {"INFO"},
-                f"vibrt: blit to Combined pass {time.perf_counter() - t_blit:.2f}s",
+                f"vibrt: blit to passes {time.perf_counter() - t_blit:.2f}s",
             )
 
 
-def _push_pixels_into_render_result(engine, pixels, width: int, height: int):
-    """Copy a float32 (h, w, 4) ndarray into the Combined pass."""
-    arr = pixels
-    if arr.shape[0] != height or arr.shape[1] != width or arr.shape[2] != 4:
+_SUPPORTED_RENDER_LAYER_OUTPUTS = frozenset({
+    # Sockets we populate (and aliases Blender exposes for the same pass).
+    "Image", "Combined",
+    "Noisy Image",
+    "Mist",
+    "Z", "Depth",
+    # Static / always-zero sockets that are safe even when un-driven.
+    "Alpha",
+})
+
+
+def _unsupported_compositor_passes(scene) -> set:
+    """Return the set of `Render Layers` output sockets the compositor reads
+    that we don't emit. Empty result means the compositor is safe to run.
+
+    classroom.blend's compositor reaches into AO / Shadow / Emit / Diffuse
+    Color and similar passes; running its tree on top of our Combined
+    (with those passes all zero) collapses the image to black. Returning
+    a non-empty set lets the caller decide to skip the compositor and
+    surface a clear warning.
+    """
+    if not getattr(scene, "render", None):
+        return set()
+    if not getattr(scene.render, "use_compositing", False):
+        return set()
+    tree = getattr(scene, "compositing_node_group", None) or getattr(
+        scene, "node_tree", None
+    )
+    if tree is None or not hasattr(tree, "nodes"):
+        return set()
+    unsupported: set = set()
+    for n in tree.nodes:
+        if n.bl_idname != "CompositorNodeRLayers":
+            continue
+        for sock in n.outputs:
+            if not sock.is_linked:
+                continue
+            if sock.name in _SUPPORTED_RENDER_LAYER_OUTPUTS:
+                continue
+            unsupported.add(sock.name)
+    return unsupported
+
+
+def _push_pixels_into_render_result(engine, pixels, depth, width, height, scene):
+    """Copy `pixels` (h, w, 4) and `depth` (h, w) into the available passes.
+
+    Populates Combined unconditionally; Mist / Z / Noisy Image are written
+    only when the corresponding view-layer flag (or denoising-data
+    request) made Blender register the pass. Mist comes from
+    `world.mist_settings` applied to the per-pixel hit distance; Noisy
+    Image is the same buffer as Combined so the lone_monk-style
+    `Mix(Image, Noisy Image)` compositor idiom is a no-op.
+    """
+    if (pixels.shape[0] != height or pixels.shape[1] != width
+            or pixels.shape[2] != 4):
         engine.report(
             {"ERROR"},
-            f"native render returned shape {arr.shape}, expected ({height}, {width}, 4)",
+            f"native render returned pixels shape {pixels.shape}, "
+            f"expected ({height}, {width}, 4)",
+        )
+        return
+    if depth.shape[0] != height or depth.shape[1] != width:
+        engine.report(
+            {"ERROR"},
+            f"native render returned depth shape {depth.shape}, "
+            f"expected ({height}, {width})",
         )
         return
 
     result = engine.begin_result(0, 0, width, height)
-    render_layer = result.layers[0]
-    combined = None
     try:
-        combined = render_layer.passes.find_by_name("Combined", "")
-    except TypeError:
-        combined = render_layer.passes.find_by_name("Combined")
-    if combined is None:
-        for p in render_layer.passes:
-            if p.name == "Combined":
-                combined = p
-                break
-    if combined is None:
+        render_layer = result.layers[0]
+        passes = {p.name: p for p in render_layer.passes}
+
+        flat_rgba = pixels.ravel()
+
+        combined = passes.get("Combined")
+        if combined is None:
+            engine.report({"ERROR"}, "Combined pass not found in render result")
+            return
+        _set_pass(combined, flat_rgba)
+
+        # Cycles' compositor idiom for denoising mixes Image↔Noisy Image;
+        # writing the same buffer to both makes the mix produce Combined
+        # regardless of factor, which is what we want here.
+        noisy = passes.get("Noisy Image")
+        if noisy is not None:
+            _set_pass(noisy, flat_rgba)
+
+        z_pass = passes.get("Z")
+        if z_pass is not None:
+            _set_pass(z_pass, depth.ravel())
+
+        mist_pass = passes.get("Mist")
+        if mist_pass is not None:
+            mist = _compute_mist(depth, scene)
+            _set_pass(mist_pass, mist.ravel())
+    finally:
         engine.end_result(result)
-        engine.report({"ERROR"}, "Combined pass not found in render result")
-        return
-    flat = arr.ravel()
-    if hasattr(combined.rect, "foreach_set"):
-        combined.rect.foreach_set(flat)
+
+
+def _set_pass(rpass, flat) -> None:
+    if hasattr(rpass.rect, "foreach_set"):
+        rpass.rect.foreach_set(flat)
     else:
-        combined.rect = [tuple(flat[i:i + 4]) for i in range(0, len(flat), 4)]
-    engine.end_result(result)
+        ch = rpass.channels
+        rpass.rect = [tuple(flat[i:i + ch]) for i in range(0, len(flat), ch)]
+
+
+def _compute_mist(depth, scene):
+    """Cycles-style Mist factor: t = clamp((dist - start)/depth, 0, 1) with
+    LINEAR / QUADRATIC / INVERSE_QUADRATIC falloff. `world.mist_settings`
+    drives start/depth/falloff; vibrt's per-pixel hit distance plays the
+    role of Cycles' camera-space ray length.
+    """
+    import numpy as np
+
+    world = scene.world
+    if world is None or not hasattr(world, "mist_settings"):
+        return np.zeros_like(depth)
+    ms = world.mist_settings
+    start = float(ms.start)
+    drange = max(float(ms.depth), 1e-6)
+    falloff = getattr(ms, "falloff", "LINEAR")
+
+    t = np.clip((depth - start) / drange, 0.0, 1.0).astype(np.float32)
+    if falloff == "QUADRATIC":
+        return t * t
+    if falloff == "INVERSE_QUADRATIC":
+        u = 1.0 - t
+        return (1.0 - u * u).astype(np.float32)
+    return t
 
 
 def register():

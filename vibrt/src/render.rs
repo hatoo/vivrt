@@ -38,6 +38,11 @@ pub struct RenderOutput {
     /// width × height × 4 floats, top-left origin (Blender convention; vibrt
     /// has always written its PNGs / EXRs assuming this layout).
     pub pixels: Vec<f32>,
+    /// width × height single-channel primary-ray hit distance from the
+    /// camera, in metres. Misses store `cam_clip_end`. Drives the addon's
+    /// Mist / Z passes so Cycles-authored compositors (mist haze,
+    /// depth-driven masks) work on top of vibrt's output.
+    pub depth: Vec<f32>,
     pub width: u32,
     pub height: u32,
 }
@@ -603,6 +608,11 @@ pub fn render_to_pixels(
     let albedo_aov = d_albedo.as_ref().map_or(0, |s| dptr_f32(s, &stream));
     let normal_aov = d_normal.as_ref().map_or(0, |s| dptr_f32(s, &stream));
 
+    // Per-pixel primary-ray hit distance. Always allocated; consumed by
+    // the addon to populate Mist / Z passes for the compositor.
+    let d_depth: CudaSlice<f32> = stream.alloc_zeros(pixel_count).cuda()?;
+    let depth_aov = dptr_f32(&d_depth, &stream);
+
     let lp = LaunchParams {
         image: dptr_f32(&d_image, &stream),
         width: render_settings.width,
@@ -645,6 +655,7 @@ pub fn render_to_pixels(
         albedo_aov,
         normal_aov,
         world_volume: world_volume_ptr,
+        depth_aov,
     };
     let d_params = alloc_and_copy(&stream, &lp)?;
 
@@ -789,8 +800,10 @@ pub fn render_to_pixels(
 
     // --- Readback ---
     let pixels: Vec<f32> = stream.clone_dtoh(&d_final).cuda()?;
+    let depth: Vec<f32> = stream.clone_dtoh(&d_depth).cuda()?;
     Ok(RenderOutput {
         pixels,
+        depth,
         width: render_settings.width,
         height: render_settings.height,
     })
