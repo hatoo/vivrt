@@ -447,6 +447,49 @@ def _warn_linked_scalar(node, input_name: str) -> float:
     return _socket_f(sock)
 
 
+def _socket_is_uniform_random_01(sock, depth: int = 0) -> bool:
+    """True if the chain feeding `sock` resolves to a per-instance signal
+    uniformly distributed across [0..1] (Object Info Random, particle
+    Random, Geometry Random Per Island, ...). These can't be folded to a
+    single value without dropping the artist's intent of "vary me across
+    instances" — a `ColorRamp(uniform random)` is best-collapsed to the
+    ramp's mean colour rather than its midpoint sample.
+
+    Walks through pass-through scalar wrappers (Math add/multiply by 0,
+    Clamp on [0,1]) only when the result stays uniform. Conservative —
+    returns False on anything we can't prove.
+    """
+    if depth > 4:
+        return False
+    sock = _follow_reroutes(sock)
+    if not sock.is_linked:
+        return False
+    src = sock.links[0].from_node
+    out_name = sock.links[0].from_socket.name
+    bl = src.bl_idname
+    if bl == "ShaderNodeObjectInfo" and out_name == "Random":
+        return True
+    if bl == "ShaderNodeParticleInfo" and out_name == "Random":
+        return True
+    if bl == "ShaderNodeNewGeometry" and out_name == "Random Per Island":
+        return True
+    return False
+
+
+def _ramp_mean_color(ramp) -> list[float]:
+    """Trapezoidal mean of a ColorRamp over [0..1]. Used when the Fac is a
+    uniform-random per-instance signal we can't carry through to the GPU.
+    Sampling at 64 stops captures piecewise-linear ramps faithfully."""
+    n = 64
+    acc = [0.0, 0.0, 0.0]
+    for i in range(n):
+        t = (i + 0.5) / n
+        c = ramp.evaluate(t)
+        for k in range(3):
+            acc[k] += c[k]
+    return [v / n for v in acc]
+
+
 def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
     """Strict scalar fold: refuses texture means / procedural mean-colour
     approximations so callers can distinguish a real constant from a guess.
@@ -614,6 +657,12 @@ def _resolve_constant_socket(sock, depth: int = 0):
         fac_sock = src.inputs.get("Fac")
         if fac_sock is None:
             return None
+        # Per-instance uniform random (Object Info Random, ...) can't be
+        # carried through; the ramp's mean across [0,1] is a more faithful
+        # collapse than `evaluate(0.5)` for palettes that are mostly dark
+        # except in a narrow band around the midpoint.
+        if _socket_is_uniform_random_01(fac_sock):
+            return _ramp_mean_color(src.color_ramp)
         if fac_sock.is_linked:
             inner = _resolve_constant_socket(fac_sock, depth + 1)
             if inner is None:
@@ -2905,6 +2954,14 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
             in_sock = src.inputs.get("Fac")
             if in_sock is None:
                 return None
+            # Per-instance uniform random → integrate the ramp instead of
+            # sampling at the midpoint (matches `_resolve_constant_socket`).
+            if _socket_is_uniform_random_01(in_sock):
+                color = _ramp_mean_color(src.color_ramp)
+                idx = len(nodes)
+                nodes.append({"type": "const", "rgb": color})
+                memo[key] = idx
+                return idx
             scalar = _resolve_constant_scalar(in_sock)
             if scalar is None:
                 rgb = _socket_constant_rgb(in_sock)
@@ -3707,6 +3764,172 @@ def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures
     return out
 
 
+def _find_subtree_color_image(node, depth: int = 0):
+    """Walk a shader subtree looking for the first `(image, chain)` feeding a
+    Color / Base Color input — used by the generic alpha-cutout path to find
+    the leaf RGB image when the opaque side isn't a plain Principled.
+
+    Returns (image, chain) or (None, ()).
+    """
+    if node is None or depth > 6:
+        return None, ()
+    bl = node.bl_idname
+    # BSDF nodes that carry a Color input: Diffuse, Translucent, Glass,
+    # Glossy, Anisotropic, Toon, Velvet, Sheen, Refraction, Subsurface, ...
+    color_input_names = ("Color", "Base Color")
+    for inp_name in color_input_names:
+        sock = node.inputs.get(inp_name)
+        if sock is None or not sock.is_linked:
+            continue
+        img, chain = _socket_linked_image_with_chain(sock)
+        if img is not None and isinstance(img, bpy.types.Image):
+            return img, chain
+    # Recurse into MixShader / AddShader children — the leaf is buried under
+    # the typical `MixShader(Add(Diffuse, Translucent), Glossy)` idiom.
+    if bl in ("ShaderNodeMixShader", "ShaderNodeAddShader"):
+        for inp in node.inputs:
+            if inp.type != "SHADER" or not inp.is_linked:
+                continue
+            child = inp.links[0].from_node
+            img, chain = _find_subtree_color_image(child, depth + 1)
+            if img is not None:
+                return img, chain
+    return None, ()
+
+
+def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures):
+    """Detect `MixShader(Transparent, OpaqueSubGraph, fac=texture)` for any
+    opaque shader on the non-Transparent side (the dedicated Principled and
+    Emission helpers handle their narrower idioms first). Bakes the leaf
+    image's RGB combined with the cutout-mask alpha into a fresh texture
+    and returns the opaque-side params with `base_color_tex` swapped and
+    `alpha_threshold` set.
+
+    This catches pabellon's `leafs` (autumn tree) idiom:
+        MixShader(Transparent, MixShader(Add(Diffuse,Translucent), Glossy),
+                  fac=opacity_tex)
+    where the cutout side fed a complex shader the narrower helpers reject.
+    Without this, the generic mix fallback kept the Transparent side's
+    params and the leaves rendered as see-through holes.
+    """
+    import numpy as np
+    if n1 is None or n2 is None:
+        return None
+    # Identify Transparent side.
+    if n1.bl_idname == "ShaderNodeBsdfTransparent":
+        opaque_node, opaque_params, opaque_idx = n2, p2, 2
+    elif n2.bl_idname == "ShaderNodeBsdfTransparent":
+        opaque_node, opaque_params, opaque_idx = n1, p1, 1
+    else:
+        return None
+    # Need a bakeable opacity texture (chain or raw image) on the factor.
+    mask_img, mask_chain = _socket_linked_image_with_chain(fac_sock)
+    if mask_img is None or not isinstance(mask_img, bpy.types.Image):
+        return None
+    if mask_img.size[0] == 0 or mask_img.size[1] == 0:
+        mask_img.update()
+    mw, mh = int(mask_img.size[0]), int(mask_img.size[1])
+    if mw == 0 or mh == 0:
+        return None
+
+    # Read & bake the mask chain.
+    mask_pix = np.empty(mw * mh * 4, dtype=np.float32)
+    mask_img.pixels.foreach_get(mask_pix)
+    if mask_chain:
+        mask_pix, _ = _bake_chain(
+            mask_pix, mw, mh,
+            "srgb" if mask_img.colorspace_settings.name.lower().startswith("srgb")
+            else "linear",
+            mask_chain,
+        )
+    mask_rgba = mask_pix.reshape((mh, mw, 4))
+    fac_link = fac_sock.links[0] if fac_sock.is_linked else None
+    if fac_link is not None and fac_link.from_socket.name == "Alpha":
+        alpha = mask_rgba[..., 3]
+    else:
+        alpha = (
+            0.2126 * mask_rgba[..., 0]
+            + 0.7152 * mask_rgba[..., 1]
+            + 0.0722 * mask_rgba[..., 2]
+        )
+    # Convention: shader1 is Transparent → fac=0 picks the cutout side, so
+    # bright alpha == leaf. Shader2 Transparent flips this.
+    if opaque_idx == 1:
+        alpha = 1.0 - alpha
+    alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+
+    # Find the leaf RGB image by walking the opaque subtree.
+    leaf_img, leaf_chain = _find_subtree_color_image(opaque_node)
+    if leaf_img is not None and isinstance(leaf_img, bpy.types.Image):
+        if leaf_img.size[0] == 0 or leaf_img.size[1] == 0:
+            leaf_img.update()
+        cw, ch = int(leaf_img.size[0]), int(leaf_img.size[1])
+        if cw == 0 or ch == 0:
+            return None
+        leaf_pix = np.empty(cw * ch * 4, dtype=np.float32)
+        leaf_img.pixels.foreach_get(leaf_pix)
+        leaf_colorspace = (
+            "srgb" if leaf_img.colorspace_settings.name.lower().startswith("srgb")
+            else "linear"
+        )
+        if leaf_chain:
+            leaf_pix, leaf_colorspace = _bake_chain(
+                leaf_pix, cw, ch, leaf_colorspace, leaf_chain,
+            )
+        leaf_rgb = leaf_pix.reshape((ch, cw, 4))[..., :3]
+    else:
+        # No leaf image — use a flat white tile so the kernel multiplies by
+        # `base_color`; the mask alone silhouettes the leaf.
+        cw, ch = mw, mh
+        leaf_rgb = np.ones((ch, cw, 3), dtype=np.float32)
+        leaf_colorspace = "linear"
+
+    # Resample mask to leaf resolution if needed.
+    if (mw, mh) != (cw, ch):
+        alpha_4 = np.repeat(alpha[..., None], 4, axis=-1)
+        alpha_4 = _resample_bilinear(alpha_4, ch, cw)
+        alpha = alpha_4[..., 0]
+    rgba = np.concatenate(
+        [leaf_rgb.astype(np.float32), alpha[..., None].astype(np.float32)],
+        axis=-1,
+    )
+    cache_key = (
+        f"__cutout_generic__{opaque_node.as_pointer()}__"
+        f"{(leaf_img.name if leaf_img else 'const')}__{mask_img.name}__"
+        f"{leaf_colorspace}"
+    )
+    for i, t in enumerate(textures):
+        if t.get("_key") == cache_key:
+            tex_id = i
+            break
+    else:
+        flat = np.ascontiguousarray(rgba, dtype=np.float32).reshape(-1)
+        desc = {
+            "width": int(cw),
+            "height": int(ch),
+            "channels": 4,
+            "colorspace": leaf_colorspace,
+            "_key": cache_key,
+            **writer.write_texture_pixels(flat),
+        }
+        textures.append(desc)
+        tex_id = len(textures) - 1
+
+    out = dict(opaque_params)
+    out["base_color_tex"] = tex_id
+    # The texture now carries the leaf RGB; flatten the multiplier so the
+    # kernel doesn't double-tint. Fall back to opaque_params' constant when
+    # there was no leaf image (white texture multiplied by base_color).
+    if leaf_img is not None:
+        out["base_color"] = [1.0, 1.0, 1.0]
+        # The chain we just baked replaces any color_graph the opaque side
+        # carried — leaving both would make the kernel run the graph again
+        # over already-baked pixels.
+        out.pop("color_graph", None)
+    out["alpha_threshold"] = 0.5
+    return out
+
+
 def _try_alpha_cutout_emission_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures):
     """Detect `MixShader(Transparent, Emission, fac=texture)` (or its
     Emission/Transparent reverse) — Cycles' canonical billboard-flame /
@@ -3868,6 +4091,14 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
         # fallback collapses to shader1's params and either drops the
         # emission or the cutout silhouette.
         baked = _try_alpha_cutout_emission_mixshader(
+            node, n1, n2, p1, p2, fac_sock, writer, textures
+        )
+        if baked is not None:
+            return baked
+        # Generic alpha-cutout: any opaque shader (or shader subgraph)
+        # paired with Transparent. Catches pabellon's `leafs` material —
+        # a MixShader whose lit side is itself a MixShader/AddShader.
+        baked = _try_alpha_cutout_generic_mixshader(
             node, n1, n2, p1, p2, fac_sock, writer, textures
         )
         if baked is not None:
