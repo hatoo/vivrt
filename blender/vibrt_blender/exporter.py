@@ -951,6 +951,12 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
     return {
         "type": "sun",
         # Direction the light *travels*: opposite of the "comes-from" vector.
+        # The kernel docstring claims `direction` points TO the light, but
+        # the empirical lone_monk Nishita case rendered correctly with the
+        # negated centroid — the trace_path codepath threads this value
+        # through `wi = T*sx + B*sy + dir*ct` and uses it as a ray
+        # direction, which actually wants the "from light" direction in
+        # the convention the existing scene_loader / tests use.
         "direction": [-sun_dir[0], -sun_dir[1], -sun_dir[2]],
         "color": color,
         "strength": flux_max,
