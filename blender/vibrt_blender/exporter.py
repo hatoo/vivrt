@@ -1422,6 +1422,18 @@ def _export_into(
                     if not getattr(obj, "visible_camera", True):
                         continue
 
+                    # Particle scatter emitters: when the source object has
+                    # particle systems and `show_instancer_for_render = False`
+                    # Cycles renders only the instances and hides the emitter
+                    # mesh itself. Without this skip pabellon's
+                    # `lotus_scattering_plane` / `pebbles_scatter` (both with
+                    # empty material lists) cover the pond as bright opaque
+                    # planes, drowning the water beneath.
+                    if (not inst.is_instance
+                            and obj_eval.particle_systems
+                            and not getattr(obj, "show_instancer_for_render", True)):
+                        continue
+
                     mkey = f"{obj_eval.data.name}#{obj_eval.name}#vc={vc_attr_name}"
                     mesh_id = mesh_cache.get(mkey)
                     if mesh_id is None:

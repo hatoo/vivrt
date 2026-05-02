@@ -1255,8 +1255,18 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
     float3 f_metal = F_metal * (D * G / fmaxf(4.0f * NoV * NoL, 1e-8f));
     float3 f_dielec = make_float3(F_dielec, F_dielec, F_dielec) *
                       (D * G / fmaxf(4.0f * NoV * NoL, 1e-8f));
+    // Dielectric surface reflection. For a matte material this is the
+    // standard "spec layer on top of diffuse"; for a glass material
+    // (transmission=1) it's the Fresnel-reflective component the
+    // transmission lobe's sampler picked when `rng.next() < F`. Without
+    // this term, a Glass BSDF surface evaluated on a reflected wi
+    // returns f=0 and pdf=0, the path tracer drops the reflection
+    // entirely, and at grazing angles where glass should mirror-reflect
+    // the rays just transmit straight through to the sky — pabellon's
+    // water plane appeared as the bright sunset sky shining through,
+    // not as a reflective pond.
     float3 f_spec = e.metallic * f_metal +
-                    (1.0f - e.metallic) * (1.0f - e.transmission) * f_dielec;
+                    (1.0f - e.metallic) * f_dielec;
 
     // Kulla-Conty multi-scattering compensation (reflection only).
     float E_wo = ggx_e_lookup(NoV, e.alpha);
@@ -1281,12 +1291,19 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
     float f_dielec_ms = F_ms_d * f_ms_scalar;
 
     f_spec = f_spec + e.metallic * f_metal_ms +
-             (1.0f - e.metallic) * (1.0f - e.transmission) *
+             (1.0f - e.metallic) *
                  make_float3(f_dielec_ms, f_dielec_ms, f_dielec_ms);
 
     r.f = r.f + f_spec * NoL;
     float pdf_spec = ggx_vndf_pdf_aniso(Vloc, Hloc, e.alpha_x, e.alpha_y);
     r.pdf += p_spec * pdf_spec;
+    // Glass reflection samples this same Fresnel lobe via the
+    // transmission branch's `rng.next() < F` decision. Account for that
+    // contribution so MIS-weighted estimators get the right pdf when
+    // we land on a reflected wi for a transmissive surface.
+    if (e.transmission > 0.0f && p_trans > 0.0f) {
+        r.pdf += p_trans * F_dielec * pdf_spec;
+    }
 
     // --- Coat (clearcoat): additive isotropic GGX dielectric above base. ---
     if (coat_w_mat > 0.0f) {
