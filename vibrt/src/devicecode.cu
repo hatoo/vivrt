@@ -1347,7 +1347,16 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
     float G1_l = smith_G1_aniso(Lloc, e.alpha_x, e.alpha_y);
     float G = G1_v * G1_l;
     float3 F_metal = schlick_rgb(VoH, e.base_color);
-    float F_dielec = schlick_scalar(VoH, F0_d);
+    // Glass / transmissive materials sample the reflect-vs-refract split via
+    // `fresnel_dielectric` (exact), so the eval has to use the same Fresnel
+    // function — Schlick over-predicts F by ~2× at low IOR (1.0–1.2), which
+    // for water (IOR=1.1) at the camera's grazing pool angle made
+    // glass-reflection paths carry too much radiance and transmission paths
+    // too little. The two formulas match within ~1% for IOR≥1.4 (the typical
+    // dielectric range), so non-glass materials don't notice.
+    float F_dielec = (e.transmission > 0.0f)
+        ? fresnel_dielectric(VoH, e.ior)
+        : schlick_scalar(VoH, F0_d);
     float3 f_metal = F_metal * (D * G / fmaxf(4.0f * NoV * NoL, 1e-8f));
     float3 f_dielec = make_float3(F_dielec, F_dielec, F_dielec) *
                       (D * G / fmaxf(4.0f * NoV * NoL, 1e-8f));
