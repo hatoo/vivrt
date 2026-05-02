@@ -655,6 +655,7 @@ pub fn render_to_pixels(
         ggx_e_lut: d_ggx_e,
         ggx_e_avg_lut: d_ggx_e_avg,
         clamp_indirect: render_settings.clamp_indirect,
+        clamp_direct: render_settings.clamp_direct,
         albedo_aov,
         normal_aov,
         depth_aov,

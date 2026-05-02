@@ -2340,7 +2340,12 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
     // NEE
     float3 wo = -dir;
     float3 nee = throughput * direct_light(e, v.P, wo, rng, vstack);
-    if (bounce > 0)
+    // bounce==0 → camera-ray NEE, clamp via Cycles' sample_clamp_direct.
+    // bounce>0 → indirect-bounce NEE, clamp via sample_clamp_indirect.
+    // Cycles applies clamping at exactly the same path-vertex layering.
+    if (bounce == 0)
+      nee = clamp_indirect(nee, params.clamp_direct);
+    else
       nee = clamp_indirect(nee, params.clamp_indirect);
     L = L + nee;
 

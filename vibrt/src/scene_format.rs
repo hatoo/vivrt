@@ -91,6 +91,10 @@ pub struct RenderSettings {
     /// Clamp for indirect (bounce>=1) contribution luminance. 0 disables.
     #[serde(default)]
     pub clamp_indirect: f32,
+    /// Clamp for direct (NEE on the primary surface) contribution
+    /// luminance. Mirrors Cycles' `sample_clamp_direct`. 0 disables.
+    #[serde(default)]
+    pub clamp_direct: f32,
 }
 
 fn default_lobe_bounces() -> u32 {

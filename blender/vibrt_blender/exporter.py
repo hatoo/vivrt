@@ -1589,6 +1589,20 @@ def _export_into(
     max_diffuse = int(getattr(cy, "diffuse_bounces", max_depth)) if cy is not None else max_depth
     max_glossy = int(getattr(cy, "glossy_bounces", max_depth)) if cy is not None else max_depth
     max_transmission = int(getattr(cy, "transmission_bounces", max_depth)) if cy is not None else max_depth
+    # Cycles' Light Paths > Clamping. Pabellon ships with both clamps at
+    # 1.0; without honouring them vibrt over-bright Fresnel reflections of
+    # the bright HDRI peaks (foreground pool floor read 50% brighter than
+    # Cycles' reference). 0 = no clamp on the Cycles side; the vibrt scene
+    # property still acts as a per-render override and falls back to the
+    # default (10.0) when Cycles is unavailable.
+    cy_clamp_indirect = float(getattr(cy, "sample_clamp_indirect", 0.0)) if cy is not None else 0.0
+    cy_clamp_direct = float(getattr(cy, "sample_clamp_direct", 0.0)) if cy is not None else 0.0
+    user_clamp = float(scene.vibrt_clamp_indirect)
+    # Pick the tightest non-zero clamp from Cycles + the vibrt user
+    # property. 0 means "no clamp" in either system, so skip those.
+    clamp_indirect = min(
+        c for c in (cy_clamp_indirect, user_clamp) if c > 0.0
+    ) if any(c > 0.0 for c in (cy_clamp_indirect, user_clamp)) else 0.0
     _emit(
         f"[vibrt] bounces total={max_depth} "
         f"diffuse={max_diffuse} glossy={max_glossy} transmission={max_transmission}"
@@ -1603,7 +1617,8 @@ def _export_into(
             "max_diffuse_bounces": max_diffuse,
             "max_glossy_bounces": max_glossy,
             "max_transmission_bounces": max_transmission,
-            "clamp_indirect": float(scene.vibrt_clamp_indirect),
+            "clamp_indirect": clamp_indirect,
+            "clamp_direct": cy_clamp_direct,
         },
         "camera": _export_camera(scene, cam_obj, aspect),
         "meshes": meshes,
