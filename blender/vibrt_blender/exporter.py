@@ -832,11 +832,13 @@ def _try_export_layer_from_background(world, bg_node, writer, textures):
         return None
     src = color_sock.links[0].from_node
     if src.bl_idname in ("ShaderNodeTexEnvironment", "ShaderNodeTexImage"):
-        # Both nodes feed an image into the Color socket of a Background;
-        # in pabellon's sunset world the HDRI is a TexImage; in cleaner
-        # scenes it'd be TexEnvironment. Either is fine for our
-        # equirect lookup since we drive the sample direction from the
-        # world ray ourselves.
+        # Both nodes feed an image into the Color socket of a Background.
+        # ShaderNodeTexEnvironment is always equirect-style (sphere
+        # mapping); ShaderNodeTexImage carries an explicit `projection`
+        # that drives a different direction → UV function. Pabellon's
+        # sunset world routes a regular JPG photo through TexImage with
+        # `projection='FLAT'`, which is fundamentally different from
+        # equirect and must not be sampled as one.
         if src.image is None:
             return None
         # Walk back through an optional Mapping → TexCoord chain to
@@ -858,6 +860,39 @@ def _try_export_layer_from_background(world, bg_node, writer, textures):
             "srgb" if src.image.colorspace_settings.name.lower().startswith("srgb")
             else "linear"
         )
+        # Determine the projection mode we tell the host rasteriser.
+        if src.bl_idname == "ShaderNodeTexEnvironment":
+            env_proj = getattr(src, "projection", "EQUIRECTANGULAR")
+            if env_proj == "EQUIRECTANGULAR":
+                projection = "equirect"
+            else:
+                _emit(
+                    f"[vibrt] warn: world {world.name!r}: TexEnvironment "
+                    f"projection={env_proj!r} unsupported — falling back "
+                    f"to equirect (image '{src.image.name}' will sample "
+                    f"with a different mapping than Cycles)"
+                )
+                projection = "equirect"
+            extension = "repeat"
+        else:
+            img_proj = getattr(src, "projection", "FLAT")
+            proj_map = {
+                "FLAT": "flat",
+                # SPHERE / TUBE / BOX would need extra device-side code;
+                # fall back to FLAT with a visible warning so the bug is
+                # locatable rather than silently mis-sampling as equirect.
+            }
+            if img_proj not in proj_map:
+                _emit(
+                    f"[vibrt] warn: world {world.name!r}: TexImage "
+                    f"projection={img_proj!r} unsupported — treating "
+                    f"as FLAT (image '{src.image.name}' may render "
+                    f"differently than Cycles)"
+                )
+            projection = proj_map.get(img_proj, "flat")
+            ext_map = {"REPEAT": "repeat", "EXTEND": "extend", "CLIP": "clip"}
+            ext_raw = getattr(src, "extension", "REPEAT")
+            extension = ext_map.get(ext_raw, "repeat")
         tex_id = material_export.export_image_texture(
             src.image, writer, textures, colorspace=colorspace
         )
@@ -865,6 +900,8 @@ def _try_export_layer_from_background(world, bg_node, writer, textures):
             "texture": int(tex_id),
             "rotation": rotation,
             "strength": strength,
+            "projection": projection,
+            "extension": extension,
         }
     if src.bl_idname == "ShaderNodeTexSky":
         key = _sky_node_alone_cache_key(world, src)

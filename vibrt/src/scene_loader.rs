@@ -282,16 +282,20 @@ pub fn load_scene_from_bytes<'a>(
         Some(WorldDesc::Mixed { a, b, fac }) => {
             // Load both layers' source textures, then host-rasterise a
             // 1024×512 "mixed grid" by sampling each layer at every
-            // pixel direction (with its rotation) and blending. The
-            // mixed grid drives the importance-sampling CDF; the kernel
-            // separately reads from `envmap_layer_*_rgb` for the
-            // actual high-resolution radiance per direction.
+            // pixel direction (with its rotation + projection) and
+            // blending. The mixed grid is what the kernel reads at
+            // render time and what drives the importance-sampling CDF;
+            // the per-layer `envmap_layer_*_rgb` are kept around in
+            // case a future optimisation wants high-res lookups.
             let layer_a = extract_rgb(a.texture)?;
             let layer_b = extract_rgb(b.texture)?;
-            let mixed = build_mixed_envmap_grid(&layer_a, &a.rotation,
-                                                a.strength,
-                                                &layer_b, &b.rotation,
-                                                b.strength, *fac, 1024, 512);
+            let mixed = build_mixed_envmap_grid(
+                &layer_a, &a.rotation, a.strength,
+                &a.projection, &a.extension,
+                &layer_b, &b.rotation, b.strength,
+                &b.projection, &b.extension,
+                *fac, 1024, 512,
+            );
             (Some(mixed), Some(layer_a), Some(layer_b))
         }
         _ => (None, None, None),
@@ -312,48 +316,89 @@ pub fn load_scene_from_bytes<'a>(
     })
 }
 
-/// Bilinear-fetch (with u-wrap, v-clamp) at a world-space direction. Used
-/// host-side to sample each layer of a `WorldDesc::Mixed` when building
-/// the importance-sampling CDF grid.
-fn sample_layer_at_dir(
-    rgb: &[f32], w: u32, h: u32, rotation: &[f32; 9], dir: [f32; 3],
-) -> [f32; 3] {
-    let r = rotation;
-    let dr = [
-        r[0] * dir[0] + r[1] * dir[1] + r[2] * dir[2],
-        r[3] * dir[0] + r[4] * dir[1] + r[5] * dir[2],
-        r[6] * dir[0] + r[7] * dir[1] + r[8] * dir[2],
-    ];
-    let theta = dr[2].clamp(-1.0, 1.0).acos();
-    let phi = dr[1].atan2(dr[0]);
-    let mut u = phi * (0.5 / std::f32::consts::PI);
-    if u < 0.0 {
-        u += 1.0;
+#[derive(Copy, Clone)]
+enum LayerProjection {
+    /// `(u, v) = (φ/2π, θ/π)`. The standard HDRI mapping a
+    /// `ShaderNodeTexEnvironment` provides.
+    Equirect,
+    /// `(u, v) = (dir.x, dir.y)`. Cycles' ShaderNodeTexImage with
+    /// `projection='FLAT'` — the rotated direction's `xy` are taken
+    /// straight as UV; `z` is dropped. Used by pabellon's sunset world,
+    /// which routes a regular sRGB JPG photo through this path.
+    Flat,
+}
+
+#[derive(Copy, Clone)]
+enum LayerExtension {
+    /// Wrap UV outside `[0, 1]` — `u - floor(u)`.
+    Repeat,
+    /// Clamp to nearest edge.
+    Extend,
+    /// Return zero outside `[0, 1]`.
+    Clip,
+}
+
+fn parse_projection(s: &str) -> LayerProjection {
+    match s {
+        "flat" => LayerProjection::Flat,
+        _ => LayerProjection::Equirect,
     }
-    let v = theta / std::f32::consts::PI;
+}
+
+fn parse_extension(s: &str) -> LayerExtension {
+    match s {
+        "extend" => LayerExtension::Extend,
+        "clip" => LayerExtension::Clip,
+        _ => LayerExtension::Repeat,
+    }
+}
+
+/// Bilinear UV fetch with the given extension mode. `u`, `v` are in
+/// continuous texture space (0..1 covers the whole image; values
+/// outside that range are handled per `extension`).
+fn bilinear_fetch(
+    rgb: &[f32], w: u32, h: u32, u: f32, v: f32, extension: LayerExtension,
+) -> [f32; 3] {
+    if let LayerExtension::Clip = extension {
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return [0.0, 0.0, 0.0];
+        }
+    }
     let fx = u * w as f32 - 0.5;
     let fy = v * h as f32 - 0.5;
     let x0 = fx.floor() as i32;
     let y0 = fy.floor() as i32;
     let dx = fx - x0 as f32;
     let dy = fy - y0 as f32;
-    let wrap = |v: i32, m: u32| -> u32 {
+    let wrap_repeat = |i: i32, m: u32| -> u32 {
         let m_ = m as i32;
-        let r = v % m_;
+        let r = i % m_;
         if r < 0 { (r + m_) as u32 } else { r as u32 }
     };
-    let x1 = wrap(x0 + 1, w);
-    let x0u = wrap(x0, w);
-    let y0u = (y0.max(0).min(h as i32 - 1)) as u32;
-    let y1u = ((y0 + 1).max(0).min(h as i32 - 1)) as u32;
+    let clamp_edge = |i: i32, m: u32| -> u32 {
+        i.max(0).min(m as i32 - 1) as u32
+    };
+    let (xfn, yfn): (Box<dyn Fn(i32, u32) -> u32>, Box<dyn Fn(i32, u32) -> u32>) =
+        match extension {
+            LayerExtension::Repeat => (Box::new(wrap_repeat), Box::new(wrap_repeat)),
+            // For Extend and Clip we clamp; Clip already returned early
+            // for fully out-of-range UVs, but the bilinear taps near
+            // the edge still need a defined fetch — clamping there
+            // matches Cycles' behaviour.
+            _ => (Box::new(clamp_edge), Box::new(clamp_edge)),
+        };
+    let x0u = xfn(x0, w);
+    let x1u = xfn(x0 + 1, w);
+    let y0u = yfn(y0, h);
+    let y1u = yfn(y0 + 1, h);
     let fetch = |x: u32, y: u32| -> [f32; 3] {
         let i = ((y * w + x) * 3) as usize;
         [rgb[i], rgb[i + 1], rgb[i + 2]]
     };
     let c00 = fetch(x0u, y0u);
-    let c10 = fetch(x1, y0u);
+    let c10 = fetch(x1u, y0u);
     let c01 = fetch(x0u, y1u);
-    let c11 = fetch(x1, y1u);
+    let c11 = fetch(x1u, y1u);
     let lerp = |a: [f32; 3], b: [f32; 3], t: f32| {
         [a[0] + (b[0] - a[0]) * t,
          a[1] + (b[1] - a[1]) * t,
@@ -364,12 +409,83 @@ fn sample_layer_at_dir(
     lerp(c0, c1, dy)
 }
 
+/// Sample one envmap layer at a world-space direction. Used host-side
+/// to rasterise the mixed envmap grid for `WorldDesc::Mixed` worlds.
+/// `rotation` is applied to `dir` before the projection-specific UV
+/// computation. Equirect projection ignores `extension` and uses the
+/// usual u-wrap, v-clamp; Flat projection honours the requested
+/// extension mode in both axes.
+fn sample_layer_at_dir(
+    rgb: &[f32], w: u32, h: u32, rotation: &[f32; 9], dir: [f32; 3],
+    projection: LayerProjection, extension: LayerExtension,
+) -> [f32; 3] {
+    let r = rotation;
+    let dr = [
+        r[0] * dir[0] + r[1] * dir[1] + r[2] * dir[2],
+        r[3] * dir[0] + r[4] * dir[1] + r[5] * dir[2],
+        r[6] * dir[0] + r[7] * dir[1] + r[8] * dir[2],
+    ];
+    match projection {
+        LayerProjection::Equirect => {
+            let theta = dr[2].clamp(-1.0, 1.0).acos();
+            let phi = dr[1].atan2(dr[0]);
+            let mut u = phi * (0.5 / std::f32::consts::PI);
+            if u < 0.0 {
+                u += 1.0;
+            }
+            let v = theta / std::f32::consts::PI;
+            // Equirect intrinsically wraps in u and clamps in v
+            // regardless of the user-set extension mode.
+            let fx = u * w as f32 - 0.5;
+            let fy = v * h as f32 - 0.5;
+            let x0 = fx.floor() as i32;
+            let y0 = fy.floor() as i32;
+            let dx = fx - x0 as f32;
+            let dy = fy - y0 as f32;
+            let wrap = |v: i32, m: u32| -> u32 {
+                let m_ = m as i32;
+                let r = v % m_;
+                if r < 0 { (r + m_) as u32 } else { r as u32 }
+            };
+            let x1 = wrap(x0 + 1, w);
+            let x0u = wrap(x0, w);
+            let y0u = (y0.max(0).min(h as i32 - 1)) as u32;
+            let y1u = ((y0 + 1).max(0).min(h as i32 - 1)) as u32;
+            let fetch = |x: u32, y: u32| -> [f32; 3] {
+                let i = ((y * w + x) * 3) as usize;
+                [rgb[i], rgb[i + 1], rgb[i + 2]]
+            };
+            let c00 = fetch(x0u, y0u);
+            let c10 = fetch(x1, y0u);
+            let c01 = fetch(x0u, y1u);
+            let c11 = fetch(x1, y1u);
+            let lerp = |a: [f32; 3], b: [f32; 3], t: f32| {
+                [a[0] + (b[0] - a[0]) * t,
+                 a[1] + (b[1] - a[1]) * t,
+                 a[2] + (b[2] - a[2]) * t]
+            };
+            let c0 = lerp(c00, c10, dx);
+            let c1 = lerp(c01, c11, dx);
+            lerp(c0, c1, dy)
+        }
+        LayerProjection::Flat => {
+            // Cycles' FLAT projection uses the rotated direction's
+            // x and y components directly as UV. Pabellon's sunset
+            // world drives a regular JPG photo through this path
+            // with REPEAT extension.
+            bilinear_fetch(rgb, w, h, dr[0], dr[1], extension)
+        }
+    }
+}
+
 /// Rasterise the (1−fac)·a + fac·b mix of two envmap layers at the
 /// given target resolution. Used to drive the importance-sampling CDF
-/// for `WorldDesc::Mixed` worlds.
+/// for `WorldDesc::Mixed` worlds and read directly by the kernel.
 fn build_mixed_envmap_grid(
     layer_a: &(Vec<f32>, u32, u32), rot_a: &[f32; 9], strength_a: f32,
+    proj_a: &str, ext_a: &str,
     layer_b: &(Vec<f32>, u32, u32), rot_b: &[f32; 9], strength_b: f32,
+    proj_b: &str, ext_b: &str,
     fac: f32, target_w: u32, target_h: u32,
 ) -> (Vec<f32>, u32, u32) {
     use rayon::prelude::*;
@@ -378,6 +494,10 @@ fn build_mixed_envmap_grid(
     let inv_h = 1.0 / target_h as f32;
     let (a_rgb, a_w, a_h) = layer_a;
     let (b_rgb, b_w, b_h) = layer_b;
+    let pa = parse_projection(proj_a);
+    let ea = parse_extension(ext_a);
+    let pb = parse_projection(proj_b);
+    let eb = parse_extension(ext_b);
     // Parallelise per-row; each row is independent.
     let mut grid = vec![0.0f32; (target_w * target_h * 3) as usize];
     grid.par_chunks_mut((target_w * 3) as usize)
@@ -391,8 +511,8 @@ fn build_mixed_envmap_grid(
                 let u = (x as f32 + 0.5) * inv_w;
                 let phi = u * 2.0 * pi;
                 let dir = [sin_t * phi.cos(), sin_t * phi.sin(), cos_t];
-                let a = sample_layer_at_dir(a_rgb, *a_w, *a_h, rot_a, dir);
-                let b = sample_layer_at_dir(b_rgb, *b_w, *b_h, rot_b, dir);
+                let a = sample_layer_at_dir(a_rgb, *a_w, *a_h, rot_a, dir, pa, ea);
+                let b = sample_layer_at_dir(b_rgb, *b_w, *b_h, rot_b, dir, pb, eb);
                 let i = (x * 3) as usize;
                 let one_minus_fac = 1.0 - fac;
                 row[i] = a[0] * strength_a * one_minus_fac

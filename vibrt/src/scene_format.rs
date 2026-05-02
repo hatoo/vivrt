@@ -571,14 +571,38 @@ fn default_point_radius() -> f32 {
 pub struct EnvmapLayer {
     pub texture: u32,
     /// 3×3 row-major rotation applied to the world-space sample direction
-    /// before the equirect lookup. `[1,0,0, 0,1,0, 0,0,1]` is identity.
-    /// Mapping nodes with arbitrary Euler XYZ rotation are pre-composed
-    /// into this matrix on the host so the kernel does one matrix-vector
-    /// per sample and no Euler reconstruction.
+    /// before the projection-specific lookup. `[1,0,0, 0,1,0, 0,0,1]` is
+    /// identity. Mapping nodes with arbitrary Euler XYZ rotation are
+    /// pre-composed into this matrix on the host.
     #[serde(default = "identity_rotation_3x3")]
     pub rotation: [f32; 9],
     #[serde(default = "one_f32")]
     pub strength: f32,
+    /// Projection mode used when sampling the layer's texture from a
+    /// world-space ray direction. `"equirect"` — the usual HDRI mapping
+    /// `(u, v) = (φ/2π, θ/π)`. `"flat"` — Cycles' ShaderNodeTexImage
+    /// projection=FLAT, which uses the rotated direction's `(x, y)`
+    /// components directly as UV (regardless of `z`). Pabellon's sunset
+    /// world drives a 4928×3264 sRGB JPG photo this way; sampling it as
+    /// equirect is wrong everywhere on the hemisphere.
+    #[serde(default = "default_projection")]
+    pub projection: String,
+    /// Texture-coordinate extension applied to UV outside `[0, 1]`.
+    /// `"repeat"` — wrap (default). `"extend"` — clamp to edge.
+    /// `"clip"` — return zero (treat sample as black, matching Cycles).
+    /// For `projection="equirect"` we always wrap u and clamp v
+    /// (longitude is periodic, latitude is bounded), so this field is
+    /// only consulted by FLAT-projection layers.
+    #[serde(default = "default_extension")]
+    pub extension: String,
+}
+
+fn default_projection() -> String {
+    "equirect".into()
+}
+
+fn default_extension() -> String {
+    "repeat".into()
 }
 
 #[derive(Deserialize)]
