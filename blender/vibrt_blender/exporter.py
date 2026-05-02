@@ -878,16 +878,22 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
         return None
     lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
     lum_max = float(lum.max())
-    # Threshold for "this is the sun disc, not just bright sky":
+    # Threshold for "this is the sun disc, not just bright sky".
     # Nishita sun discs punch through diffuse sky by 4-5 orders of
-    # magnitude (max-pixel >> 30) so a high floor is safe and reliable.
-    # Preetham (and bakes that crank exposure down) put the disc only
-    # ~3-10× brighter than the brightest cloud, so a percentile-relative
-    # threshold matters more than the absolute floor. Use 3× the 99th
-    # percentile, with a small absolute floor (1.5) so a pure
-    # diffuse-overcast bake (no real disc) doesn't fire on noise.
+    # magnitude. Preetham / sunset bakes put the disc only ~2-3×
+    # brighter than the brightest cloud. We rely on a percentile-
+    # relative threshold (the disc is always the brightest pixel
+    # cluster) and require the ratio of max to median luminance to
+    # be high enough that the bake genuinely has a hot spot — pure
+    # overcast skies have a very low max/median ratio (≈ 1.5), suns
+    # push it to 3+. Skips both the hand-edited HDRI overcast case
+    # and the very-dim-sun edge cases that would otherwise produce a
+    # garbage delta light.
+    p_med = float(np.percentile(lum, 50.0))
+    if p_med <= 0.0 or lum_max / max(p_med, 1e-4) < 3.0:
+        return None
     p99 = float(np.percentile(lum, 99.0))
-    threshold = max(1.5, p99 * 3.0)
+    threshold = p99 * 1.5
     if lum_max < threshold:
         return None
     bright_mask = lum > threshold
