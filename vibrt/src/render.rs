@@ -662,6 +662,18 @@ pub fn render_to_pixels(
         clamp_indirect: render_settings.clamp_indirect,
         clamp_direct: render_settings.clamp_direct,
         filter_glossy: render_settings.filter_glossy,
+        // Mixed-envmap layer B is unused until phase 3 of option A (the
+        // exporter doesn't yet emit `WorldDesc::Mixed`). Initialise to
+        // null/identity so the kernel's `world_background` falls
+        // through the legacy single-layer path: `envmap_data_b == nullptr`.
+        envmap_data_b: 0,
+        envmap_width_b: 0,
+        envmap_height_b: 0,
+        envmap_strength_a: world_strength,
+        envmap_strength_b: 0.0,
+        envmap_rotation_a: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        envmap_rotation_b: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        envmap_mix_fac: 0.0,
         albedo_aov,
         normal_aov,
         depth_aov,

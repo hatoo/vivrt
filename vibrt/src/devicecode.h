@@ -187,7 +187,7 @@ struct LaunchParams {
   AreaRectLight *rect_lights;
   float *rect_light_cdf;
 
-  int world_type; // 0=constant, 1=envmap
+  int world_type; // 0=constant, 1=single envmap, 2=mixed (two layers)
   float world_color[3];
   float world_strength;
   float *envmap_data;
@@ -197,6 +197,19 @@ struct LaunchParams {
   float *envmap_conditional_cdf;
   float envmap_integral;
   float envmap_rotation_z_rad;
+  // Mixed-envmap (world_type=2) state. Layer A is the existing
+  // envmap_data; layer B lives in envmap_data_b. nullptr on layer B
+  // means single-layer (legacy `Envmap`) behaviour. Per-layer rotations
+  // are 3×3 row-major matrices applied to the world-space sample
+  // direction before the equirect lookup.
+  float *envmap_data_b;
+  int envmap_width_b;
+  int envmap_height_b;
+  float envmap_strength_a;
+  float envmap_strength_b;
+  float envmap_rotation_a[9];
+  float envmap_rotation_b[9];
+  float envmap_mix_fac;
 
   float *ggx_e_lut;
   float *ggx_e_avg_lut;

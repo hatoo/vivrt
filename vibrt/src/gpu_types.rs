@@ -263,7 +263,7 @@ pub struct LaunchParams {
     pub rect_lights: optix_sys::CUdeviceptr,
     pub rect_light_cdf: optix_sys::CUdeviceptr,
 
-    /// World background: 0 = constant, 1 = envmap
+    /// World background: 0 = constant, 1 = single envmap, 2 = mixed (two layers).
     pub world_type: i32,
     pub world_color: [f32; 3],
     pub world_strength: f32,
@@ -274,6 +274,21 @@ pub struct LaunchParams {
     pub envmap_conditional_cdf: optix_sys::CUdeviceptr,
     pub envmap_integral: f32,
     pub envmap_rotation_z_rad: f32,
+    /// Optional second layer for mixed envmaps (`world_type=2`). When
+    /// `envmap_data_b` is null, the kernel treats the world as
+    /// single-layer (legacy `Envmap` behaviour). The two layers are
+    /// blended by `mix_fac` in the kernel: `world(dir) = (1−fac)·a +
+    /// fac·b`. Each layer carries its own per-component rotation as a
+    /// 3×3 row-major matrix so HDRIs with `Mapping` rotations sample at
+    /// native resolution without a Cycles bake.
+    pub envmap_data_b: optix_sys::CUdeviceptr,
+    pub envmap_width_b: i32,
+    pub envmap_height_b: i32,
+    pub envmap_strength_a: f32,
+    pub envmap_strength_b: f32,
+    pub envmap_rotation_a: [f32; 9],
+    pub envmap_rotation_b: [f32; 9],
+    pub envmap_mix_fac: f32,
 
     pub ggx_e_lut: optix_sys::CUdeviceptr,
     pub ggx_e_avg_lut: optix_sys::CUdeviceptr,

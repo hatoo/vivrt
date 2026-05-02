@@ -426,26 +426,23 @@ static __forceinline__ __device__ float3 rotate_y(float3 v, float c, float s) {
   return make_float3(v.x * c + v.z * s, v.y, -v.x * s + v.z * c);
 }
 
-static __device__ float3 world_background(float3 dir) {
-  if (params.world_type == 0) {
-    return make_f3(params.world_color) * params.world_strength;
-  }
-  // envmap
-  float c = cosf(-params.envmap_rotation_z_rad);
-  float s = sinf(-params.envmap_rotation_z_rad);
-  float3 d = make_float3(dir.x * c - dir.y * s, dir.x * s + dir.y * c, dir.z);
+// Bilinear-filter an equirect texture (3-channel, packed) at a world-space
+// direction `dir`. Wraps u (longitude is periodic) and clamps v (poles are
+// not). `rotation` is a 3×3 row-major matrix applied to `dir` before the
+// equirect lookup so per-layer Mapping rotations don't have to bake into
+// pixels.
+static __device__ float3 sample_equirect_layer(const float *data, int w, int h,
+                                                const float *rotation,
+                                                float3 dir) {
+  float3 d = make_float3(rotation[0] * dir.x + rotation[1] * dir.y + rotation[2] * dir.z,
+                         rotation[3] * dir.x + rotation[4] * dir.y + rotation[5] * dir.z,
+                         rotation[6] * dir.x + rotation[7] * dir.y + rotation[8] * dir.z);
   float theta = acosf(fminf(fmaxf(d.z, -1.0f), 1.0f));
   float phi = atan2f(d.y, d.x);
   float u = phi * (0.5f * INV_PIf);
   if (u < 0.0f)
     u += 1.0f;
   float v = theta * INV_PIf;
-  int w = params.envmap_width;
-  int h = params.envmap_height;
-  // Bilinear filter the equirect texture. Nearest-neighbor leaves visible
-  // texel boundaries when the bake (1024×512 for pabellon) is undersampled
-  // relative to the camera resolution — the sky renders as discrete steps
-  // of colour. Wrap u, clamp v (poles aren't periodic).
   float fx = u * (float)w - 0.5f;
   float fy = v * (float)h - 0.5f;
   int x0 = (int)floorf(fx);
@@ -461,7 +458,7 @@ static __device__ float3 world_background(float3 dir) {
   y0 = max(0, min(h - 1, y0));
   int y1 = max(0, min(h - 1, y0 + 1));
   auto fetch = [&](int x, int y) {
-    const float *p = &params.envmap_data[(y * w + x) * 3];
+    const float *p = &data[(y * w + x) * 3];
     return make_float3(p[0], p[1], p[2]);
   };
   float3 c00 = fetch(x0, y0);
@@ -470,8 +467,47 @@ static __device__ float3 world_background(float3 dir) {
   float3 c11 = fetch(x1, y1);
   float3 c0 = c00 * (1.0f - dx) + c10 * dx;
   float3 c1 = c01 * (1.0f - dx) + c11 * dx;
-  float3 col = c0 * (1.0f - dy) + c1 * dy;
-  return col * params.world_strength;
+  return c0 * (1.0f - dy) + c1 * dy;
+}
+
+// Build a 3×3 rotation matrix from `envmap_rotation_z_rad` for the legacy
+// single-envmap path so it can share `sample_equirect_layer`.
+static __forceinline__ __device__ void make_rotation_z(float angle,
+                                                        float (&m)[9]) {
+  float c = cosf(angle), s = sinf(angle);
+  m[0] = c; m[1] = -s; m[2] = 0;
+  m[3] = s; m[4] = c;  m[5] = 0;
+  m[6] = 0; m[7] = 0;  m[8] = 1;
+}
+
+static __device__ float3 world_background(float3 dir) {
+  if (params.world_type == 0) {
+    return make_f3(params.world_color) * params.world_strength;
+  }
+  // Single-envmap legacy path: rotation_z_rad → 3×3 matrix; world_strength
+  // applied as the only multiplier.
+  if (params.envmap_data_b == nullptr) {
+    float rot[9];
+    make_rotation_z(-params.envmap_rotation_z_rad, rot);
+    float3 col = sample_equirect_layer(params.envmap_data,
+                                       params.envmap_width,
+                                       params.envmap_height, rot, dir);
+    return col * params.world_strength;
+  }
+  // Mixed-envmap path: each layer has its own rotation + strength, blend
+  // via mix_fac.
+  float3 a =
+      sample_equirect_layer(params.envmap_data, params.envmap_width,
+                            params.envmap_height,
+                            params.envmap_rotation_a, dir) *
+      params.envmap_strength_a;
+  float3 b =
+      sample_equirect_layer(params.envmap_data_b, params.envmap_width_b,
+                            params.envmap_height_b,
+                            params.envmap_rotation_b, dir) *
+      params.envmap_strength_b;
+  float fac = params.envmap_mix_fac;
+  return a * (1.0f - fac) + b * fac;
 }
 
 static __device__ int cdf_search(const float *cdf, int n, float r) {
