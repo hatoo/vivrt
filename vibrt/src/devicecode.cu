@@ -2185,12 +2185,17 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
   unsigned int diffuse_bounces = 0;
   unsigned int glossy_bounces = 0;
   unsigned int transmission_bounces = 0;
-  // Filter-glossy floor for the path. Camera ray sees the BSDF at its
-  // authored roughness; once a glossy / transmission bounce is taken the
-  // floor rises so subsequent surfaces can't refocus the radiance into a
-  // sharper lobe than was already established. Cycles' default Light
-  // Paths > Filter Glossy of 1.0 corresponds roughly to alpha_min ≈ 0.05
-  // after the first glossy bounce.
+  // Filter-glossy state machine (mirrors Cycles' Light Paths > Filter
+  // Glossy). Track the smallest BSDF pdf the path has sampled at a
+  // glossy / transmission bounce. The next surface's BSDF α is clamped
+  // up by an amount that keeps its lobe at least as wide as
+  // 1/(filter_glossy · path_min_pdf) — concretely
+  // `min_alpha = sqrt(filter_glossy / path_min_pdf)`. Camera rays start
+  // with min_pdf=∞ → min_alpha=0 (no inflation), so primary visibility
+  // sees authored materials unmodified; only paths that already passed
+  // through a sharp lobe get blurred. Cycles' filter_glossy=0 short-
+  // circuits the inflation entirely.
+  float path_min_ray_pdf = 1e30f;
   float min_alpha = 0.0f;
   VolumeStack vstack;
   vstack.depth = 0;
@@ -2398,21 +2403,32 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
       glossy_bounces++;
       if (glossy_bounces > params.max_glossy_bounces)
         break;
-      // Bump the filter-glossy floor. 0.05 corresponds to roughness ≈
-      // 0.22, enough to materially widen a near-mirror lobe but not so
-      // wide it noticeably softens artist-authored matte gloss (whose
-      // roughness is already well above 0.22).
-      min_alpha = fmaxf(min_alpha, 0.05f);
     } else if (bs.lobe == LOBE_TRANSMISSION) {
       transmission_bounces++;
       if (transmission_bounces > params.max_transmission_bounces)
         break;
-      // Glass / refraction lobes also count for filter-glossy: each
-      // round-trip through pabellon's water plane was refocusing the
-      // sky reflection into a near-delta cone for the second bounce
-      // and beyond, lifting the foreground pool floor's apparent
-      // brightness well above Cycles' reference.
-      min_alpha = fmaxf(min_alpha, 0.05f);
+    }
+    // Update filter-glossy state. After every glossy / transmission
+    // bounce, narrow the path's pdf floor to the just-sampled value so
+    // the next surface's α is widened proportionally. Diffuse bounces
+    // don't update min_pdf because their pdf is already broad
+    // (cosine-weighted hemisphere integrates to 1).
+    if (params.filter_glossy > 0.0f
+        && (bs.lobe == LOBE_GLOSSY || bs.lobe == LOBE_TRANSMISSION)) {
+      path_min_ray_pdf = fminf(path_min_ray_pdf, bs.pdf);
+      // α_min = sqrt(filter_glossy / min_pdf). Cycles' filter_glossy of
+      // 1.0 with a typical glossy bounce pdf of 100 → α_min = 0.10
+      // (roughness ≈ 0.32). filter_glossy=5.0 (pabellon) gives α_min
+      // ≈ 0.22 (roughness ≈ 0.47) — substantial widening of any
+      // near-mirror lobe encountered downstream.
+      float new_min_alpha =
+          sqrtf(params.filter_glossy /
+                fmaxf(path_min_ray_pdf, 1e-6f));
+      // Cap at α=1 (roughness=1, fully diffuse-like) so high
+      // filter_glossy values on a very sharp bounce don't produce
+      // numerically silly alphas.
+      new_min_alpha = fminf(new_min_alpha, 1.0f);
+      min_alpha = fmaxf(min_alpha, new_min_alpha);
     }
 
     // Russian roulette after a few bounces

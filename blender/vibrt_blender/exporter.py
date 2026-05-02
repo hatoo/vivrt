@@ -1597,6 +1597,11 @@ def _export_into(
     # default (10.0) when Cycles is unavailable.
     cy_clamp_indirect = float(getattr(cy, "sample_clamp_indirect", 0.0)) if cy is not None else 0.0
     cy_clamp_direct = float(getattr(cy, "sample_clamp_direct", 0.0)) if cy is not None else 0.0
+    # Cycles' "Filter Glossy" parameter (cycles.blur_glossy). Pabellon
+    # ships it at 5.0; default for new scenes is 1.0. Used in the kernel
+    # to inflate subsequent BSDFs' alpha after glossy / transmission
+    # bounces, suppressing fireflies on caustic-prone paths.
+    cy_filter_glossy = float(getattr(cy, "blur_glossy", 0.0)) if cy is not None else 0.0
     user_clamp = float(scene.vibrt_clamp_indirect)
     # Pick the tightest non-zero clamp from Cycles + the vibrt user
     # property. 0 means "no clamp" in either system, so skip those.
@@ -1619,6 +1624,7 @@ def _export_into(
             "max_transmission_bounces": max_transmission,
             "clamp_indirect": clamp_indirect,
             "clamp_direct": cy_clamp_direct,
+            "filter_glossy": cy_filter_glossy,
         },
         "camera": _export_camera(scene, cam_obj, aspect),
         "meshes": meshes,

@@ -206,6 +206,10 @@ struct LaunchParams {
   // Clamp for direct (NEE on the camera ray's first surface). Mirrors
   // Cycles' `sample_clamp_direct`. <=0 disables.
   float clamp_direct;
+  // Cycles' Light Paths > Filter Glossy. Used by trace_path to track a
+  // per-path minimum BSDF α that grows after each glossy / transmission
+  // bounce, suppressing fireflies from caustic-prone paths. <=0 disables.
+  float filter_glossy;
 
   // Denoiser guide AOVs (optional; null when denoising is off). Each is one
   // float3 per pixel, captured from a single un-jittered primary ray.

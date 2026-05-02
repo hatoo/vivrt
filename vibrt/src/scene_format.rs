@@ -95,6 +95,14 @@ pub struct RenderSettings {
     /// luminance. Mirrors Cycles' `sample_clamp_direct`. 0 disables.
     #[serde(default)]
     pub clamp_direct: f32,
+    /// Cycles' Light Paths > Filter Glossy (`cycles.blur_glossy`).
+    /// Inflates BSDF roughness on subsequent bounces proportional to
+    /// `sqrt(filter_glossy / min_ray_pdf)` so a near-mirror lobe seen
+    /// after a previous glossy bounce can't refocus radiance into a
+    /// solid angle smaller than the path has already established. 0
+    /// disables. Cycles defaults to 1.0; pabellon ships at 5.0.
+    #[serde(default)]
+    pub filter_glossy: f32,
 }
 
 fn default_lobe_bounces() -> u32 {
