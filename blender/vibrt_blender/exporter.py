@@ -1055,14 +1055,27 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
         flat = np.empty(iw * ih * ch, dtype=np.float32)
         img_loaded.pixels.foreach_get(flat)
         arr = flat.reshape((ih, iw, ch))
-        # Mirror the bake horizontally: with rotation_euler=(-π/2, 0, 0)
-        # the bake's elevation axis matches our kernel's `theta=v*π`
-        # exactly, but the longitude axis wraps the OPPOSITE way (Cycles'
-        # equirect uses atan2(x_local, -z_local) which goes the reverse
-        # of our `phi = atan2(y_world, x_world)`). The mirror lines the
-        # two up so the extracted sun direction matches the Sky
-        # Texture's authored sun_rotation.
-        rgb = np.ascontiguousarray(arr[:, ::-1, :3], dtype=np.float32)
+        # Roll the bake +90° in azimuth (no mirror). Empirically validated
+        # via `scripts/_test_bake_orientation.py`, which builds a debug
+        # world that paints `+X→red, +Y→green, +Z→blue` and confirms
+        # cardinal-direction lookups match.
+        #
+        # Why: the bake camera uses `rotation_euler=(-π/2, 0, 0)` so its
+        # latitude axis lines up with the world Z axis (kernel's `theta=0`
+        # is +Z, the zenith). That same rotation lands the camera-forward
+        # `-Z_local` along world `+Y`, while Cycles' equirect places
+        # `phi_local=0` at camera-forward — so `u=0.5` in the bake stores
+        # world `+Y`, but the kernel reads `phi = atan2(dir.y, dir.x)`
+        # which expects `u=0` at world `+X` (and `u=0.25` at world `+Y`).
+        # Rolling the array right by `bw/4` shifts world `+Y` from u=0.5
+        # back to u=0.25, restoring the kernel's convention. The earlier
+        # `arr[:, ::-1]` mirror lined up Sky Texture's sun_rotation by
+        # accident but flipped the y axis (made +Y read as -Y from the
+        # kernel) for any general world graph.
+        bw = iw
+        roll = bw // 4
+        rgb = np.ascontiguousarray(np.roll(arr[..., :3], roll, axis=1),
+                                   dtype=np.float32)
     finally:
         try:
             if img_loaded is not None:
