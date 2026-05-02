@@ -22,14 +22,19 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
     bl_label = "vibrt"
     bl_use_preview = False
     bl_use_shading_nodes_custom = False
-    # Run Blender's compositor over our output. We populate Combined plus
-    # Mist (from primary-ray hit distance + world.mist_settings), Z (same
-    # depth), and Noisy Image (= Combined, so any Mix(Image, Noisy Image)
-    # idiom is a no-op). lone_monk's tree (Mist factor mix → Glare → Lens
-    # Distortion) needs these to actually produce its hazy/airy look; with
-    # them present, scenes whose compositor is empty / trivial render the
-    # same way they did when this flag was False.
-    bl_use_postprocess = True
+    # We populate the Combined / Mist / Z / Noisy Image passes so a scene's
+    # compositor *can* run on top of vibrt's output, but we leave the
+    # post-process flag off by default. The reason: scenes like lone_monk
+    # ship a compositor (Mist factor → ColorRamp → Exposure → Glare →
+    # Lens Distortion) calibrated against Cycles' underlying render
+    # brightness. Our path tracer's indirect-light intensity isn't yet a
+    # bit-for-bit match for Cycles, so the same compositor — driven by
+    # the same depth-derived Mist mask — produces a noticeably brighter
+    # result on vibrt's render than on Cycles'. To opt in (e.g. on a
+    # scene whose compositor is just bloom or denoise-mix), enable
+    # `Render → Post Processing → Compositing` in Blender's UI; we don't
+    # disable it for the user, just don't force it on either.
+    bl_use_postprocess = False
 
     def update(self, data=None, depsgraph=None):
         # `update()` is Blender's "prepare-to-render" hook. We use it to
