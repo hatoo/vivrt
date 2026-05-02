@@ -597,7 +597,10 @@ def _export_light(obj, writer, textures: list) -> dict | None:
             "radius": max(light.shadow_soft_size, 0.005),
         }
     if light.type == "SUN":
-        # Blender sun: local -Z is light direction in world
+        # Blender sun: local -Z is the direction photons travel (i.e.
+        # the forward / away-from-sun direction in world). Export that;
+        # `scene_loader.rs` negates to the toward-sun direction the
+        # kernel ultimately uses as `wi`.
         direction = [-obj.matrix_world[i][2] for i in range(3)]
         return {
             "type": "sun",
@@ -1285,13 +1288,11 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
     )
     return {
         "type": "sun",
-        # Direction the light *travels*: opposite of the "comes-from" vector.
-        # The kernel docstring claims `direction` points TO the light, but
-        # the empirical lone_monk Nishita case rendered correctly with the
-        # negated centroid — the trace_path codepath threads this value
-        # through `wi = T*sx + B*sy + dir*ct` and uses it as a ray
-        # direction, which actually wants the "from light" direction in
-        # the convention the existing scene_loader / tests use.
+        # Forward / photon-travel direction: opposite of the centroid
+        # (which points toward the bright bake pixels = toward the
+        # sun). `scene_loader.rs` negates this back to the toward-sun
+        # direction the kernel uses as `wi`. Keep the convention in
+        # sync with `_export_light` for SUN lamps.
         "direction": [-sun_dir[0], -sun_dir[1], -sun_dir[2]],
         "color": color,
         "strength": flux_max,
