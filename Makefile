@@ -43,7 +43,7 @@ DENOISE_FLAG := $(if $(strip $(DENOISE)),--denoise)
 ADDON_ZIP     := blender/vibrt_blender.zip
 ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
 
-.PHONY: all previews cycles-previews addon addon-with-native dev-install clean native-build test FORCE \
+.PHONY: all previews cycles-previews addon addon-with-native dev-install clean native-build test check-layouts FORCE \
         $(BLEND_PREVIEW_TARGETS) $(BLEND_CYCLES_TARGETS)
 
 FORCE:
@@ -51,11 +51,17 @@ FORCE:
 # Pure-Python unit tests (no Blender / CUDA required). Each test file
 # runs as a standalone script; we glob the directory so adding a new
 # test_*.py picks it up automatically.
-test:
+test: check-layouts
 	@for f in blender/vibrt_blender/test_*.py; do \
 		echo "=== $$f ==="; \
 		$(PYTHON) $$f || exit 1; \
 	done
+
+# Sanity-check that every #[repr(C)] struct in vibrt/src/gpu_types.rs
+# matches its declaration in vibrt/src/devicecode.h field-for-field.
+# Catches the silent depth_aov<->world_volume class of bug.
+check-layouts:
+	$(PYTHON) scripts/check_struct_layouts.py
 
 # Build the PyO3 extension and stage it next to the addon source. Cargo is
 # incremental, so this is a no-op when nothing changed. `make dev-install`
