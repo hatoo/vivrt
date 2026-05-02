@@ -568,11 +568,10 @@ pub fn render_to_pixels(
     let (world_type, world_color, world_strength) = match &scene.file.world {
         Some(scene_format::WorldDesc::Constant { color, strength }) => (0, *color, *strength),
         Some(scene_format::WorldDesc::Envmap { strength, .. }) => (1, [0.0; 3], *strength),
-        // TODO: phase 2 of option A — bake each layer separately and ship
-        // both to the GPU; until then `Mixed` falls through to a single
-        // envmap using only `a`'s texture so the path tracer still has a
-        // background to sample.
-        Some(scene_format::WorldDesc::Mixed { a, .. }) => (1, [0.0; 3], a.strength),
+        // For mixed worlds the per-layer strengths live on each
+        // EnvmapLayer; world_strength is unused on the kernel side
+        // (world_background takes the layer mix).
+        Some(scene_format::WorldDesc::Mixed { .. }) => (2, [0.0; 3], 1.0),
         None => (0, [0.0; 3], 0.0),
     };
     let envmap_rot = match &scene.file.world {
@@ -588,6 +587,36 @@ pub fn render_to_pixels(
             (d_env, *w as i32, *h as i32, d_m, d_c, total)
         } else {
             (0, 0, 0, 0, 0, 0.0)
+        };
+    // Mixed-envmap layers (uploaded only when WorldDesc::Mixed).
+    let (d_envmap_a, env_w_a, env_h_a) = if let Some((rgb, w, h)) =
+        &scene.envmap_layer_a_rgb
+    {
+        let d = alloc_and_copy_slice(&stream, rgb)?;
+        (d, *w as i32, *h as i32)
+    } else {
+        (0, 0, 0)
+    };
+    let (d_envmap_b, env_w_b, env_h_b) = if let Some((rgb, w, h)) =
+        &scene.envmap_layer_b_rgb
+    {
+        let d = alloc_and_copy_slice(&stream, rgb)?;
+        (d, *w as i32, *h as i32)
+    } else {
+        (0, 0, 0)
+    };
+    let (env_strength_a, env_strength_b, env_rot_a, env_rot_b, env_mix_fac) =
+        match &scene.file.world {
+            Some(scene_format::WorldDesc::Mixed { a, b, fac }) => (
+                a.strength, b.strength, a.rotation, b.rotation, *fac,
+            ),
+            _ => (
+                0.0,
+                0.0,
+                [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                0.0,
+            ),
         };
 
     // --- GGX LUTs ---
@@ -662,18 +691,17 @@ pub fn render_to_pixels(
         clamp_indirect: render_settings.clamp_indirect,
         clamp_direct: render_settings.clamp_direct,
         filter_glossy: render_settings.filter_glossy,
-        // Mixed-envmap layer B is unused until phase 3 of option A (the
-        // exporter doesn't yet emit `WorldDesc::Mixed`). Initialise to
-        // null/identity so the kernel's `world_background` falls
-        // through the legacy single-layer path: `envmap_data_b == nullptr`.
-        envmap_data_b: 0,
-        envmap_width_b: 0,
-        envmap_height_b: 0,
-        envmap_strength_a: world_strength,
-        envmap_strength_b: 0.0,
-        envmap_rotation_a: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        envmap_rotation_b: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        envmap_mix_fac: 0.0,
+        envmap_data_a: d_envmap_a,
+        envmap_width_a: env_w_a,
+        envmap_height_a: env_h_a,
+        envmap_data_b: d_envmap_b,
+        envmap_width_b: env_w_b,
+        envmap_height_b: env_h_b,
+        envmap_strength_a: env_strength_a,
+        envmap_strength_b: env_strength_b,
+        envmap_rotation_a: env_rot_a,
+        envmap_rotation_b: env_rot_b,
+        envmap_mix_fac: env_mix_fac,
         albedo_aov,
         normal_aov,
         depth_aov,

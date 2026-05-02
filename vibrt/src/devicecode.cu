@@ -484,30 +484,32 @@ static __device__ float3 world_background(float3 dir) {
   if (params.world_type == 0) {
     return make_f3(params.world_color) * params.world_strength;
   }
+  // Mixed-envmap path: each layer has its own rotation + strength, blend
+  // via mix_fac. `envmap_data` itself is the host-rasterised mixed grid
+  // (used by sample_envmap / envmap_pdf for importance sampling) — the
+  // actual radiance comes from the high-resolution per-layer textures.
+  if (params.envmap_data_a != nullptr && params.envmap_data_b != nullptr) {
+    float3 a =
+        sample_equirect_layer(params.envmap_data_a, params.envmap_width_a,
+                              params.envmap_height_a,
+                              params.envmap_rotation_a, dir) *
+        params.envmap_strength_a;
+    float3 b =
+        sample_equirect_layer(params.envmap_data_b, params.envmap_width_b,
+                              params.envmap_height_b,
+                              params.envmap_rotation_b, dir) *
+        params.envmap_strength_b;
+    float fac = params.envmap_mix_fac;
+    return a * (1.0f - fac) + b * fac;
+  }
   // Single-envmap legacy path: rotation_z_rad → 3×3 matrix; world_strength
   // applied as the only multiplier.
-  if (params.envmap_data_b == nullptr) {
-    float rot[9];
-    make_rotation_z(-params.envmap_rotation_z_rad, rot);
-    float3 col = sample_equirect_layer(params.envmap_data,
-                                       params.envmap_width,
-                                       params.envmap_height, rot, dir);
-    return col * params.world_strength;
-  }
-  // Mixed-envmap path: each layer has its own rotation + strength, blend
-  // via mix_fac.
-  float3 a =
-      sample_equirect_layer(params.envmap_data, params.envmap_width,
-                            params.envmap_height,
-                            params.envmap_rotation_a, dir) *
-      params.envmap_strength_a;
-  float3 b =
-      sample_equirect_layer(params.envmap_data_b, params.envmap_width_b,
-                            params.envmap_height_b,
-                            params.envmap_rotation_b, dir) *
-      params.envmap_strength_b;
-  float fac = params.envmap_mix_fac;
-  return a * (1.0f - fac) + b * fac;
+  float rot[9];
+  make_rotation_z(-params.envmap_rotation_z_rad, rot);
+  float3 col = sample_equirect_layer(params.envmap_data,
+                                     params.envmap_width,
+                                     params.envmap_height, rot, dir);
+  return col * params.world_strength;
 }
 
 static __device__ int cdf_search(const float *cdf, int n, float r) {
@@ -590,12 +592,30 @@ static __device__ EnvSample sample_envmap(RNG &rng) {
   float phi = u * 2.0f * M_PIf;
   float sin_t = sinf(theta);
   float3 d = make_float3(sin_t * cosf(phi), sin_t * sinf(phi), cosf(theta));
-  // Apply rotation (inverse of what we do in background lookup).
-  float c = cosf(params.envmap_rotation_z_rad);
-  float sr = sinf(params.envmap_rotation_z_rad);
-  s.dir = make_float3(d.x * c - d.y * sr, d.x * sr + d.y * c, d.z);
+  // Apply rotation (inverse of what we do in background lookup). For
+  // mixed-envmap worlds the rasterised CDF grid is in the world-space
+  // frame already (no per-layer rotation baked in), so skip the
+  // single-layer rotation correction.
+  if (params.envmap_data_a != nullptr && params.envmap_data_b != nullptr) {
+    s.dir = d;
+  } else {
+    float c = cosf(params.envmap_rotation_z_rad);
+    float sr = sinf(params.envmap_rotation_z_rad);
+    s.dir = make_float3(d.x * c - d.y * sr, d.x * sr + d.y * c, d.z);
+  }
+  // For mixed worlds, return the high-res per-layer radiance at the
+  // sampled direction (matches what BSDF-sampled miss paths see). For
+  // single-layer worlds, read directly from the CDF grid (= the only
+  // texture) so MC-tested unbiased behaviour stays bit-identical.
+  if (params.envmap_data_a != nullptr && params.envmap_data_b != nullptr) {
+    s.L = world_background(s.dir);
+  } else {
+    const float *px = &params.envmap_data[(y * w + x) * 3];
+    s.L = make_float3(px[0], px[1], px[2]) * params.world_strength;
+  }
+  // Read luminance for the pdf from the rasterised grid (which is
+  // mixed for mixed worlds, layer A's texture for single).
   const float *px = &params.envmap_data[(y * w + x) * 3];
-  s.L = make_float3(px[0], px[1], px[2]) * params.world_strength;
 
   // pdf is over raw texel luminance only — see envmap_pdf for the derivation.
   // Folding world_strength into `lum` here would cancel out of the

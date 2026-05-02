@@ -53,8 +53,17 @@ pub struct LoadedScene<'bin> {
     pub spot_lights: Vec<SpotLight>,
     pub rect_lights: Vec<AreaRectLight>,
     /// Envmap texture fully materialised (linear RGB only, width*height*3 floats).
+    /// For `Mixed` worlds this is the host-rasterised mix grid used for
+    /// the importance-sampling CDF; the two source layers live in
+    /// `envmap_layer_a_rgb` / `envmap_layer_b_rgb`. For single-layer
+    /// `Envmap` worlds `envmap_layer_*` are None.
     /// `None` if world is Constant.
     pub envmap_rgb: Option<(Vec<f32>, u32, u32)>,
+    /// Layer A's source texture for `Mixed` worlds (HDRI direct or Sky
+    /// Texture per-node bake). `None` for `Envmap` and `Constant`.
+    pub envmap_layer_a_rgb: Option<(Vec<f32>, u32, u32)>,
+    /// Layer B's source texture for `Mixed` worlds.
+    pub envmap_layer_b_rgb: Option<(Vec<f32>, u32, u32)>,
 }
 
 /// Parse an in-memory `scene.json` plus per-blob byte buffers into a
@@ -251,19 +260,9 @@ pub fn load_scene_from_bytes<'a>(
         }
     }
 
-    // Envmap: extract RGB (3 channels) from textures if world is an envmap.
-    // For `Mixed` worlds we currently use only layer `a`'s texture as the
-    // primary envmap — phase 2 of option A will load both layers and mix
-    // in the kernel; for now this falls back to single-layer behaviour so
-    // existing `Envmap` scenes are unaffected and `Mixed` scenes at least
-    // see one of the two backgrounds.
-    let envmap_tex_idx: Option<u32> = match &file.world {
-        Some(WorldDesc::Envmap { texture, .. }) => Some(*texture),
-        Some(WorldDesc::Mixed { a, .. }) => Some(a.texture),
-        _ => None,
-    };
-    let envmap_rgb = if let Some(idx) = envmap_tex_idx {
-        let idx = idx as usize;
+    // Envmap: extract RGB (3 channels) from textures.
+    let extract_rgb = |tex_idx: u32| -> anyhow::Result<(Vec<f32>, u32, u32)> {
+        let idx = tex_idx as usize;
         let tex = textures
             .get(idx)
             .ok_or_else(|| anyhow!("envmap texture index out of range: {}", idx))?;
@@ -273,9 +272,29 @@ pub fn load_scene_from_bytes<'a>(
             rgb.push(chunk[1]);
             rgb.push(chunk[2]);
         }
-        Some((rgb, tex.width, tex.height))
-    } else {
-        None
+        Ok((rgb, tex.width, tex.height))
+    };
+
+    let (envmap_rgb, envmap_layer_a_rgb, envmap_layer_b_rgb) = match &file.world {
+        Some(WorldDesc::Envmap { texture, .. }) => {
+            (Some(extract_rgb(*texture)?), None, None)
+        }
+        Some(WorldDesc::Mixed { a, b, fac }) => {
+            // Load both layers' source textures, then host-rasterise a
+            // 1024×512 "mixed grid" by sampling each layer at every
+            // pixel direction (with its rotation) and blending. The
+            // mixed grid drives the importance-sampling CDF; the kernel
+            // separately reads from `envmap_layer_*_rgb` for the
+            // actual high-resolution radiance per direction.
+            let layer_a = extract_rgb(a.texture)?;
+            let layer_b = extract_rgb(b.texture)?;
+            let mixed = build_mixed_envmap_grid(&layer_a, &a.rotation,
+                                                a.strength,
+                                                &layer_b, &b.rotation,
+                                                b.strength, *fac, 1024, 512);
+            (Some(mixed), Some(layer_a), Some(layer_b))
+        }
+        _ => (None, None, None),
     };
 
     Ok(LoadedScene {
@@ -288,7 +307,103 @@ pub fn load_scene_from_bytes<'a>(
         spot_lights,
         rect_lights,
         envmap_rgb,
+        envmap_layer_a_rgb,
+        envmap_layer_b_rgb,
     })
+}
+
+/// Bilinear-fetch (with u-wrap, v-clamp) at a world-space direction. Used
+/// host-side to sample each layer of a `WorldDesc::Mixed` when building
+/// the importance-sampling CDF grid.
+fn sample_layer_at_dir(
+    rgb: &[f32], w: u32, h: u32, rotation: &[f32; 9], dir: [f32; 3],
+) -> [f32; 3] {
+    let r = rotation;
+    let dr = [
+        r[0] * dir[0] + r[1] * dir[1] + r[2] * dir[2],
+        r[3] * dir[0] + r[4] * dir[1] + r[5] * dir[2],
+        r[6] * dir[0] + r[7] * dir[1] + r[8] * dir[2],
+    ];
+    let theta = dr[2].clamp(-1.0, 1.0).acos();
+    let phi = dr[1].atan2(dr[0]);
+    let mut u = phi * (0.5 / std::f32::consts::PI);
+    if u < 0.0 {
+        u += 1.0;
+    }
+    let v = theta / std::f32::consts::PI;
+    let fx = u * w as f32 - 0.5;
+    let fy = v * h as f32 - 0.5;
+    let x0 = fx.floor() as i32;
+    let y0 = fy.floor() as i32;
+    let dx = fx - x0 as f32;
+    let dy = fy - y0 as f32;
+    let wrap = |v: i32, m: u32| -> u32 {
+        let m_ = m as i32;
+        let r = v % m_;
+        if r < 0 { (r + m_) as u32 } else { r as u32 }
+    };
+    let x1 = wrap(x0 + 1, w);
+    let x0u = wrap(x0, w);
+    let y0u = (y0.max(0).min(h as i32 - 1)) as u32;
+    let y1u = ((y0 + 1).max(0).min(h as i32 - 1)) as u32;
+    let fetch = |x: u32, y: u32| -> [f32; 3] {
+        let i = ((y * w + x) * 3) as usize;
+        [rgb[i], rgb[i + 1], rgb[i + 2]]
+    };
+    let c00 = fetch(x0u, y0u);
+    let c10 = fetch(x1, y0u);
+    let c01 = fetch(x0u, y1u);
+    let c11 = fetch(x1, y1u);
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| {
+        [a[0] + (b[0] - a[0]) * t,
+         a[1] + (b[1] - a[1]) * t,
+         a[2] + (b[2] - a[2]) * t]
+    };
+    let c0 = lerp(c00, c10, dx);
+    let c1 = lerp(c01, c11, dx);
+    lerp(c0, c1, dy)
+}
+
+/// Rasterise the (1−fac)·a + fac·b mix of two envmap layers at the
+/// given target resolution. Used to drive the importance-sampling CDF
+/// for `WorldDesc::Mixed` worlds.
+fn build_mixed_envmap_grid(
+    layer_a: &(Vec<f32>, u32, u32), rot_a: &[f32; 9], strength_a: f32,
+    layer_b: &(Vec<f32>, u32, u32), rot_b: &[f32; 9], strength_b: f32,
+    fac: f32, target_w: u32, target_h: u32,
+) -> (Vec<f32>, u32, u32) {
+    use rayon::prelude::*;
+    let pi = std::f32::consts::PI;
+    let inv_w = 1.0 / target_w as f32;
+    let inv_h = 1.0 / target_h as f32;
+    let (a_rgb, a_w, a_h) = layer_a;
+    let (b_rgb, b_w, b_h) = layer_b;
+    // Parallelise per-row; each row is independent.
+    let mut grid = vec![0.0f32; (target_w * target_h * 3) as usize];
+    grid.par_chunks_mut((target_w * 3) as usize)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let v = (y as f32 + 0.5) * inv_h;
+            let theta = v * pi;
+            let sin_t = theta.sin();
+            let cos_t = theta.cos();
+            for x in 0..target_w {
+                let u = (x as f32 + 0.5) * inv_w;
+                let phi = u * 2.0 * pi;
+                let dir = [sin_t * phi.cos(), sin_t * phi.sin(), cos_t];
+                let a = sample_layer_at_dir(a_rgb, *a_w, *a_h, rot_a, dir);
+                let b = sample_layer_at_dir(b_rgb, *b_w, *b_h, rot_b, dir);
+                let i = (x * 3) as usize;
+                let one_minus_fac = 1.0 - fac;
+                row[i] = a[0] * strength_a * one_minus_fac
+                       + b[0] * strength_b * fac;
+                row[i + 1] = a[1] * strength_a * one_minus_fac
+                           + b[1] * strength_b * fac;
+                row[i + 2] = a[2] * strength_a * one_minus_fac
+                           + b[2] * strength_b * fac;
+            }
+        });
+    (grid, target_w, target_h)
 }
 
 /// Pick a blob from `mesh_blobs` by index. Bounded error on overflow.

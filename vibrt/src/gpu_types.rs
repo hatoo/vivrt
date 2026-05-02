@@ -274,13 +274,17 @@ pub struct LaunchParams {
     pub envmap_conditional_cdf: optix_sys::CUdeviceptr,
     pub envmap_integral: f32,
     pub envmap_rotation_z_rad: f32,
-    /// Optional second layer for mixed envmaps (`world_type=2`). When
-    /// `envmap_data_b` is null, the kernel treats the world as
-    /// single-layer (legacy `Envmap` behaviour). The two layers are
-    /// blended by `mix_fac` in the kernel: `world(dir) = (1−fac)·a +
-    /// fac·b`. Each layer carries its own per-component rotation as a
-    /// 3×3 row-major matrix so HDRIs with `Mapping` rotations sample at
-    /// native resolution without a Cycles bake.
+    /// Mixed-envmap layer storage (`world_type=2`). When both
+    /// `envmap_data_a` and `envmap_data_b` are non-null the kernel
+    /// blends them in `world_background` by `mix_fac` after applying
+    /// each layer's own 3×3 row-major rotation. `envmap_data` itself
+    /// is the host-rasterised mixed grid used for the importance-
+    /// sampling CDF / pdf — the two layer pointers feed the high-res
+    /// per-direction radiance lookup, while CDF lookups still go
+    /// through the (lower-res) `envmap_data`.
+    pub envmap_data_a: optix_sys::CUdeviceptr,
+    pub envmap_width_a: i32,
+    pub envmap_height_a: i32,
     pub envmap_data_b: optix_sys::CUdeviceptr,
     pub envmap_width_b: i32,
     pub envmap_height_b: i32,

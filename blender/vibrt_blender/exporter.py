@@ -715,6 +715,222 @@ def _world_generic_cache_key(world) -> str:
     return f"__world_full__{world.name}__1024x512"
 
 
+def _sky_node_alone_cache_key(world, sky_node) -> str:
+    """Cache key for a per-Sky-node bake (a Sky Texture inside a
+    MixShader, baked in isolation so option-A's Mixed envmap path can
+    sample each layer at native resolution without paying for a
+    combined-world bake)."""
+    sun_rot = float(getattr(sky_node, "sun_rotation", 0.0))
+    sun_elev = float(getattr(sky_node, "sun_elevation", 0.0))
+    sun_size = float(getattr(sky_node, "sun_size", 0.0))
+    sun_disc = bool(getattr(sky_node, "sun_disc", False))
+    sky_type = getattr(sky_node, "sky_type", "?")
+    return (f"__sky_alone__{world.name}__{sky_node.name}__{sky_type}__"
+            f"{sun_rot}__{sun_elev}__{sun_size}__{sun_disc}__1024x512")
+
+
+def _detect_mix_world(world):
+    """If the world's Surface is `MixShader(Background, Background, fac=const)`,
+    return `(bg_a, bg_b, fac)`. Otherwise None.
+
+    Both Backgrounds must drive their Color from a recognised source
+    (`ShaderNodeTexEnvironment` with an image, or `ShaderNodeTexSky`).
+    Linked / non-foldable Mix factors fall through to None — the caller
+    then takes the existing full-bake path.
+    """
+    if world is None or not world.use_nodes or world.node_tree is None:
+        return None
+    out = world.node_tree.nodes.get("World Output") or next(
+        (n for n in world.node_tree.nodes
+         if n.bl_idname == "ShaderNodeOutputWorld"),
+        None,
+    )
+    if out is None:
+        return None
+    surf = out.inputs.get("Surface")
+    if surf is None or not surf.is_linked:
+        return None
+    src = surf.links[0].from_node
+    if src.bl_idname != "ShaderNodeMixShader":
+        return None
+    fac_sock = src.inputs[0]
+    if fac_sock.is_linked:
+        return None
+    fac = float(fac_sock.default_value)
+    in1 = src.inputs[1]
+    in2 = src.inputs[2]
+    if not in1.is_linked or not in2.is_linked:
+        return None
+    bg_a = in1.links[0].from_node
+    bg_b = in2.links[0].from_node
+    if bg_a.bl_idname != "ShaderNodeBackground":
+        return None
+    if bg_b.bl_idname != "ShaderNodeBackground":
+        return None
+    return bg_a, bg_b, fac
+
+
+def _walk_world_for_sky_nodes(world):
+    """Return every `ShaderNodeTexSky` reachable from the world's surface
+    output. Used so the prebake step can render each Sky in isolation
+    when it's wrapped inside a MixShader (pabellon's sunset world
+    blends a Sky Texture with an HDRI backplate)."""
+    if world is None or not world.use_nodes or world.node_tree is None:
+        return []
+    return [n for n in world.node_tree.nodes
+            if n.bl_idname == "ShaderNodeTexSky"]
+
+
+def _euler_xyz_to_matrix3(rx, ry, rz):
+    """Compose a 3×3 row-major rotation matrix from intrinsic XYZ Euler
+    angles (Blender's default for Mapping rotation). Matches
+    `mathutils.Euler((rx,ry,rz), 'XYZ').to_matrix()`."""
+    import math
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    # R = Rz · Ry · Rx (intrinsic XYZ = Rx then Ry then Rz applied to vector)
+    # Combined manually:
+    m = [
+        cy * cz,        sx * sy * cz - cx * sz,  cx * sy * cz + sx * sz,
+        cy * sz,        sx * sy * sz + cx * cz,  cx * sy * sz - sx * cz,
+        -sy,            sx * cy,                  cx * cy,
+    ]
+    return [float(v) for v in m]
+
+
+_IDENTITY_3X3 = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+
+
+def _mapping_rotation_matrix(mapping_node):
+    """Extract a 3×3 row-major rotation matrix from a `ShaderNodeMapping`
+    node, or identity if the node has any non-rotation transform we
+    can't fold (location / non-unit scale)."""
+    if mapping_node is None:
+        return list(_IDENTITY_3X3)
+    rot_sock = mapping_node.inputs.get("Rotation")
+    if rot_sock is None:
+        return list(_IDENTITY_3X3)
+    rx, ry, rz = rot_sock.default_value
+    return _euler_xyz_to_matrix3(float(rx), float(ry), float(rz))
+
+
+def _try_export_layer_from_background(world, bg_node, writer, textures):
+    """Convert one `ShaderNodeBackground` into the dict shape that
+    `WorldDesc::Mixed.{a,b}` expects (texture id + 3×3 rotation +
+    strength). Returns None when the background's source isn't one of
+    the recognised options (TexEnvironment with image, TexSky cached)."""
+    strength_sock = bg_node.inputs.get("Strength")
+    if strength_sock is not None and strength_sock.is_linked:
+        # A linked Strength can't be folded into a constant — bail to
+        # the full-bake path so the artist's animation still reads.
+        return None
+    strength = (float(strength_sock.default_value)
+                if strength_sock is not None else 1.0)
+    color_sock = bg_node.inputs.get("Color")
+    if color_sock is None or not color_sock.is_linked:
+        return None
+    src = color_sock.links[0].from_node
+    if src.bl_idname in ("ShaderNodeTexEnvironment", "ShaderNodeTexImage"):
+        # Both nodes feed an image into the Color socket of a Background;
+        # in pabellon's sunset world the HDRI is a TexImage; in cleaner
+        # scenes it'd be TexEnvironment. Either is fine for our
+        # equirect lookup since we drive the sample direction from the
+        # world ray ourselves.
+        if src.image is None:
+            return None
+        # Walk back through an optional Mapping → TexCoord chain to
+        # collect the rotation. Cycles Mapping (type='Point' default)
+        # applies `R · v` to the input vector, so the kernel — which
+        # also pre-multiplies the sample direction by `rotation` —
+        # gets the same `R` we extract here. Non-unit scale and
+        # non-zero location aren't representable as a 3×3 alone and
+        # are silently ignored (rare on world-shader Mapping nodes).
+        rotation = list(_IDENTITY_3X3)
+        vec_sock = src.inputs.get("Vector")
+        if vec_sock is not None and vec_sock.is_linked:
+            mapping = vec_sock.links[0].from_node
+            if mapping.bl_idname == "ShaderNodeMapping":
+                rotation = _mapping_rotation_matrix(mapping)
+        # Linear colorspace for HDRI assets that ship as EXR / HDR;
+        # SRGB images get linearised at scene-load.
+        colorspace = (
+            "srgb" if src.image.colorspace_settings.name.lower().startswith("srgb")
+            else "linear"
+        )
+        tex_id = material_export.export_image_texture(
+            src.image, writer, textures, colorspace=colorspace
+        )
+        return {
+            "texture": int(tex_id),
+            "rotation": rotation,
+            "strength": strength,
+        }
+    if src.bl_idname == "ShaderNodeTexSky":
+        key = _sky_node_alone_cache_key(world, src)
+        baked = _SKY_BAKE_CACHE.get(key)
+        if baked is None:
+            return None
+        rgb, bw, bh, _sun = baked
+        pb = material_export._PreBakedTexture(
+            rgb=rgb, w=bw, h=bh, cache_key=key,
+        )
+        tex_id = material_export.export_image_texture(
+            pb, writer, textures, colorspace="linear"
+        )
+        return {
+            "texture": int(tex_id),
+            "rotation": list(_IDENTITY_3X3),
+            "strength": strength,
+        }
+    return None
+
+
+def _try_export_mixed_world(world, mix_pat, writer, textures, lights_json):
+    """Emit `WorldDesc::Mixed` for a world whose surface matches
+    `MixShader(Background_a, Background_b, fac=const)`. Returns None
+    when either layer can't be converted, so the caller falls back to
+    the legacy combined-bake path."""
+    bg_a, bg_b, fac = mix_pat
+    layer_a = _try_export_layer_from_background(world, bg_a, writer, textures)
+    if layer_a is None:
+        return None
+    layer_b = _try_export_layer_from_background(world, bg_b, writer, textures)
+    if layer_b is None:
+        return None
+    # Sun lights extracted from per-Sky bakes ride alongside the Mixed
+    # envmap; their strength was already scaled by the Sky's
+    # Background.Strength when extracted, so no further scaling here.
+    if lights_json is not None:
+        for bg in (bg_a, bg_b):
+            color_sock = bg.inputs.get("Color")
+            if color_sock is None or not color_sock.is_linked:
+                continue
+            src = color_sock.links[0].from_node
+            if src.bl_idname != "ShaderNodeTexSky":
+                continue
+            key = _sky_node_alone_cache_key(world, src)
+            baked = _SKY_BAKE_CACHE.get(key)
+            if baked is None:
+                continue
+            _rgb, _bw, _bh, sun_light = baked
+            if sun_light is not None:
+                lights_json.append(dict(sun_light))
+    _emit(
+        f"[vibrt] world {world.name!r}: emitting Mixed envmap "
+        f"(a={'sky' if bg_a.inputs['Color'].links[0].from_node.bl_idname == 'ShaderNodeTexSky' else 'image'} "
+        f"strength={layer_a['strength']:.2f}, "
+        f"b={'sky' if bg_b.inputs['Color'].links[0].from_node.bl_idname == 'ShaderNodeTexSky' else 'image'} "
+        f"strength={layer_b['strength']:.2f}, fac={fac:.3f})"
+    )
+    return {
+        "type": "mixed",
+        "a": layer_a,
+        "b": layer_b,
+        "fac": float(fac),
+    }
+
+
 def _world_needs_full_bake(world) -> bool:
     """True when the world's shader graph isn't a plain
     `ShaderNodeBackground -> Output.Surface`. Catches the
@@ -763,8 +979,77 @@ def prebake_sky_envmaps_for_world(world, w: int = 2048, h: int = 1024) -> None:
     if sky is not None:
         _prebake_sky_texture(world, sky, w=w, h=h)
         return
+    # If the world surface is `MixShader(Background_a, Background_b, fac=const)`,
+    # bake each Sky Texture present in either branch separately so the
+    # exporter's option-A path can emit `WorldDesc::Mixed` with per-layer
+    # native-resolution textures. The full-world bake fallback below is
+    # still kept for any topology we don't recognise.
+    mix_pat = _detect_mix_world(world)
+    if mix_pat is not None:
+        for sky_node in _walk_world_for_sky_nodes(world):
+            _prebake_sky_node_alone(world, sky_node, w=w, h=h)
+        return
     if _world_needs_full_bake(world):
         _prebake_world_full(world, w=w, h=h)
+
+
+def _prebake_sky_node_alone(world, sky_node, w: int, h: int) -> None:
+    """Bake a single Sky Texture node in isolation (its own temp world
+    with `Output → Background → Sky`) so option-A's Mixed envmap can
+    pick it up as one layer without re-rendering the whole world graph.
+    Cached by Sky-node identity in `_SKY_BAKE_CACHE`."""
+    key = _sky_node_alone_cache_key(world, sky_node)
+    if key in _SKY_BAKE_CACHE:
+        return
+    t0 = time.perf_counter()
+    # Build a temp world with a single Background → this Sky Texture.
+    # We can't render `world` directly because it's a MixShader of two
+    # Backgrounds; we want only the Sky's contribution, so a fresh tiny
+    # world tree gets fed to `_bake_sky_world_to_pixels`.
+    tmp_world = bpy.data.worlds.new(f"__vibrt_sky_alone_{sky_node.name}")
+    tmp_world.use_nodes = True
+    nt = tmp_world.node_tree
+    nt.nodes.clear()
+    out_n = nt.nodes.new("ShaderNodeOutputWorld")
+    bg = nt.nodes.new("ShaderNodeBackground")
+    bg.inputs["Strength"].default_value = 1.0
+    sky_clone = nt.nodes.new("ShaderNodeTexSky")
+    # Copy the Sky Texture's relevant attributes onto the clone so the
+    # bake reproduces what the original node would emit.
+    for attr in ("sky_type", "sun_disc", "sun_size", "sun_intensity",
+                 "sun_elevation", "sun_rotation", "altitude",
+                 "air_density", "dust_density", "ozone_density",
+                 "ground_albedo", "turbidity"):
+        if hasattr(sky_node, attr) and hasattr(sky_clone, attr):
+            try:
+                setattr(sky_clone, attr, getattr(sky_node, attr))
+            except (TypeError, AttributeError):
+                pass
+    nt.links.new(sky_clone.outputs["Color"], bg.inputs["Color"])
+    nt.links.new(bg.outputs["Background"], out_n.inputs["Surface"])
+    try:
+        baked = _bake_sky_world_to_pixels(tmp_world, w=w, h=h)
+    except Exception as ex:
+        _emit(
+            f"[vibrt] warn: world {world.name!r}: failed to bake Sky "
+            f"node {sky_node.name!r} alone: {ex} — Mixed envmap will "
+            f"miss this layer's contribution"
+        )
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    if baked is None:
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    rgb, bw, bh = baked
+    sun_light = _extract_sun_from_bake_inplace(rgb, bw, bh, sky_node, world.name)
+    _SKY_BAKE_CACHE[key] = (rgb, bw, bh, sun_light)
+    _emit(
+        f"[vibrt] world {world.name!r}: pre-baked Sky node {sky_node.name!r} "
+        f"alone ({sky_node.sky_type}) to {bw}x{bh} envmap in "
+        f"{time.perf_counter() - t0:.2f}s"
+        + (" + extracted sun" if sun_light is not None else "")
+    )
+    bpy.data.worlds.remove(tmp_world, do_unlink=True)
 
 
 def _prebake_sky_texture(world, sky, w: int, h: int) -> None:
@@ -1271,6 +1556,19 @@ def _export_world(world, writer, textures: list, lights_json: list | None = None
                     f"ShaderNodeTexEnvironment) — using constant default"
                 )
         return {"type": "constant", "color": col, "strength": float(strength)}
+
+    # Option A: detect `MixShader(Background_a, Background_b, fac=const)`
+    # and emit `WorldDesc::Mixed` so each layer can be sampled at its
+    # native resolution (HDRI direct, Sky Texture per-node bake) instead
+    # of the combined world bake we used to fall back to.
+    mix_pat = _detect_mix_world(world)
+    if mix_pat is not None:
+        mixed = _try_export_mixed_world(world, mix_pat, writer, textures,
+                                         lights_json)
+        if mixed is not None:
+            return mixed
+        # If conversion failed (unsupported source on a layer), fall
+        # through to the legacy combined-bake path below.
 
     # Surface is driven by something we don't fold host-side (MixShader,
     # nested colour math, …). Look for a generic full-world bake the

@@ -197,11 +197,16 @@ struct LaunchParams {
   float *envmap_conditional_cdf;
   float envmap_integral;
   float envmap_rotation_z_rad;
-  // Mixed-envmap (world_type=2) state. Layer A is the existing
-  // envmap_data; layer B lives in envmap_data_b. nullptr on layer B
-  // means single-layer (legacy `Envmap`) behaviour. Per-layer rotations
-  // are 3×3 row-major matrices applied to the world-space sample
-  // direction before the equirect lookup.
+  // Mixed-envmap state (world_type=2). When `envmap_data_a` and
+  // `envmap_data_b` are both non-null the kernel mixes them in
+  // `world_background`. `envmap_data` (above) is the host-rasterised
+  // mixed grid that drives the importance-sampling CDF / pdf — the
+  // per-layer pointers feed the high-resolution per-direction radiance
+  // lookup. Per-layer rotations are 3×3 row-major matrices applied to
+  // the world-space sample direction before the equirect lookup.
+  float *envmap_data_a;
+  int envmap_width_a;
+  int envmap_height_a;
   float *envmap_data_b;
   int envmap_width_b;
   int envmap_height_b;
