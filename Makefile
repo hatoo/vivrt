@@ -30,8 +30,9 @@ BLEND_SCENE_classroom := test_scenes/classroom/classroom/classroom.blend
 BLEND_SCENE_bmw27     := test_scenes/bmw27/bmw27/bmw27_gpu.blend
 BLEND_SCENE_junk_shop := test_scenes/junk_shop/junk_shop/junk_shop.blend
 BLEND_SCENE_lone_monk := test_scenes/lone_monk/lone_monk/lone_monk.blend
+BLEND_SCENE_pabellon  := test_scenes/pabellon/3d/pavillon_barcelone_v1.2.blend
 
-BLEND_SCENES          := classroom bmw27 junk_shop lone_monk
+BLEND_SCENES          := classroom bmw27 junk_shop lone_monk pabellon
 BLEND_PREVIEW_PNGS    := $(foreach s,$(BLEND_SCENES),test_scenes/$(s)/preview.png)
 BLEND_PREVIEW_TARGETS := $(addsuffix -preview,$(BLEND_SCENES))
 BLEND_CYCLES_PNGS     := $(foreach s,$(BLEND_SCENES),test_scenes/$(s)/preview_cycles.png)

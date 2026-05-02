@@ -705,18 +705,69 @@ def _world_sky_node(world):
     return src
 
 
-def prebake_sky_envmaps_for_world(world, w: int = 1024, h: int = 512) -> None:
-    """If `world`'s Background.Color is driven by a ShaderNodeTexSky, bake
-    it into `_SKY_BAKE_CACHE`. Safe to call repeatedly: returns early on
-    cache hit. Must be called from `RenderEngine.update()` (or other
-    non-render context) — see _SKY_BAKE_CACHE comment.
+def _world_generic_cache_key(world) -> str:
+    """Cache key for a "bake the entire world" envmap. Used when
+    `_export_world` can't recognise the world's shader graph (MixShader,
+    nested colour math, etc.). The cache is cleared between renders so
+    we just key on the world name — graph mutations within one render
+    are unsupported anyway.
+    """
+    return f"__world_full__{world.name}__1024x512"
 
-    No-op for worlds that don't use Sky Texture, so engine.py can call
-    this unconditionally before every render.
+
+def _world_needs_full_bake(world) -> bool:
+    """True when the world's shader graph isn't a plain
+    `ShaderNodeBackground -> Output.Surface`. Catches the
+    `MixShader(Background_a, Background_b)` pattern that scenes like
+    pabellon_barcelona use to blend a Sky Texture with a curve-shifted
+    duplicate, and falls through any other unrecognised topology to a
+    Cycles-evaluated equirect bake instead of the
+    "treat-world-as-black" branch in `_export_world`.
+    """
+    if world is None or not world.use_nodes or world.node_tree is None:
+        return False
+    out = world.node_tree.nodes.get("World Output") or next(
+        (n for n in world.node_tree.nodes
+         if n.bl_idname == "ShaderNodeOutputWorld"),
+        None,
+    )
+    if out is None:
+        return False
+    surf = out.inputs.get("Surface")
+    if surf is None or not surf.is_linked:
+        return False
+    return surf.links[0].from_node.bl_idname != "ShaderNodeBackground"
+
+
+def prebake_sky_envmaps_for_world(world, w: int = 1024, h: int = 512) -> None:
+    """Bake a world's environment into `_SKY_BAKE_CACHE` so the exporter
+    has equirect pixels ready by the time it runs. Two paths share this
+    cache:
+
+    1. The world's Background.Color is driven by a ShaderNodeTexSky →
+       bake the procedural sky and split out the sun disc as a delta
+       sun light (firefly mitigation).
+    2. The world's Surface is driven by anything else we can't fold
+       host-side (MixShader, nested colour math, …) → bake the whole
+       world via Cycles and use the result as a plain envmap.
+       pabellon_barcelona's `mid day` / `sunset` / `night` worlds all
+       hit this path because their surface is a MixShader of two
+       Backgrounds, not a single Background.
+
+    Safe to call repeatedly: returns early on cache hit. Must be called
+    from `RenderEngine.update()` (or other non-render context) — Blender
+    silently produces an all-zero image for nested renders started from
+    inside `render()`.
     """
     sky = _world_sky_node(world)
-    if sky is None:
+    if sky is not None:
+        _prebake_sky_texture(world, sky, w=w, h=h)
         return
+    if _world_needs_full_bake(world):
+        _prebake_world_full(world, w=w, h=h)
+
+
+def _prebake_sky_texture(world, sky, w: int, h: int) -> None:
     key = _sky_node_cache_key(world, sky)
     if key in _SKY_BAKE_CACHE:
         return
@@ -737,11 +788,6 @@ def prebake_sky_envmaps_for_world(world, w: int = 1024, h: int = 512) -> None:
             f"will fall back to constant"
         )
         return
-    # Split the sun out of the bake: super-bright pixels (the disc) are
-    # impossible to importance-sample cleanly through an equirect — they
-    # blow up NEE/BSDF MIS into vertical firefly streaks. Cycles handles
-    # this internally by emitting the sun as a dedicated delta-direction
-    # sun light *in addition* to the procedural sky; we mirror that.
     rgb, bw, bh = baked
     sun_light = _extract_sun_from_bake_inplace(rgb, bw, bh, sky, world.name)
     _SKY_BAKE_CACHE[key] = (rgb, bw, bh, sun_light)
@@ -749,6 +795,38 @@ def prebake_sky_envmaps_for_world(world, w: int = 1024, h: int = 512) -> None:
         f"[vibrt] world {world.name!r}: pre-baked ShaderNodeTexSky "
         f"({sky.sky_type}) to a {baked[1]}x{baked[2]} envmap in "
         f"{time.perf_counter() - t0:.2f}s"
+    )
+
+
+def _prebake_world_full(world, w: int, h: int) -> None:
+    key = _world_generic_cache_key(world)
+    if key in _SKY_BAKE_CACHE:
+        return
+    t0 = time.perf_counter()
+    try:
+        baked = _bake_sky_world_to_pixels(world, w=w, h=h)
+    except Exception as ex:
+        _emit(
+            f"[vibrt] warn: world {world.name!r}: failed to bake "
+            f"complex world graph via Cycles in update(): {ex} — "
+            f"world background will fall back to constant"
+        )
+        return
+    if baked is None:
+        _emit(
+            f"[vibrt] warn: world {world.name!r}: complex world bake "
+            f"produced no pixels — world background will fall back to "
+            f"constant"
+        )
+        return
+    rgb, bw, bh = baked
+    # No sun split for complex bakes: the bright-pixel heuristic is
+    # tuned for Sky Texture's sun_disc, and a curve-shifted MixShader
+    # blend may have spurious bright spots that aren't really a sun.
+    _SKY_BAKE_CACHE[key] = (rgb, bw, bh, None)
+    _emit(
+        f"[vibrt] world {world.name!r}: pre-baked complex world graph "
+        f"to a {bw}x{bh} envmap in {time.perf_counter() - t0:.2f}s"
     )
 
 
@@ -1140,9 +1218,34 @@ def _export_world(world, writer, textures: list, lights_json: list | None = None
                 )
         return {"type": "constant", "color": col, "strength": float(strength)}
 
+    # Surface is driven by something we don't fold host-side (MixShader,
+    # nested colour math, …). Look for a generic full-world bake the
+    # prebake step should have left behind, and emit it as a plain
+    # envmap. Strength=1 because the bake captured the world's
+    # Cycles-evaluated output already.
+    full_key = _world_generic_cache_key(world)
+    full_baked = _SKY_BAKE_CACHE.get(full_key)
+    if full_baked is not None:
+        rgb, bw, bh, sun_light = full_baked
+        pb = material_export._PreBakedTexture(
+            rgb=rgb, w=bw, h=bh, cache_key=full_key,
+        )
+        tex_id = material_export.export_image_texture(
+            pb, writer, textures, colorspace="linear"
+        )
+        if sun_light is not None and lights_json is not None:
+            lights_json.append(dict(sun_light))
+        return {
+            "type": "envmap",
+            "texture": tex_id,
+            "rotation_z_rad": 0.0,
+            "strength": 1.0,
+        }
+
     _emit(
         f"[vibrt] warn: world {world.name!r}: World Output Surface driven by "
-        f"{src.bl_idname} (expected ShaderNodeBackground) — world treated as black"
+        f"{src.bl_idname} (expected ShaderNodeBackground) and no generic "
+        f"bake was cached — world treated as black"
     )
     return {"type": "constant", "color": [0, 0, 0], "strength": 0.0}
 
