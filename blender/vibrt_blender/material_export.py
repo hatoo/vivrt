@@ -490,6 +490,26 @@ def _ramp_mean_color(ramp) -> list[float]:
     return [v / n for v in acc]
 
 
+def _bake_ramp_to_lut(ramp, n_stops: int = 256) -> list[float]:
+    """Sample a ColorRamp at `n_stops` evenly-spaced positions in [0..1]
+    and return a flat list of `n_stops × 3` linear-RGB floats. Layout
+    matches `ColorNode::ColorRamp.lut` on the renderer side: each stop's
+    RGB sits in three consecutive entries (index `i*3+c`).
+
+    The Cycles ColorRamp evaluates in linear-light space already (the
+    `color_ramp.evaluate()` API returns RGBA in scene-linear), so no
+    sRGB conversion is needed before upload.
+    """
+    out: list[float] = []
+    for i in range(n_stops):
+        t = i / max(1, n_stops - 1)
+        c = ramp.evaluate(t)
+        out.append(float(c[0]))
+        out.append(float(c[1]))
+        out.append(float(c[2]))
+    return out
+
+
 def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
     """Strict scalar fold: refuses texture means / procedural mean-colour
     approximations so callers can distinguish a real constant from a guess.
@@ -2943,6 +2963,23 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
             memo[key] = idx
             return idx
 
+        if bl in ("ShaderNodeObjectInfo", "ShaderNodeNewGeometry") or (
+            bl == "ShaderNodeParticleInfo" and link.from_socket.name == "Random"
+        ):
+            # Per-instance uniform random — Cycles' canonical hook for "vary
+            # this per particle". Only the Random output (or Random Per
+            # Island on Geometry) is supported; Location / Index / Age /
+            # etc. would each need their own slot in PathVertex.
+            out_name = link.from_socket.name
+            if (bl == "ShaderNodeObjectInfo" and out_name == "Random") or (
+                bl == "ShaderNodeNewGeometry" and out_name == "Random Per Island"
+            ) or (bl == "ShaderNodeParticleInfo" and out_name == "Random"):
+                idx = len(nodes)
+                nodes.append({"type": "object_random"})
+                memo[key] = idx
+                return idx
+            return None
+
         if bl == "ShaderNodeValToRGB":
             # ColorRamp: scalar in, RGB out. We fold it to a Const node when
             # the Fac chain reduces to a constant (noise / procedural leaves
@@ -2954,12 +2991,16 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
             in_sock = src.inputs.get("Fac")
             if in_sock is None:
                 return None
-            # Per-instance uniform random → integrate the ramp instead of
-            # sampling at the midpoint (matches `_resolve_constant_socket`).
+            # Per-instance uniform random — emit a real ColorRamp graph node
+            # backed by an `object_random` source so each instance picks a
+            # different colour. Without this the ramp collapses to its mean
+            # and every leaf in a particle system shares the same tint.
             if _socket_is_uniform_random_01(in_sock):
-                color = _ramp_mean_color(src.color_ramp)
+                rand_idx = len(nodes)
+                nodes.append({"type": "object_random"})
+                lut = _bake_ramp_to_lut(src.color_ramp, n_stops=256)
                 idx = len(nodes)
-                nodes.append({"type": "const", "rgb": color})
+                nodes.append({"type": "color_ramp", "input": rand_idx, "lut": lut})
                 memo[key] = idx
                 return idx
             scalar = _resolve_constant_scalar(in_sock)
@@ -3858,31 +3899,44 @@ def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, 
         alpha = 1.0 - alpha
     alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
 
-    # Find the leaf RGB image by walking the opaque subtree.
-    leaf_img, leaf_chain = _find_subtree_color_image(opaque_node)
-    if leaf_img is not None and isinstance(leaf_img, bpy.types.Image):
-        if leaf_img.size[0] == 0 or leaf_img.size[1] == 0:
-            leaf_img.update()
-        cw, ch = int(leaf_img.size[0]), int(leaf_img.size[1])
-        if cw == 0 or ch == 0:
-            return None
-        leaf_pix = np.empty(cw * ch * 4, dtype=np.float32)
-        leaf_img.pixels.foreach_get(leaf_pix)
-        leaf_colorspace = (
-            "srgb" if leaf_img.colorspace_settings.name.lower().startswith("srgb")
-            else "linear"
-        )
-        if leaf_chain:
-            leaf_pix, leaf_colorspace = _bake_chain(
-                leaf_pix, cw, ch, leaf_colorspace, leaf_chain,
-            )
-        leaf_rgb = leaf_pix.reshape((ch, cw, 4))[..., :3]
-    else:
-        # No leaf image — use a flat white tile so the kernel multiplies by
-        # `base_color`; the mask alone silhouettes the leaf.
+    # When the opaque side carries a colour graph (per-pixel UV / per-
+    # instance random / vertex colour), preserve it: bake the alpha mask
+    # alone with white RGB, and let the kernel still pick the per-pixel
+    # tint from `color_graph` (which the device evaluator already
+    # short-circuits over `base_color_tex` when both are set).
+    has_graph = "color_graph" in opaque_params
+    if has_graph:
+        leaf_img = None
+        leaf_chain = ()
         cw, ch = mw, mh
         leaf_rgb = np.ones((ch, cw, 3), dtype=np.float32)
         leaf_colorspace = "linear"
+    else:
+        # Find the leaf RGB image by walking the opaque subtree.
+        leaf_img, leaf_chain = _find_subtree_color_image(opaque_node)
+        if leaf_img is not None and isinstance(leaf_img, bpy.types.Image):
+            if leaf_img.size[0] == 0 or leaf_img.size[1] == 0:
+                leaf_img.update()
+            cw, ch = int(leaf_img.size[0]), int(leaf_img.size[1])
+            if cw == 0 or ch == 0:
+                return None
+            leaf_pix = np.empty(cw * ch * 4, dtype=np.float32)
+            leaf_img.pixels.foreach_get(leaf_pix)
+            leaf_colorspace = (
+                "srgb" if leaf_img.colorspace_settings.name.lower().startswith("srgb")
+                else "linear"
+            )
+            if leaf_chain:
+                leaf_pix, leaf_colorspace = _bake_chain(
+                    leaf_pix, cw, ch, leaf_colorspace, leaf_chain,
+                )
+            leaf_rgb = leaf_pix.reshape((ch, cw, 4))[..., :3]
+        else:
+            # No leaf image — use a flat white tile so the kernel multiplies
+            # by `base_color`; the mask alone silhouettes the leaf.
+            cw, ch = mw, mh
+            leaf_rgb = np.ones((ch, cw, 3), dtype=np.float32)
+            leaf_colorspace = "linear"
 
     # Resample mask to leaf resolution if needed.
     if (mw, mh) != (cw, ch):
@@ -3917,15 +3971,16 @@ def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, 
 
     out = dict(opaque_params)
     out["base_color_tex"] = tex_id
-    # The texture now carries the leaf RGB; flatten the multiplier so the
-    # kernel doesn't double-tint. Fall back to opaque_params' constant when
-    # there was no leaf image (white texture multiplied by base_color).
     if leaf_img is not None:
+        # The texture now carries the leaf RGB; flatten the multiplier so the
+        # kernel doesn't double-tint. Both the chain we baked and the
+        # opaque side's color_graph would be redundant — keep the leaner
+        # texture path.
         out["base_color"] = [1.0, 1.0, 1.0]
-        # The chain we just baked replaces any color_graph the opaque side
-        # carried — leaving both would make the kernel run the graph again
-        # over already-baked pixels.
         out.pop("color_graph", None)
+    # When `has_graph` was true we deliberately kept the graph + emitted a
+    # white-RGB cutout texture; the device's `eval_material` reads RGB
+    # from the graph and alpha from the texture independently.
     out["alpha_threshold"] = 0.5
     return out
 

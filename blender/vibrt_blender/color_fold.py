@@ -92,7 +92,11 @@ def _clamp01(c: list[float]) -> list[float]:
 
 def _try_fold(node: dict, prev: list[dict]) -> dict | None:
     t = node.get("type")
-    if t in ("const", "image_tex", "vertex_color", None):
+    # Per-fragment / per-instance signals can't fold to a constant — they
+    # must be evaluated on the GPU. `image_tex` varies with UV, `vertex_color`
+    # with mesh attribute, `object_random` with instance id, and
+    # `color_ramp` lives downstream of the graph it samples.
+    if t in ("const", "image_tex", "vertex_color", "object_random", "color_ramp", None):
         return None
 
     if t == "mix":

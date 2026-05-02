@@ -406,6 +406,21 @@ pub enum ColorNode {
     /// ship the matching colour attribute (exporter plumbs this via
     /// `_vertex_color_attr`); when absent the device falls back to white.
     VertexColor {},
+    /// Per-instance uniform random in [0..1) — derived from the OptiX
+    /// instance id at hit time. Mirrors `ShaderNodeObjectInfo.Random`. The
+    /// scalar is broadcast to all three RGB channels so downstream Mix /
+    /// ColorRamp consumers can use it both as a colour and as a Fac.
+    ObjectRandom {},
+    /// Look up a 1D RGB ramp at a Fac driven by another graph slot. Used
+    /// when ColorRamp's Fac chain is non-foldable (typically
+    /// `ObjectInfo.Random` feeding a per-instance palette). The exporter
+    /// bakes the ramp to `lut.len() / 3` evenly-spaced linear-RGB stops.
+    ColorRamp {
+        input: u32,
+        /// `n_stops × 3` floats: R[0..n], G[0..n], B[0..n] flattened by
+        /// stop, so payload[i*3..i*3+3] is the i-th stop's linear RGB.
+        lut: Vec<f32>,
+    },
 }
 
 fn default_mix_fac() -> ColorFactor {

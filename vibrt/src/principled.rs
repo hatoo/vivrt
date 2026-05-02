@@ -1,9 +1,9 @@
 //! Host-side material upload for Principled BSDF.
 
 use crate::gpu_types::{
-    ColorGraphNode, PrincipledGpu, VolumeGpu, COLOR_NODE_BRIGHT_CONTRAST, COLOR_NODE_CONST,
-    COLOR_NODE_HUE_SAT, COLOR_NODE_IMAGE_TEX, COLOR_NODE_INVERT, COLOR_NODE_MATH, COLOR_NODE_MIX,
-    COLOR_NODE_RGB_CURVE, COLOR_NODE_VERTEX_COLOR,
+    ColorGraphNode, PrincipledGpu, VolumeGpu, COLOR_NODE_BRIGHT_CONTRAST, COLOR_NODE_COLOR_RAMP,
+    COLOR_NODE_CONST, COLOR_NODE_HUE_SAT, COLOR_NODE_IMAGE_TEX, COLOR_NODE_INVERT, COLOR_NODE_MATH,
+    COLOR_NODE_MIX, COLOR_NODE_OBJECT_RANDOM, COLOR_NODE_RGB_CURVE, COLOR_NODE_VERTEX_COLOR,
 };
 use crate::scene_format::{ColorFactor, ColorGraph, ColorNode, PrincipledMaterial, VolumeParams};
 use crate::scene_loader::LoadedTexture;
@@ -65,30 +65,54 @@ pub fn upload_color_graph(
             graph.nodes.len()
         ));
     }
-    // RGBCurve nodes carry their LUT inline in JSON; allocate them per-node
-    // on the GPU so `flatten_color_graph` can splice the device pointer
-    // into the payload.
+    // RGBCurve / ColorRamp nodes carry their LUT inline in JSON; allocate
+    // them per-node on the GPU so `flatten_color_graph` can splice the
+    // device pointer into the payload. RGBCurve has a fixed 768-entry LUT
+    // (256 × 3 channels); ColorRamp's stop count is variable and stored
+    // alongside the pointer.
     let mut lut_ptrs: Vec<optix_sys::CUdeviceptr> = Vec::with_capacity(graph.nodes.len());
+    let mut lut_lens: Vec<u32> = Vec::with_capacity(graph.nodes.len());
     for node in &graph.nodes {
-        if let ColorNode::RgbCurve { lut, .. } = node {
-            if lut.len() != 768 {
-                return Err(anyhow!(
-                    "color_graph RgbCurve.lut has {} entries (want 768)",
-                    lut.len()
-                ));
+        match node {
+            ColorNode::RgbCurve { lut, .. } => {
+                if lut.len() != 768 {
+                    return Err(anyhow!(
+                        "color_graph RgbCurve.lut has {} entries (want 768)",
+                        lut.len()
+                    ));
+                }
+                let slice = stream.clone_htod(lut).cuda()?;
+                let ptr = {
+                    let (p, _sync) = slice.device_ptr(stream);
+                    p as optix_sys::CUdeviceptr
+                };
+                f_bufs.push(slice);
+                lut_ptrs.push(ptr);
+                lut_lens.push(0);
             }
-            let slice = stream.clone_htod(lut).cuda()?;
-            let ptr = {
-                let (p, _sync) = slice.device_ptr(stream);
-                p as optix_sys::CUdeviceptr
-            };
-            f_bufs.push(slice);
-            lut_ptrs.push(ptr);
-        } else {
-            lut_ptrs.push(0);
+            ColorNode::ColorRamp { lut, .. } => {
+                if lut.is_empty() || lut.len() % 3 != 0 {
+                    return Err(anyhow!(
+                        "color_graph ColorRamp.lut has {} floats (need >=3 and multiple of 3)",
+                        lut.len()
+                    ));
+                }
+                let slice = stream.clone_htod(lut).cuda()?;
+                let ptr = {
+                    let (p, _sync) = slice.device_ptr(stream);
+                    p as optix_sys::CUdeviceptr
+                };
+                f_bufs.push(slice);
+                lut_ptrs.push(ptr);
+                lut_lens.push((lut.len() / 3) as u32);
+            }
+            _ => {
+                lut_ptrs.push(0);
+                lut_lens.push(0);
+            }
         }
     }
-    let flat = flatten_color_graph(graph, textures, &lut_ptrs)?;
+    let flat = flatten_color_graph(graph, textures, &lut_ptrs, &lut_lens)?;
     // ColorGraphNode is repr(C) + 16 × u32 with no padding (see the
     // compile-time size/align asserts in `gpu_types.rs`), so reinterpreting
     // the buffer as `&[u32]` is sound and lets us reuse the existing
@@ -122,6 +146,7 @@ fn flatten_color_graph(
     graph: &ColorGraph,
     textures: &[(optix_sys::CUdeviceptr, i32, i32)],
     lut_ptrs: &[optix_sys::CUdeviceptr],
+    lut_lens: &[u32],
 ) -> Result<Vec<ColorGraphNode>> {
     let mut out: Vec<ColorGraphNode> = Vec::with_capacity(graph.nodes.len());
     for (i, node) in graph.nodes.iter().enumerate() {
@@ -129,7 +154,7 @@ fn flatten_color_graph(
             tag: 0,
             payload: [0u32; 15],
         };
-        flatten_one(node, i, textures, lut_ptrs, &mut record)?;
+        flatten_one(node, i, textures, lut_ptrs, lut_lens, &mut record)?;
         out.push(record);
     }
     Ok(out)
@@ -140,6 +165,7 @@ fn flatten_one(
     self_idx: usize,
     textures: &[(optix_sys::CUdeviceptr, i32, i32)],
     lut_ptrs: &[optix_sys::CUdeviceptr],
+    lut_lens: &[u32],
     out: &mut ColorGraphNode,
 ) -> Result<()> {
     let check_ref = |r: u32, field: &str| -> Result<()> {
@@ -265,6 +291,19 @@ fn flatten_one(
         }
         ColorNode::VertexColor {} => {
             out.tag = COLOR_NODE_VERTEX_COLOR;
+        }
+        ColorNode::ObjectRandom {} => {
+            out.tag = COLOR_NODE_OBJECT_RANDOM;
+        }
+        ColorNode::ColorRamp { input, .. } => {
+            check_ref(*input, "input")?;
+            let lut_ptr = lut_ptrs[self_idx];
+            let lut_len = lut_lens[self_idx];
+            out.tag = COLOR_NODE_COLOR_RAMP;
+            p[0] = *input;
+            p[1] = lut_ptr as u32;
+            p[2] = (lut_ptr >> 32) as u32;
+            p[3] = lut_len;
         }
     }
     Ok(())

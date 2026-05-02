@@ -44,6 +44,8 @@ pub const COLOR_NODE_HUE_SAT: u32 = 5;
 pub const COLOR_NODE_RGB_CURVE: u32 = 6;
 pub const COLOR_NODE_BRIGHT_CONTRAST: u32 = 7;
 pub const COLOR_NODE_VERTEX_COLOR: u32 = 8;
+pub const COLOR_NODE_OBJECT_RANDOM: u32 = 9;
+pub const COLOR_NODE_COLOR_RAMP: u32 = 10;
 
 #[repr(C)]
 #[derive(Copy, Clone)]

@@ -398,6 +398,11 @@ struct PathVertex {
   float2 uv; // mesh UVs (0,0 if absent)
   float3 vc; // interpolated vertex colour (1,1,1 if mesh has none)
   PrincipledGpu *mat;
+  // Per-instance uniform random in [0..1). Derived from
+  // `optixGetInstanceId()` via a hash so each particle / instance gets a
+  // stable but-different value — feeds `COLOR_NODE_OBJECT_RANDOM` so the
+  // material graph can lerp ColorRamps and Mix nodes per instance.
+  float object_random;
   int hit; // 1 if hit, 0 if miss
 };
 
@@ -818,7 +823,8 @@ static __forceinline__ __device__ float3 hsv_to_rgb_bl(float3 c) {
 }
 
 static __device__ float3 eval_color_graph(
-    ColorGraphNode *nodes, int n_nodes, int output, float2 base_uv, float3 vc) {
+    ColorGraphNode *nodes, int n_nodes, int output, float2 base_uv, float3 vc,
+    float object_random) {
   float3 slots[COLOR_GRAPH_MAX_NODES];
   int n = n_nodes < COLOR_GRAPH_MAX_NODES ? n_nodes : COLOR_GRAPH_MAX_NODES;
   for (int i = 0; i < n; i++) {
@@ -929,6 +935,31 @@ static __device__ float3 eval_color_graph(
                              src.z * facm + shifted.z * fac);
     } else if (tag == COLOR_NODE_VERTEX_COLOR) {
       slots[i] = vc;
+    } else if (tag == COLOR_NODE_OBJECT_RANDOM) {
+      slots[i] = make_float3(object_random, object_random, object_random);
+    } else if (tag == COLOR_NODE_COLOR_RAMP) {
+      // Payload: [in_slot, lut_ptr_lo, lut_ptr_hi, lut_len]. The host bakes
+      // the ramp to `lut_len` linear-RGB stops; we look up by Fac.x with
+      // bilinear interpolation across the table.
+      int iin = (int)pp[0];
+      unsigned long long ptr =
+          ((unsigned long long)pp[2] << 32) | (unsigned long long)pp[1];
+      const float *lut = (const float *)ptr;
+      int len = (int)pp[3];
+      float3 src = slots[iin];
+      // ColorRamp's Fac socket reads as either a scalar or the R channel of
+      // an incoming colour — match `_socket_constant_rgb`'s convention.
+      float fac = src.x;
+      fac = fmaxf(0.0f, fminf(1.0f, fac));
+      float fx = fac * (float)(len - 1);
+      int i0 = (int)floorf(fx);
+      int i1 = i0 < (len - 1) ? i0 + 1 : (len - 1);
+      float t = fx - (float)i0;
+      float3 c0 = make_float3(lut[i0 * 3 + 0], lut[i0 * 3 + 1], lut[i0 * 3 + 2]);
+      float3 c1 = make_float3(lut[i1 * 3 + 0], lut[i1 * 3 + 1], lut[i1 * 3 + 2]);
+      slots[i] = make_float3(c0.x * (1.0f - t) + c1.x * t,
+                             c0.y * (1.0f - t) + c1.y * t,
+                             c0.z * (1.0f - t) + c1.z * t);
     } else {
       // Unknown tag means the host built a graph with a node type the device
       // doesn't recognize — a real bug in the exporter / scene_loader. Print
@@ -990,7 +1021,8 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
     // its own uv_transform so sources with different Mapping nodes don't
     // get jammed into one global scale.
     float3 g = eval_color_graph(m->color_graph_nodes, m->color_graph_len,
-                                m->color_graph_output, v.uv, v.vc);
+                                m->color_graph_output, v.uv, v.vc,
+                                v.object_random);
     e.base_color = e.base_color * g;
   } else if (m->base_color_tex != nullptr) {
     float3 t =
@@ -1881,6 +1913,14 @@ extern "C" __global__ void __closesthit__ch() {
     if ((int)mi < hg->num_materials)
       v->mat = hg->materials[mi];
   }
+  // Hash the OptiX instance id into a uniform [0,1) for ObjectInfo.Random.
+  // PCG-style multiplicative hash: cheap, decorrelated, deterministic per
+  // instance — what Cycles uses for the same node.
+  unsigned int iid = optixGetInstanceId();
+  unsigned int h = iid * 747796405u + 2891336453u;
+  h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+  h = (h >> 22u) ^ h;
+  v->object_random = (float)h * (1.0f / 4294967296.0f);
   v->hit = 1;
 }
 

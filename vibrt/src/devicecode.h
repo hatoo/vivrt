@@ -18,6 +18,8 @@ struct ColorGraphNode {
 #define COLOR_NODE_RGB_CURVE 6u
 #define COLOR_NODE_BRIGHT_CONTRAST 7u
 #define COLOR_NODE_VERTEX_COLOR 8u
+#define COLOR_NODE_OBJECT_RANDOM 9u
+#define COLOR_NODE_COLOR_RAMP 10u
 
 /// Homogeneous volume parameters. Mirrors `gpu_types::VolumeGpu`.
 struct Volume {
