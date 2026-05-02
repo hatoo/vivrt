@@ -2763,6 +2763,18 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
             blend_lc = blend.lower()
             if blend_lc not in _GRAPH_BLEND_MODES:
                 return None
+            # Constant-factor short-circuits: with fac=0 the Mix is just A,
+            # with fac=1 it's just B (for blend=mix). Pabellon's pebbles use
+            # `Mix(fac=1, A=Noise, B=ColorRamp(Random))` — an artist's idiom
+            # for "use B, ignore A". Without the short-circuit the unsupported
+            # `Noise` leaf on A made the whole Mix unrepresentable and the
+            # per-instance ramp variation collapsed to the ramp's mean.
+            if blend_lc == "mix" and not fac_sock.is_linked:
+                fac_const = _socket_f(fac_sock)
+                if fac_const <= 0.0:
+                    return emit(a_sock)
+                if fac_const >= 1.0:
+                    return emit(b_sock)
             ai = emit(a_sock)
             if ai is None:
                 return None
