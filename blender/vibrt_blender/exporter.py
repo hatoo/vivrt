@@ -820,14 +820,38 @@ def _prebake_world_full(world, w: int, h: int) -> None:
         )
         return
     rgb, bw, bh = baked
-    # No sun split for complex bakes: the bright-pixel heuristic is
-    # tuned for Sky Texture's sun_disc, and a curve-shifted MixShader
-    # blend may have spurious bright spots that aren't really a sun.
-    _SKY_BAKE_CACHE[key] = (rgb, bw, bh, None)
+    # Walk the world graph for any Sky Texture with `sun_disc=True`. If
+    # one is present (typical: a MixShader blends a Nishita sky with a
+    # backplate HDRI — pabellon's sunset world), use it to drive the sun
+    # extraction; the bright-pixel heuristic + MixShader-strength
+    # weighting matches the disc that's actually baked into the
+    # equirect. Without this, complex worlds drop the sun entirely and
+    # NEE on shaded surfaces (pebbles below the pool plane) only sees
+    # the diffuse-sky envmap, which is too dim to compete with the
+    # camera-side Fresnel reflection on the water.
+    sun_light = None
+    sky_node = _find_first_sky_node(world)
+    if sky_node is not None and getattr(sky_node, "sun_disc", False):
+        sun_light = _extract_sun_from_bake_inplace(rgb, bw, bh, sky_node, world.name)
+    _SKY_BAKE_CACHE[key] = (rgb, bw, bh, sun_light)
     _emit(
         f"[vibrt] world {world.name!r}: pre-baked complex world graph "
         f"to a {bw}x{bh} envmap in {time.perf_counter() - t0:.2f}s"
+        + (f" + extracted sun" if sun_light is not None else "")
     )
+
+
+def _find_first_sky_node(world):
+    """Walk the world's node tree for the first ShaderNodeTexSky regardless
+    of where it sits in the graph (direct Background.Color, behind a
+    MixShader, inside a NodeGroup). Used to seed sun extraction for the
+    full-world-bake path."""
+    if world is None or not world.use_nodes or world.node_tree is None:
+        return None
+    for n in world.node_tree.nodes:
+        if n.bl_idname == "ShaderNodeTexSky":
+            return n
+    return None
 
 
 def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: str):
@@ -854,18 +878,16 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
         return None
     lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
     lum_max = float(lum.max())
-    # Diffuse Nishita sky tops out around 10-30. Anything noticeably
-    # brighter than the brightest bright-but-diffuse pixel is the sun
-    # disc; threshold at 5x the 99.5th percentile gives a robust cutoff
-    # without per-scene tuning. Bail when the bake is uniform-ish (no
-    # sun_disc, overcast sky, hand-edited HDRI).
-    # Diffuse Nishita sky tops out around 5-15 W/sr/m². The disc punches
-    # through that by 4-5 orders of magnitude. Threshold at 3x the 99th
-    # percentile catches the disc's wing without clipping bright horizon
-    # scattering; floor at 30 so a hand-edited HDRI without a tight disc
-    # doesn't accidentally have its highlights pulled out as a "sun".
+    # Threshold for "this is the sun disc, not just bright sky":
+    # Nishita sun discs punch through diffuse sky by 4-5 orders of
+    # magnitude (max-pixel >> 30) so a high floor is safe and reliable.
+    # Preetham (and bakes that crank exposure down) put the disc only
+    # ~3-10× brighter than the brightest cloud, so a percentile-relative
+    # threshold matters more than the absolute floor. Use 3× the 99th
+    # percentile, with a small absolute floor (1.5) so a pure
+    # diffuse-overcast bake (no real disc) doesn't fire on noise.
     p99 = float(np.percentile(lum, 99.0))
-    threshold = max(30.0, p99 * 3.0)
+    threshold = max(1.5, p99 * 3.0)
     if lum_max < threshold:
         return None
     bright_mask = lum > threshold
