@@ -484,26 +484,13 @@ static __device__ float3 world_background(float3 dir) {
   if (params.world_type == 0) {
     return make_f3(params.world_color) * params.world_strength;
   }
-  // Mixed-envmap path: each layer has its own rotation + strength, blend
-  // via mix_fac. `envmap_data` itself is the host-rasterised mixed grid
-  // (used by sample_envmap / envmap_pdf for importance sampling) — the
-  // actual radiance comes from the high-resolution per-layer textures.
-  if (params.envmap_data_a != nullptr && params.envmap_data_b != nullptr) {
-    float3 a =
-        sample_equirect_layer(params.envmap_data_a, params.envmap_width_a,
-                              params.envmap_height_a,
-                              params.envmap_rotation_a, dir) *
-        params.envmap_strength_a;
-    float3 b =
-        sample_equirect_layer(params.envmap_data_b, params.envmap_width_b,
-                              params.envmap_height_b,
-                              params.envmap_rotation_b, dir) *
-        params.envmap_strength_b;
-    float fac = params.envmap_mix_fac;
-    return a * (1.0f - fac) + b * fac;
-  }
-  // Single-envmap legacy path: rotation_z_rad → 3×3 matrix; world_strength
-  // applied as the only multiplier.
+  // Both single-layer and mixed worlds read from `envmap_data` so that
+  // MIS-combined NEE and BSDF-sampled-miss strategies see the same
+  // radiance at any given direction (essential for unbiased estimation).
+  // For mixed worlds, `envmap_data` is the host-rasterised mix at CDF
+  // resolution; the per-layer high-res `envmap_data_a` / `_b` are
+  // currently kept around for future high-res sampling once the CDF
+  // construction also moves to the high-res grid.
   float rot[9];
   make_rotation_z(-params.envmap_rotation_z_rad, rot);
   float3 col = sample_equirect_layer(params.envmap_data,
@@ -549,8 +536,14 @@ static __forceinline__ __device__ float power_heuristic(float pa, float pb) {
 // the strength factor stays on the radiance side and direct-light contribution
 // scales correctly with `world_strength`.
 static __device__ float envmap_pdf(float3 dir) {
-  if (params.world_type != 1 || params.envmap_integral <= 0.0f)
+  // Active for both single-layer (world_type==1) and mixed (==2) envmaps.
+  // The CDF lives on `envmap_data` either way (mixed worlds rasterise the
+  // blend on the host so this PDF lookup stays consistent with the
+  // direction sampler).
+  if (params.world_type == 0 || params.envmap_integral <= 0.0f)
     return 0.0f;
+  // For mixed worlds `envmap_rotation_z_rad` is 0 and this collapses to
+  // identity — consistent with `world_background`'s shared lookup path.
   float c = cosf(-params.envmap_rotation_z_rad);
   float s = sinf(-params.envmap_rotation_z_rad);
   float3 d = make_float3(dir.x * c - dir.y * s, dir.x * s + dir.y * c, dir.z);
@@ -576,7 +569,9 @@ static __device__ EnvSample sample_envmap(RNG &rng) {
   s.dir = make_float3(0, 0, 1);
   s.L = make_float3(0, 0, 0);
   s.pdf = 0.0f;
-  if (params.world_type != 1 || params.envmap_integral <= 0.0f)
+  // Active for both single-layer and mixed envmaps; the CDF lives on
+  // `envmap_data` for both cases (host rasterises the mix for type==2).
+  if (params.world_type == 0 || params.envmap_integral <= 0.0f)
     return s;
   int w = params.envmap_width;
   int h = params.envmap_height;
@@ -592,30 +587,23 @@ static __device__ EnvSample sample_envmap(RNG &rng) {
   float phi = u * 2.0f * M_PIf;
   float sin_t = sinf(theta);
   float3 d = make_float3(sin_t * cosf(phi), sin_t * sinf(phi), cosf(theta));
-  // Apply rotation (inverse of what we do in background lookup). For
-  // mixed-envmap worlds the rasterised CDF grid is in the world-space
-  // frame already (no per-layer rotation baked in), so skip the
-  // single-layer rotation correction.
-  if (params.envmap_data_a != nullptr && params.envmap_data_b != nullptr) {
-    s.dir = d;
-  } else {
-    float c = cosf(params.envmap_rotation_z_rad);
-    float sr = sinf(params.envmap_rotation_z_rad);
-    s.dir = make_float3(d.x * c - d.y * sr, d.x * sr + d.y * c, d.z);
-  }
-  // For mixed worlds, return the high-res per-layer radiance at the
-  // sampled direction (matches what BSDF-sampled miss paths see). For
-  // single-layer worlds, read directly from the CDF grid (= the only
-  // texture) so MC-tested unbiased behaviour stays bit-identical.
-  if (params.envmap_data_a != nullptr && params.envmap_data_b != nullptr) {
-    s.L = world_background(s.dir);
-  } else {
-    const float *px = &params.envmap_data[(y * w + x) * 3];
-    s.L = make_float3(px[0], px[1], px[2]) * params.world_strength;
-  }
-  // Read luminance for the pdf from the rasterised grid (which is
-  // mixed for mixed worlds, layer A's texture for single).
+  // Apply rotation (inverse of what `world_background` does). For mixed
+  // worlds `envmap_rotation_z_rad` is left at 0 (the rasterised grid is
+  // already in world space) so this collapses to the identity, which
+  // is the correct "undo" of `world_background`'s identity lookup.
+  float c = cosf(params.envmap_rotation_z_rad);
+  float sr = sinf(params.envmap_rotation_z_rad);
+  s.dir = make_float3(d.x * c - d.y * sr, d.x * sr + d.y * c, d.z);
+  // Read s.L from the same rasterised grid the CDF / pdf were built
+  // from. Returning a different (higher-res) radiance value for the
+  // same direction would make `f / pdf` inconsistent and over-count
+  // bright bands of the mixed envmap. The slight loss in HDRI peak
+  // brightness on NEE samples is compensated by BSDF-sampled paths
+  // (which DO read high-res via `world_background`) — MIS combines
+  // both strategies into an unbiased estimator only when each
+  // strategy's `f / pdf` is internally consistent.
   const float *px = &params.envmap_data[(y * w + x) * 3];
+  s.L = make_float3(px[0], px[1], px[2]) * params.world_strength;
 
   // pdf is over raw texel luminance only — see envmap_pdf for the derivation.
   // Folding world_strength into `lum` here would cancel out of the
@@ -1839,7 +1827,14 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
   }
 
   // Envmap: one importance sample, MIS-weighted against BSDF sampling.
-  if (params.world_type == 1 && params.envmap_integral > 0.0f) {
+  // Activated for both single-layer (`world_type==1`) and mixed
+  // (`world_type==2`) envmaps. Without this gate covering both, mixed
+  // worlds would skip envmap NEE entirely — BSDF-sampled paths into the
+  // sky would still pick up envmap radiance but with no NEE strategy
+  // competing on MIS weights, doubling the effective contribution
+  // (previously masquerading as 2× brightness on diffuse surfaces in
+  // pabellon's pool basin).
+  if (params.world_type != 0 && params.envmap_integral > 0.0f) {
     EnvSample es = sample_envmap(rng);
     if (es.pdf > 0.0f) {
       float3 vis = shadow_transmittance(P, es.dir, 1e20f, vstack);
@@ -1965,7 +1960,7 @@ static __device__ float3 direct_light_volume(float3 P, float3 wi_world,
       }
     }
   }
-  if (params.world_type == 1 && params.envmap_integral > 0.0f) {
+  if (params.world_type != 0 && params.envmap_integral > 0.0f) {
     EnvSample es = sample_envmap(rng);
     if (es.pdf > 0.0f) {
       float3 vis = shadow_transmittance(P, es.dir, 1e20f, vstack);
@@ -2382,7 +2377,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
     if (v.hit == 0) {
       float3 bg = world_background(dir);
       float w = 1.0f;
-      if (bounce > 0 && !last_specular && params.world_type == 1) {
+      if (bounce > 0 && !last_specular && params.world_type != 0) {
         float p_env = envmap_pdf(dir);
         w = power_heuristic(prev_bsdf_pdf, p_env);
       }
