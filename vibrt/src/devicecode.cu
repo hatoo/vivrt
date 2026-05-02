@@ -1055,6 +1055,11 @@ struct MaterialEval {
   float alpha;   // isotropic α = roughness², used for LUT + transmission
   float alpha_x; // anisotropic αx (along tangent T)
   float alpha_y; // anisotropic αy (along bitangent B)
+  // Filter-glossy-inflated coat α. Pre-computed in eval_material so the
+  // clearcoat lobe in eval_bsdf / sample_bsdf doesn't have to re-derive
+  // it from the material's coat_roughness on every call (and so it
+  // picks up the path's min_alpha state along with the main lobe).
+  float coat_alpha;
   float ior;
   float transmission;
   float3 emission;
@@ -1218,6 +1223,16 @@ static __device__ MaterialEval eval_material(const PathVertex &v,
     e.alpha_x = e.alpha * aspect;
     e.alpha_y = e.alpha / aspect;
   }
+  // Coat α also gets the filter-glossy floor applied. Pebble materials
+  // in pabellon use a Fresnel-driven MixShader → my exporter routes the
+  // glossy side onto the coat lobe with a low coat_roughness (~0.45),
+  // which without inflation can refocus indirect bounces through the
+  // pool's surface into a sharper cone than the path has already
+  // sampled. Same min_alpha as the main lobe — Cycles' filter_glossy
+  // is a single state shared across all glossy lobes.
+  e.coat_alpha = fmaxf(m->coat_roughness * m->coat_roughness, 1e-4f);
+  if (min_alpha > e.coat_alpha)
+    e.coat_alpha = min_alpha;
   // Tangent rotation around Ns.
   float rot = m->tangent_rotation;
   if (rot != 0.0f) {
@@ -1302,7 +1317,7 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
   // Coat Fresnel parameters (used both for MIS weighting and the coat BRDF).
   PrincipledGpu *mc = e.mat;
   float coat_w_mat = mc->coat_weight;
-  float coat_alpha = fmaxf(mc->coat_roughness * mc->coat_roughness, 1e-4f);
+  float coat_alpha = e.coat_alpha;  // already filter-glossy-clamped
   float cF0 = ((mc->coat_ior - 1.0f) / (mc->coat_ior + 1.0f)) *
               ((mc->coat_ior - 1.0f) / (mc->coat_ior + 1.0f));
 
@@ -1557,7 +1572,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
   // Coat weight mirrors eval_bsdf: scale by F_coat(V) so sampling budget
   // follows the actual coat intensity at this view angle (grazing >> normal).
   float coat_w_mat = e.mat->coat_weight;
-  float coat_alpha = fmaxf(e.mat->coat_roughness * e.mat->coat_roughness, 1e-4f);
+  float coat_alpha = e.coat_alpha;  // already filter-glossy-clamped
   float cF0 = ((e.mat->coat_ior - 1.0f) / (e.mat->coat_ior + 1.0f)) *
               ((e.mat->coat_ior - 1.0f) / (e.mat->coat_ior + 1.0f));
   float w_diffuse = (1.0f - e.metallic) * (1.0f - e.transmission);
