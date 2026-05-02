@@ -739,7 +739,7 @@ def _world_needs_full_bake(world) -> bool:
     return surf.links[0].from_node.bl_idname != "ShaderNodeBackground"
 
 
-def prebake_sky_envmaps_for_world(world, w: int = 1024, h: int = 512) -> None:
+def prebake_sky_envmaps_for_world(world, w: int = 2048, h: int = 1024) -> None:
     """Bake a world's environment into `_SKY_BAKE_CACHE` so the exporter
     has equirect pixels ready by the time it runs. Two paths share this
     cache:

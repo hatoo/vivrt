@@ -442,10 +442,36 @@ static __device__ float3 world_background(float3 dir) {
   float v = theta * INV_PIf;
   int w = params.envmap_width;
   int h = params.envmap_height;
-  int x = min((int)(u * w), w - 1);
-  int y = min((int)(v * h), h - 1);
-  const float *px = &params.envmap_data[(y * w + x) * 3];
-  return make_float3(px[0], px[1], px[2]) * params.world_strength;
+  // Bilinear filter the equirect texture. Nearest-neighbor leaves visible
+  // texel boundaries when the bake (1024×512 for pabellon) is undersampled
+  // relative to the camera resolution — the sky renders as discrete steps
+  // of colour. Wrap u, clamp v (poles aren't periodic).
+  float fx = u * (float)w - 0.5f;
+  float fy = v * (float)h - 0.5f;
+  int x0 = (int)floorf(fx);
+  int y0 = (int)floorf(fy);
+  float dx = fx - (float)x0;
+  float dy = fy - (float)y0;
+  auto wrap = [](int v, int m) {
+    int r = v % m;
+    return r < 0 ? r + m : r;
+  };
+  int x1 = wrap(x0 + 1, w);
+  x0 = wrap(x0, w);
+  y0 = max(0, min(h - 1, y0));
+  int y1 = max(0, min(h - 1, y0 + 1));
+  auto fetch = [&](int x, int y) {
+    const float *p = &params.envmap_data[(y * w + x) * 3];
+    return make_float3(p[0], p[1], p[2]);
+  };
+  float3 c00 = fetch(x0, y0);
+  float3 c10 = fetch(x1, y0);
+  float3 c01 = fetch(x0, y1);
+  float3 c11 = fetch(x1, y1);
+  float3 c0 = c00 * (1.0f - dx) + c10 * dx;
+  float3 c1 = c01 * (1.0f - dx) + c11 * dx;
+  float3 col = c0 * (1.0f - dy) + c1 * dy;
+  return col * params.world_strength;
 }
 
 static __device__ int cdf_search(const float *cdf, int n, float r) {
