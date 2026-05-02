@@ -283,15 +283,20 @@ pub struct LaunchParams {
     /// Camera-space shading normal (X=right, Y=up, Z=forward).
     pub normal_aov: optix_sys::CUdeviceptr,
 
+    /// Per-pixel primary-ray hit distance (single float). Drives the
+    /// addon's Mist / Z passes so Cycles-authored compositors run on top
+    /// of vibrt's output. Always allocated. Field order MUST match the
+    /// `LaunchParams` struct in `devicecode.h` exactly — when this was
+    /// last placed after `world_volume` here but before it in the C
+    /// header, the device read `depth_aov` as `world_volume` (= null on
+    /// scenes without atmospheric haze), so depth was never written and
+    /// the addon's Mist pass came out all-zero.
+    pub depth_aov: optix_sys::CUdeviceptr,
+
     /// Optional global homogeneous volume (atmospheric haze) that fills the
     /// scene. 0 means "vacuum"; non-null is a `VolumeGpu*`. Always part of
     /// the volume stack at depth 0.
     pub world_volume: optix_sys::CUdeviceptr,
-
-    /// Per-pixel primary-ray hit distance (single float). Drives the
-    /// addon's Mist / Z passes so Cycles-authored compositors run on top
-    /// of vibrt's output. Always allocated.
-    pub depth_aov: optix_sys::CUdeviceptr,
 }
 
 #[repr(C)]

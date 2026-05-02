@@ -657,8 +657,8 @@ pub fn render_to_pixels(
         clamp_indirect: render_settings.clamp_indirect,
         albedo_aov,
         normal_aov,
-        world_volume: world_volume_ptr,
         depth_aov,
+        world_volume: world_volume_ptr,
     };
     let d_params = alloc_and_copy(&stream, &lp)?;
 
