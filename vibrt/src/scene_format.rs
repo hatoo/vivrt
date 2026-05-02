@@ -79,9 +79,22 @@ pub struct RenderSettings {
     pub height: u32,
     pub spp: u32,
     pub max_depth: u32,
+    /// Per-lobe bounce caps mirroring Cycles' `diffuse_bounces` /
+    /// `glossy_bounces` / `transmission_bounces`. Default to `max_depth`
+    /// (= no per-lobe restriction) so older scene JSONs still render.
+    #[serde(default = "default_lobe_bounces")]
+    pub max_diffuse_bounces: u32,
+    #[serde(default = "default_lobe_bounces")]
+    pub max_glossy_bounces: u32,
+    #[serde(default = "default_lobe_bounces")]
+    pub max_transmission_bounces: u32,
     /// Clamp for indirect (bounce>=1) contribution luminance. 0 disables.
     #[serde(default)]
     pub clamp_indirect: f32,
+}
+
+fn default_lobe_bounces() -> u32 {
+    32
 }
 
 #[derive(Deserialize)]

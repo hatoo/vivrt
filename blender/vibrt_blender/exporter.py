@@ -1410,13 +1410,30 @@ def _export_into(
 
     spp = max(1, int(scene.vibrt_spp))
     _emit(f"[vibrt] spp={spp}")
+    # Read Cycles' bounce caps directly so a scene authored with e.g.
+    # `diffuse_bounces=2` (lone_monk) doesn't quietly get 8 diffuse
+    # bounces' worth of warm-brick indirect light. Falls back to
+    # generous defaults when Cycles' settings are missing (e.g. a
+    # vibrt-only scene without the cycles addon active).
+    cy = getattr(scene, "cycles", None)
+    max_depth = int(getattr(cy, "max_bounces", 12)) if cy is not None else 12
+    max_diffuse = int(getattr(cy, "diffuse_bounces", max_depth)) if cy is not None else max_depth
+    max_glossy = int(getattr(cy, "glossy_bounces", max_depth)) if cy is not None else max_depth
+    max_transmission = int(getattr(cy, "transmission_bounces", max_depth)) if cy is not None else max_depth
+    _emit(
+        f"[vibrt] bounces total={max_depth} "
+        f"diffuse={max_diffuse} glossy={max_glossy} transmission={max_transmission}"
+    )
     scene_json = {
         "version": 1,
         "render": {
             "width": width,
             "height": height,
             "spp": spp,
-            "max_depth": 8,
+            "max_depth": max_depth,
+            "max_diffuse_bounces": max_diffuse,
+            "max_glossy_bounces": max_glossy,
+            "max_transmission_bounces": max_transmission,
             "clamp_indirect": float(scene.vibrt_clamp_indirect),
         },
         "camera": _export_camera(scene, cam_obj, aspect),

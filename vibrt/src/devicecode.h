@@ -147,6 +147,15 @@ struct LaunchParams {
   unsigned int height;
   unsigned int samples_per_pixel;
   unsigned int max_depth;
+  // Per-lobe bounce caps mirroring Cycles' diffuse/glossy/transmission
+  // limits. Once a path has consumed its quota of one lobe type the
+  // tracer terminates that path; without this cap, vibrt was producing
+  // significantly more diffuse bounces than Cycles in scenes that limit
+  // it (lone_monk: diffuse_bounces=2 but max_bounces=8 → 4× the warm
+  // brick-on-brick indirect bounces, hence the visibly redder shadows).
+  unsigned int max_diffuse_bounces;
+  unsigned int max_glossy_bounces;
+  unsigned int max_transmission_bounces;
 
   float cam_eye[3];
   float cam_u[3];

@@ -1370,11 +1370,20 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
 }
 
 // Sample BSDF, returning new direction wi, evaluated f*cosθ, and PDF.
+// Path-tracer per-type bounce counters key off this lobe id. Cycles caps
+// `diffuse_bounces` / `glossy_bounces` / `transmission_bounces` separately
+// from the total `max_bounces`, so the kernel needs to know which lobe
+// each sampled direction came from.
+#define LOBE_DIFFUSE 0
+#define LOBE_GLOSSY 1
+#define LOBE_TRANSMISSION 2
+
 struct BsdfSample {
   float3 wi;
   float3 f;
   float pdf;
   bool specular; // true for rough-specular that shouldn't NEE-double-count
+  int lobe;      // LOBE_DIFFUSE / LOBE_GLOSSY / LOBE_TRANSMISSION
 };
 
 static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
@@ -1384,6 +1393,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
   s.f = make_float3(0, 0, 0);
   s.pdf = 0.0f;
   s.specular = false;
+  s.lobe = LOBE_DIFFUSE;
 
   float NoV = dot3(e.Ns, wo);
   if (NoV <= 0.0f)
@@ -1402,6 +1412,10 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
     BsdfEval ev = eval_hair(e, wo, s.wi);
     s.f = ev.f;
     s.pdf = ev.pdf;
+    // Hair-Kajiya is mostly a forward-cone lobe + a diffuse base; bucket
+    // it as glossy because the dominant contribution shouldn't deplete
+    // the diffuse-bounces budget that thinks of brick / paint walls.
+    s.lobe = LOBE_GLOSSY;
     return s;
   }
 
@@ -1433,6 +1447,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
     float3 local = make_float3(r * cosf(phi), r * sinf(phi),
                                sqrtf(fmaxf(0.0f, 1.0f - u1)));
     s.wi = normalize3(e.T * local.x + e.B * local.y + e.Ns * local.z);
+    s.lobe = LOBE_DIFFUSE;
   } else if (u < p_diff + p_spec) {
     // GGX VNDF specular (anisotropic)
     float3 Vlocal = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
@@ -1449,6 +1464,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
     // let trace_path add BSDF-sampled emission directly.
     if (e.alpha <= 0.02f * 0.02f)
       s.specular = true;
+    s.lobe = LOBE_GLOSSY;
   } else if (u < p_diff + p_spec + p_trans) {
     // Rough-dielectric transmission
     float eta = e.ior;
@@ -1476,6 +1492,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
     }
     if (e.alpha <= 0.02f * 0.02f)
       s.specular = true;
+    s.lobe = LOBE_TRANSMISSION;
   } else {
     // Coat: isotropic GGX VNDF on coat_alpha. Always reflects, so no
     // Fresnel reflect/transmit branch here.
@@ -1489,6 +1506,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
     s.wi = wi;
     if (coat_alpha <= 0.02f * 0.02f)
       s.specular = true;
+    s.lobe = LOBE_GLOSSY;
   }
 
   BsdfEval ev = eval_bsdf(e, wo, s.wi);
@@ -2007,6 +2025,15 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
   float3 L = make_float3(0, 0, 0);
   bool last_specular = true;
   float prev_bsdf_pdf = 0.0f;
+  // Cycles caps diffuse / glossy / transmission bounces independently of
+  // the total path-length cap. Track per-lobe counters; once one runs out
+  // the path terminates (diffuse-saturated scenes — lone_monk's brick
+  // courtyard with diffuse_bounces=2 — used to receive 4× too much
+  // brick-on-brick indirect light because the kernel only honoured the
+  // total `max_depth=8`).
+  unsigned int diffuse_bounces = 0;
+  unsigned int glossy_bounces = 0;
+  unsigned int transmission_bounces = 0;
   VolumeStack vstack;
   vstack.depth = 0;
 
@@ -2191,6 +2218,28 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
     throughput = throughput * contrib;
     last_specular = bs.specular;
     prev_bsdf_pdf = bs.pdf;
+
+    // Cycles-style per-lobe bounce caps. Cycles' `diffuse_bounces=N`
+    // means up to N diffuse reflections may appear in the path, which
+    // makes NEE fire at the surface that the Nth bounce LANDS on.
+    // Translating that to our sample-then-trace loop: we allow the
+    // counter to reach N (NEE at the next iteration is the Nth-bounce
+    // indirect contribution), and only terminate when the *next* bounce
+    // of the same lobe would exceed N — i.e. on count > limit. Using
+    // `>=` here (the obvious-looking choice) under-samples by one bounce.
+    if (bs.lobe == LOBE_DIFFUSE) {
+      diffuse_bounces++;
+      if (diffuse_bounces > params.max_diffuse_bounces)
+        break;
+    } else if (bs.lobe == LOBE_GLOSSY) {
+      glossy_bounces++;
+      if (glossy_bounces > params.max_glossy_bounces)
+        break;
+    } else if (bs.lobe == LOBE_TRANSMISSION) {
+      transmission_bounces++;
+      if (transmission_bounces > params.max_transmission_bounces)
+        break;
+    }
 
     // Russian roulette after a few bounces
     if (bounce >= 3) {

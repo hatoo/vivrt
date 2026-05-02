@@ -223,6 +223,13 @@ pub struct LaunchParams {
     pub height: u32,
     pub samples_per_pixel: u32,
     pub max_depth: u32,
+    /// Per-lobe bounce caps (Cycles `diffuse_bounces` / `glossy_bounces` /
+    /// `transmission_bounces`). Tracked separately by the path tracer so
+    /// scenes that limit one lobe type aggressively (lone_monk:
+    /// diffuse=2) match Cycles' indirect-light intensity.
+    pub max_diffuse_bounces: u32,
+    pub max_glossy_bounces: u32,
+    pub max_transmission_bounces: u32,
 
     pub cam_eye: [f32; 3],
     pub cam_u: [f32; 3],
