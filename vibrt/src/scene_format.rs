@@ -562,6 +562,25 @@ fn default_point_radius() -> f32 {
     0.05
 }
 
+/// One layer of a (possibly mixed) world envmap. Mirrors a single
+/// `ShaderNodeBackground` driving its `Color` from a `ShaderNodeTexEnvironment`
+/// or `ShaderNodeTexSky`. Used as a building block for the `Mixed` world
+/// variant; single-layer worlds still go through the simpler `Envmap`
+/// variant for backwards compatibility.
+#[derive(Deserialize, Clone)]
+pub struct EnvmapLayer {
+    pub texture: u32,
+    /// 3×3 row-major rotation applied to the world-space sample direction
+    /// before the equirect lookup. `[1,0,0, 0,1,0, 0,0,1]` is identity.
+    /// Mapping nodes with arbitrary Euler XYZ rotation are pre-composed
+    /// into this matrix on the host so the kernel does one matrix-vector
+    /// per sample and no Euler reconstruction.
+    #[serde(default = "identity_rotation_3x3")]
+    pub rotation: [f32; 9],
+    #[serde(default = "one_f32")]
+    pub strength: f32,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorldDesc {
@@ -577,4 +596,29 @@ pub enum WorldDesc {
         #[serde(default = "one_f32")]
         strength: f32,
     },
+    /// Two-layer envmap mixed by `fac`. Used when the world is a
+    /// `ShaderNodeMixShader(Background_a, Background_b)` — pabellon's
+    /// sunset world is the canonical case (Sky Texture + HDRI). Each
+    /// layer keeps its own rotation + strength so HDRIs (sampled at
+    /// native resolution) and Sky Texture bakes can coexist without
+    /// losing peak luminance to the single combined bake the
+    /// `_world_needs_full_bake` path currently produces.
+    ///
+    /// `fac=0` selects `a` only; `fac=1` selects `b` only; intermediate
+    /// values do a linear blend per Cycles' MixShader convention.
+    ///
+    /// Importance sampling: the scene loader currently builds a CDF
+    /// from a host-side rasterised mix; future work could fold that
+    /// into the GPU side so updates to either layer don't trigger a
+    /// rebuild.
+    Mixed {
+        a: EnvmapLayer,
+        b: EnvmapLayer,
+        #[serde(default = "half_f32")]
+        fac: f32,
+    },
+}
+
+fn identity_rotation_3x3() -> [f32; 9] {
+    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
 }

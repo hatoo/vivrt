@@ -252,8 +252,18 @@ pub fn load_scene_from_bytes<'a>(
     }
 
     // Envmap: extract RGB (3 channels) from textures if world is an envmap.
-    let envmap_rgb = if let Some(WorldDesc::Envmap { texture, .. }) = &file.world {
-        let idx = *texture as usize;
+    // For `Mixed` worlds we currently use only layer `a`'s texture as the
+    // primary envmap — phase 2 of option A will load both layers and mix
+    // in the kernel; for now this falls back to single-layer behaviour so
+    // existing `Envmap` scenes are unaffected and `Mixed` scenes at least
+    // see one of the two backgrounds.
+    let envmap_tex_idx: Option<u32> = match &file.world {
+        Some(WorldDesc::Envmap { texture, .. }) => Some(*texture),
+        Some(WorldDesc::Mixed { a, .. }) => Some(a.texture),
+        _ => None,
+    };
+    let envmap_rgb = if let Some(idx) = envmap_tex_idx {
+        let idx = idx as usize;
         let tex = textures
             .get(idx)
             .ok_or_else(|| anyhow!("envmap texture index out of range: {}", idx))?;

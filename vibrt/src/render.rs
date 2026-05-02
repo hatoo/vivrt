@@ -568,6 +568,11 @@ pub fn render_to_pixels(
     let (world_type, world_color, world_strength) = match &scene.file.world {
         Some(scene_format::WorldDesc::Constant { color, strength }) => (0, *color, *strength),
         Some(scene_format::WorldDesc::Envmap { strength, .. }) => (1, [0.0; 3], *strength),
+        // TODO: phase 2 of option A — bake each layer separately and ship
+        // both to the GPU; until then `Mixed` falls through to a single
+        // envmap using only `a`'s texture so the path tracer still has a
+        // background to sample.
+        Some(scene_format::WorldDesc::Mixed { a, .. }) => (1, [0.0; 3], a.strength),
         None => (0, [0.0; 3], 0.0),
     };
     let envmap_rot = match &scene.file.world {
