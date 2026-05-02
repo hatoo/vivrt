@@ -1005,12 +1005,11 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
     try:
         # Sun discs in Sky Texture / HDRI hot spots cover tiny solid angles;
         # 64 spp doesn't hit them often enough for the average pixel to
-        # carry the sun's full luminance, so the baked envmap rendered the
-        # sunset as a dim wash and the pool floor (lit only by what the
-        # bake captured) was way too dark. 256 spp + denoising disabled is
+        # carry the sun's full luminance. 256 spp + denoising disabled is
         # a reasonable trade — adds a few extra seconds to the one-time
-        # update-step bake but produces a pool floor that's lit at roughly
-        # the right intensity for downstream NEE.
+        # update-step bake. 1024 spp doesn't help meaningfully on tested
+        # scenes (pabellon's HDRI is already SDR-clipped and Nishita
+        # converges by 256), so the extra cost isn't worth it.
         tmp.cycles.samples = 256
         tmp.cycles.use_denoising = False
         tmp.cycles.use_adaptive_sampling = False
