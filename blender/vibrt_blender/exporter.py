@@ -153,6 +153,19 @@ def _find_displacement(obj_eval, writer, textures):
         disp = out.inputs.get("Displacement")
         if disp is None or not disp.is_linked:
             continue
+        # Cycles only moves real geometry when `displacement_method` is
+        # DISPLACEMENT or BOTH; the default BUMP just feeds the
+        # Displacement node into the shader's normal channel and leaves
+        # the mesh unchanged. Apply the same gate so we don't distort
+        # terrains whose author meant the height map purely as a bump
+        # cue (pabellon's `grass` material on `tree_scatter_plane` is
+        # exactly this — scale=0.1 in local space × the plane's 44.94
+        # world scale would otherwise smear the ground by ~4.5 m).
+        disp_method = (getattr(mat, "displacement_method", None)
+                       or getattr(getattr(mat, "cycles", None),
+                                  "displacement_method", "BUMP"))
+        if str(disp_method).upper() == "BUMP":
+            continue
         src = disp.links[0].from_node
         tag = f"{obj_eval.name!r}/{mat.name!r}"
         strength = 1.0
