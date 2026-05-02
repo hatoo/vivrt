@@ -2013,14 +2013,18 @@ extern "C" __global__ void __anyhit__ah() {
       m = hg->materials[mi];
   }
   // Shadow rays pass through transmissive surfaces (approximation of
-  // Cycles' transparent shadows — no color attenuation for now). Also
-  // pass through translucent thin sheets (Add(Diffuse, Translucent) ⇒
-  // `sss_weight > 0`): otherwise the pool floor under pabellon's lotus
-  // pads renders fully shadowed, while Cycles' translucent BSDF lets
-  // ~50% of the sun through to the pebbles below.
+  // Cycles' transparent shadows — no color attenuation for now).
+  // Translucent thin sheets (Add(Diffuse, Translucent), sss_weight>0)
+  // are NOT auto-passed: Cycles only lets ~30-50% through them, and
+  // letting them be fully transparent makes the foreground pool floor
+  // ~50% brighter than Cycles' reference. Cycles-style soft shadows
+  // through translucent BSDFs would need a payload-accumulating
+  // shadow-ray loop; for now respecting the alpha-cutout silhouette
+  // (which is what's checked further below) gets us closer to
+  // reference than full pass-through.
   bool is_shadow_ray =
       (optixGetRayFlags() & OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT) != 0;
-  if (is_shadow_ray && (m->transmission > 0.5f || m->sss_weight > 0.5f)) {
+  if (is_shadow_ray && m->transmission > 0.5f) {
     optixIgnoreIntersection();
   }
   // Pure volume-container surfaces are invisible to *binary* shadow rays
