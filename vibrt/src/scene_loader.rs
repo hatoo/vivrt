@@ -52,6 +52,16 @@ pub struct LoadedScene<'bin> {
     pub sun_lights: Vec<SunLight>,
     pub spot_lights: Vec<SpotLight>,
     pub rect_lights: Vec<AreaRectLight>,
+    /// Per-light IES profiles, one entry per light in the matching
+    /// vector above (None means no IES). The render pipeline walks
+    /// these, builds a packed device buffer per profile (theta axis +
+    /// phi axis + normalised candelas), and patches the corresponding
+    /// light's `ies_data` pointer + `ies_n_v` / `ies_n_h` before the
+    /// device upload. We can't do this in scene_loader itself because
+    /// it has no CUDA stream; the upload pass lives in render.rs.
+    pub point_ies: Vec<Option<IesProfile>>,
+    pub spot_ies: Vec<Option<IesProfile>>,
+    pub rect_ies: Vec<Option<IesProfile>>,
     /// Envmap texture fully materialised (linear RGB only, width*height*3 floats).
     /// For `Mixed` worlds this is the host-rasterised mix grid used for
     /// the importance-sampling CDF; the two source layers live in
@@ -150,13 +160,23 @@ pub fn load_scene_from_bytes<'a>(
     let mut sun_lights = Vec::new();
     let mut spot_lights = Vec::new();
     let mut rect_lights = Vec::new();
+    // Owned IES profiles, gathered per-light so render.rs can build a
+    // single device buffer per profile and patch the `ies_*` fields on
+    // the corresponding GPU light struct before the upload. None means
+    // "no IES on this light" — the GPU lookup short-circuits to 1.0
+    // and the light shines isotropically as before.
+    let mut point_ies: Vec<Option<IesProfile>> = Vec::new();
+    let mut spot_ies: Vec<Option<IesProfile>> = Vec::new();
+    let mut rect_ies: Vec<Option<IesProfile>> = Vec::new();
     for light in &file.lights {
-        match *light {
+        match light {
             LightDesc::Point {
                 position,
                 color,
                 power,
                 radius,
+                light_rotation,
+                ies,
             } => {
                 // Blender point light: total emitted power Φ W. The device samples
                 // this as a delta point, so `emission` must be intensity I = Φ/(4π)
@@ -165,14 +185,38 @@ pub fn load_scene_from_bytes<'a>(
                 // surface, which only applies if we sample the surface (we don't);
                 // using it as I made pendants ~1/(πr²) times too bright.
                 let r = radius.max(1e-3);
-                let coeff = power / (4.0 * std::f32::consts::PI);
+                // Without IES: isotropic, divide by 4π so ∫ I dΩ = power.
+                // With IES: divide by the IES profile's solid-angle
+                // integral over the sphere of the [0, 1]-normalised
+                // candela table, so ∫ I(θ, φ) dΩ = coeff × integral_norm
+                // = power. This concentrates `power` into a sharper
+                // peak when the IES beam is narrow (downlight, spot,
+                // etc.). It's a flux-preservation normalisation, not
+                // an exact Cycles match — Cycles' IES Texture node
+                // returns absolute candelas multiplied by the per-light
+                // strength, which empirically tracks 2× brighter than
+                // this approach on the official ies_light test scene
+                // (likely an additional factor in Cycles' light eval
+                // chain we haven't replicated). The basic directional
+                // shape is correct here; absolute brightness may need
+                // a second pass once we pin down Cycles' formula.
+                let denom = match ies {
+                    Some(p) if p.integral_norm > 1e-6 => p.integral_norm,
+                    _ => 4.0 * std::f32::consts::PI,
+                };
+                let coeff = power / denom;
                 let emission = [color[0] * coeff, color[1] * coeff, color[2] * coeff];
                 point_lights.push(PointLight {
-                    position,
+                    position: *position,
                     radius: r,
                     emission,
                     _pad: 0.0,
+                    ies_data: 0,
+                    ies_n_v: 0,
+                    ies_n_h: 0,
+                    light_rotation: *light_rotation,
                 });
+                point_ies.push(ies.clone());
             }
             LightDesc::Sun {
                 direction,
@@ -180,7 +224,7 @@ pub fn load_scene_from_bytes<'a>(
                 strength,
                 angle_rad,
             } => {
-                let dir = normalize3(direction);
+                let dir = normalize3(*direction);
                 // Point TO light (same convention as existing renderer's DistantLight).
                 let towards = [-dir[0], -dir[1], -dir[2]];
                 let emission = [
@@ -201,18 +245,36 @@ pub fn load_scene_from_bytes<'a>(
                 power,
                 cone_rad,
                 blend,
+                ies,
             } => {
-                let t = transform::from_4x4_row_major(&t4);
+                let t = transform::from_4x4_row_major(t4);
                 let position = [t[3], t[7], t[11]];
                 // Blender spot: local -Z is emission direction.
                 let dir = transform::transform_dir(&t, [0.0, 0.0, -1.0]);
                 let dir = normalize3(dir);
                 let cos_outer = cone_rad.cos();
                 let cos_inner = (cone_rad * (1.0 - blend)).cos();
-                // Approx radiance from power: point-like with directional falloff.
+                // Without IES: distribute power uniformly over the spot
+                // cone (solid_angle = 2π(1-cos_outer)).
+                // With IES: divide by the IES profile's integral so
+                // the IES profile (which can be narrower than the
+                // spot cone) controls concentration. See the Point
+                // branch for the same formulation and caveats.
                 let solid_angle = 2.0 * std::f32::consts::PI * (1.0 - cos_outer).max(1e-4);
-                let coeff = power / solid_angle;
+                let denom = match ies {
+                    Some(p) if p.integral_norm > 1e-6 => p.integral_norm,
+                    _ => solid_angle,
+                };
+                let coeff = power / denom;
                 let emission = [color[0] * coeff, color[1] * coeff, color[2] * coeff];
+                // Light's local frame for IES sampling: build from the
+                // 3×3 rotation part of `t4`. The IES table is sampled
+                // in this frame with theta from local -Z (the cone axis).
+                let light_rotation = [
+                    t4[0], t4[1], t4[2],
+                    t4[4], t4[5], t4[6],
+                    t4[8], t4[9], t4[10],
+                ];
                 spot_lights.push(SpotLight {
                     position,
                     _pad0: 0.0,
@@ -220,7 +282,12 @@ pub fn load_scene_from_bytes<'a>(
                     cos_outer,
                     emission,
                     cos_inner,
+                    ies_data: 0,
+                    ies_n_v: 0,
+                    ies_n_h: 0,
+                    light_rotation,
                 });
+                spot_ies.push(ies.clone());
             }
             LightDesc::AreaRect {
                 transform: t4,
@@ -229,8 +296,9 @@ pub fn load_scene_from_bytes<'a>(
                 power,
                 camera_visible,
                 two_sided,
+                ies,
             } => {
-                let t = transform::from_4x4_row_major(&t4);
+                let t = transform::from_4x4_row_major(t4);
                 // Local rectangle lies in XY with +Z normal, centred at origin.
                 let center = [t[3], t[7], t[11]];
                 let u_axis = normalize3(transform::transform_dir(&t, [1.0, 0.0, 0.0]));
@@ -244,18 +312,31 @@ pub fn load_scene_from_bytes<'a>(
                 let area = (size[0] * size[1]).max(1e-6);
                 let coeff = power / (area * std::f32::consts::PI);
                 let emission = [color[0] * coeff, color[1] * coeff, color[2] * coeff];
+                // Light's local frame for IES sampling: 3×3 rotation
+                // part of `t4`. The IES table is sampled with theta from
+                // local +Z (the rect emission direction).
+                let light_rotation = [
+                    t4[0], t4[1], t4[2],
+                    t4[4], t4[5], t4[6],
+                    t4[8], t4[9], t4[10],
+                ];
                 rect_lights.push(AreaRectLight {
                     corner,
                     size_u: size[0],
                     u_axis,
                     size_v: size[1],
                     v_axis,
-                    two_sided,
+                    two_sided: *two_sided,
                     normal,
-                    camera_visible,
+                    camera_visible: *camera_visible,
                     emission,
-                    power,
+                    power: *power,
+                    ies_data: 0,
+                    ies_n_v: 0,
+                    ies_n_h: 0,
+                    light_rotation,
                 });
+                rect_ies.push(ies.clone());
             }
         }
     }
@@ -341,6 +422,9 @@ pub fn load_scene_from_bytes<'a>(
         sun_lights,
         spot_lights,
         rect_lights,
+        point_ies,
+        spot_ies,
+        rect_ies,
         envmap_rgb,
         envmap_layer_a_rgb,
         envmap_layer_b_rgb,

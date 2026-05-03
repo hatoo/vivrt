@@ -176,6 +176,24 @@ pub struct PointLight {
     pub radius: f32,
     pub emission: [f32; 3],
     pub _pad: f32,
+    /// Optional IES profile attached to this light. `ies_data` points
+    /// to a CUDA buffer of `ies_n_v * max(1, ies_n_h) * 1` floats laid
+    /// out as `[h * n_v + v]` (matching `IesProfile.candelas`), already
+    /// normalised by `peak_candela` so each entry is in `[0, 1]`. Two
+    /// extra prefix floats hold the table's vertical-angle range
+    /// (theta_min_deg, theta_max_deg) and `ies_n_h` extra floats hold
+    /// the phi axis (when `n_h > 1`); the GPU lookup walks them with
+    /// `ies_lookup_normalised`. `ies_data == 0` (null) means "no IES,
+    /// emit isotropically" — the existing scenes' lights all start
+    /// here.
+    pub ies_data: optix_sys::CUdeviceptr,
+    pub ies_n_v: u32,
+    pub ies_n_h: u32,
+    /// Object→world rotation 3×3 row-major. Used to convert a
+    /// world-space sample direction into the light's local frame
+    /// before the IES lookup. Identity when no IES is attached
+    /// (Blender Point lights are isotropic without IES).
+    pub light_rotation: [f32; 9],
 }
 
 #[repr(C)]
@@ -196,6 +214,13 @@ pub struct SpotLight {
     pub cos_outer: f32,
     pub emission: [f32; 3],
     pub cos_inner: f32,
+    /// IES profile for the spot. Same layout as `PointLight::ies_data`.
+    /// Sampled in the spot's local frame; theta is from local -Z (the
+    /// cone axis).
+    pub ies_data: optix_sys::CUdeviceptr,
+    pub ies_n_v: u32,
+    pub ies_n_h: u32,
+    pub light_rotation: [f32; 9],
 }
 
 #[repr(C)]
@@ -218,6 +243,13 @@ pub struct AreaRectLight {
     pub camera_visible: u32,
     pub emission: [f32; 3],
     pub power: f32,
+    /// IES profile for the rect. Sampled in the rect's local frame
+    /// (theta from local +Z = emission axis). Same layout as
+    /// `PointLight::ies_data`.
+    pub ies_data: optix_sys::CUdeviceptr,
+    pub ies_n_v: u32,
+    pub ies_n_h: u32,
+    pub light_rotation: [f32; 9],
 }
 
 #[repr(C)]

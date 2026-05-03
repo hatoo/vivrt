@@ -32,8 +32,13 @@ BLEND_SCENE_junk_shop     := test_scenes/junk_shop/junk_shop/junk_shop.blend
 BLEND_SCENE_lone_monk     := test_scenes/lone_monk/lone_monk/lone_monk.blend
 BLEND_SCENE_pabellon      := test_scenes/pabellon/3d/pavillon_barcelone_v1.2.blend
 BLEND_SCENE_flat_archiviz := test_scenes/flat_archiviz/flat_archiviz/flat-archiviz.blend
+# Blender's official Cycles regression scene for IES profile lights —
+# Point + Spot + Area each driven by an internal `bega.ies` Text
+# datablock. 256x256@50% = 128x128 px so it renders in seconds. Use
+# this for IES correctness verification.
+BLEND_SCENE_ies_light     := test_scenes/ies_light/ies_light/ies_light.blend
 
-BLEND_SCENES          := classroom bmw27 junk_shop lone_monk pabellon flat_archiviz
+BLEND_SCENES          := classroom bmw27 junk_shop lone_monk pabellon flat_archiviz ies_light
 BLEND_PREVIEW_PNGS    := $(foreach s,$(BLEND_SCENES),test_scenes/$(s)/preview.png)
 BLEND_PREVIEW_TARGETS := $(addsuffix -preview,$(BLEND_SCENES))
 BLEND_CYCLES_PNGS     := $(foreach s,$(BLEND_SCENES),test_scenes/$(s)/preview_cycles.png)

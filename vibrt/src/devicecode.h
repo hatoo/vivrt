@@ -115,6 +115,21 @@ struct PointLight {
   float radius;
   float emission[3];
   float _pad;
+  // Optional IES (Illuminating Engineering Society) profile: directional
+  // intensity multiplier in [0, 1] sampled in the light's local frame.
+  // `ies_data` is a CUDA pointer to a candela table laid out as
+  // `[h * n_v + v]`, already normalised by the table's peak so each
+  // entry is in `[0, 1]`. Followed by `n_v` floats for the vertical-
+  // angle axis (degrees) and (when n_h > 1) `n_h` floats for the
+  // horizontal-angle axis. `ies_data == nullptr` means "no IES, emit
+  // isotropically" (the default for Blender Point lights).
+  float *ies_data;
+  unsigned int ies_n_v;
+  unsigned int ies_n_h;
+  // Object→world rotation 3×3 (row-major). Used to convert the
+  // world-space sample direction into the light's local frame before
+  // the IES table lookup. Identity when no IES is attached.
+  float light_rotation[9];
 };
 
 struct SunLight {
@@ -131,6 +146,12 @@ struct SpotLight {
   float cos_outer;
   float emission[3];
   float cos_inner;
+  // IES profile, same layout as PointLight::ies_data. Sampled in the
+  // spot's local frame; theta is from local -Z (the cone axis).
+  float *ies_data;
+  unsigned int ies_n_v;
+  unsigned int ies_n_h;
+  float light_rotation[9];
 };
 
 struct AreaRectLight {
@@ -144,6 +165,12 @@ struct AreaRectLight {
   unsigned int camera_visible;
   float emission[3];
   float power;
+  // IES profile, same layout as PointLight::ies_data. Sampled in the
+  // rect's local frame (theta from local +Z = emission axis).
+  float *ies_data;
+  unsigned int ies_n_v;
+  unsigned int ies_n_h;
+  float light_rotation[9];
 };
 
 struct LaunchParams {

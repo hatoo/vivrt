@@ -522,6 +522,47 @@ pub struct ObjectDesc {
 
 fn default_true() -> bool { true }
 
+/// IES (Illuminating Engineering Society) photometric profile.
+///
+/// Sampled in the host-side `ies::lookup_normalised` and the GPU's
+/// `ies_lookup` from `(theta, phi)` in the light's local frame, where
+/// `theta` is the angle from the light's local +Z (Blender's IES
+/// convention is angle from -Z, but the exporter inverts so that
+/// "directly down" matches +Z when sampling). The table stores raw
+/// candela values; `peak_candela` is precomputed so the runtime can
+/// normalise to a [0, 1] directional shape multiplier and let the
+/// light's own `power`/`color` carry absolute brightness — same
+/// convention Cycles uses (the IES Texture Node's `Factor` output is
+/// `candela / max(candela)`).
+#[derive(Deserialize, Clone, Debug)]
+pub struct IesProfile {
+    /// Vertical angles in degrees. Strictly increasing, in [0, 180].
+    pub thetas_deg: Vec<f32>,
+    /// Horizontal angles in degrees. Strictly increasing. Length 1
+    /// means the profile is radially symmetric.
+    pub phis_deg: Vec<f32>,
+    /// Candela values, row-major over `phis_deg × thetas_deg` so that
+    /// `candelas[h * thetas_deg.len() + v]` is the intensity at
+    /// `(phis_deg[h], thetas_deg[v])`. Length must equal
+    /// `thetas_deg.len() * phis_deg.len()`.
+    pub candelas: Vec<f32>,
+    /// Peak (maximum) candela across the table. Precomputed so the GPU
+    /// doesn't have to scan the table at every sample. Zero/negative is
+    /// treated as "no IES" (returns multiplier 1.0).
+    pub peak_candela: f32,
+    /// Solid-angle integral of `candela / peak_candela` over the
+    /// sphere (steradians). The renderer uses this to preserve total
+    /// flux when an IES is attached to a Point/Spot/Area — without
+    /// IES these lights normalise emission by `4π` (isotropic
+    /// hemisphere/sphere), with IES they use `integral_norm` instead
+    /// so a sharply-focused beam concentrates the same `power` into
+    /// a brighter peak (Cycles' convention). Computed once at export
+    /// time; zero falls back to `4π` (no normalisation, behaviour
+    /// matches an isotropic light scaled by the IES factor in [0, 1]).
+    #[serde(default)]
+    pub integral_norm: f32,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LightDesc {
@@ -531,6 +572,15 @@ pub enum LightDesc {
         power: f32,
         #[serde(default = "default_point_radius")]
         radius: f32,
+        /// Object→world rotation 3×3 (row-major). Identity when no IES
+        /// is attached. With IES, `wi_local = transpose(rotation) * wi_world`
+        /// gives the direction in light-local frame for table lookup.
+        /// Blender Point lights have a `matrix_world` rotation that is
+        /// invisible without IES (truly isotropic) but matters here.
+        #[serde(default = "identity_rotation_3x3")]
+        light_rotation: [f32; 9],
+        #[serde(default)]
+        ies: Option<IesProfile>,
     },
     Sun {
         direction: [f32; 3],
@@ -547,6 +597,11 @@ pub enum LightDesc {
         cone_rad: f32,
         #[serde(default)]
         blend: f32,
+        /// IES profile attached to this spot. Sampled in the same
+        /// local frame the cone uses (axis = local -Z = "down");
+        /// see `IesProfile`.
+        #[serde(default)]
+        ies: Option<IesProfile>,
     },
     AreaRect {
         /// 4x4 row-major. Area plane is local XY, emission along local +Z.
@@ -565,6 +620,10 @@ pub enum LightDesc {
         /// unchanged.
         #[serde(default)]
         two_sided: u32,
+        /// IES profile attached to this area light. Sampled in the
+        /// rect's local frame (emission direction = local +Z).
+        #[serde(default)]
+        ies: Option<IesProfile>,
     },
 }
 

@@ -112,6 +112,80 @@ fn alloc_and_copy_slice<T>(stream: &Arc<CudaStream>, data: &[T]) -> Result<optix
     }
 }
 
+/// Light types that carry an optional IES profile. The trait gives
+/// `upload_ies_buffers` a uniform way to patch each light's
+/// `ies_data` / `ies_n_v` / `ies_n_h` fields without three near-
+/// identical helpers.
+trait HasIes {
+    fn set_ies(&mut self, data: optix_sys::CUdeviceptr, n_v: u32, n_h: u32);
+}
+impl HasIes for crate::gpu_types::PointLight {
+    fn set_ies(&mut self, data: optix_sys::CUdeviceptr, n_v: u32, n_h: u32) {
+        self.ies_data = data;
+        self.ies_n_v = n_v;
+        self.ies_n_h = n_h;
+    }
+}
+impl HasIes for crate::gpu_types::SpotLight {
+    fn set_ies(&mut self, data: optix_sys::CUdeviceptr, n_v: u32, n_h: u32) {
+        self.ies_data = data;
+        self.ies_n_v = n_v;
+        self.ies_n_h = n_h;
+    }
+}
+impl HasIes for crate::gpu_types::AreaRectLight {
+    fn set_ies(&mut self, data: optix_sys::CUdeviceptr, n_v: u32, n_h: u32) {
+        self.ies_data = data;
+        self.ies_n_v = n_v;
+        self.ies_n_h = n_h;
+    }
+}
+
+/// Pack each `Some(IesProfile)` into a flat float buffer
+/// `[thetas (n_v) | phis (n_h) | normalised candelas (n_v * n_h)]`,
+/// upload to the device, and patch the matching light's IES fields
+/// to point at it. Returns the device pointers so the caller can keep
+/// the allocations alive for the lifetime of the render.
+///
+/// The packing is what `ies_lookup` in devicecode.cu reads; keep the
+/// two in sync.
+fn upload_ies_buffers<L: HasIes>(
+    stream: &Arc<CudaStream>,
+    lights: &mut [L],
+    profiles: &[Option<scene_format::IesProfile>],
+) -> Result<Vec<optix_sys::CUdeviceptr>> {
+    let mut out = Vec::new();
+    for (i, profile) in profiles.iter().enumerate() {
+        let Some(p) = profile else { continue; };
+        let n_v = p.thetas_deg.len();
+        let n_h = p.phis_deg.len().max(1);
+        if n_v == 0 || p.candelas.len() != n_v * p.phis_deg.len() {
+            // Malformed profile — silently skip rather than crashing
+            // mid-render. The exporter is supposed to validate; this
+            // is just defence in depth.
+            continue;
+        }
+        let peak = p.peak_candela.max(1e-6);
+        let mut buf: Vec<f32> = Vec::with_capacity(n_v + n_h + n_v * n_h);
+        buf.extend_from_slice(&p.thetas_deg);
+        // Synthesise a single phi=0 entry for radially-symmetric
+        // profiles so the GPU lookup can read the phi axis without
+        // a special case for n_h==1.
+        if p.phis_deg.is_empty() {
+            buf.push(0.0);
+        } else {
+            buf.extend_from_slice(&p.phis_deg);
+        }
+        for c in &p.candelas {
+            buf.push(c / peak);
+        }
+        let d = alloc_and_copy_slice(stream, &buf)?;
+        lights[i].set_ies(d, n_v as u32, n_h as u32);
+        out.push(d);
+    }
+    Ok(out)
+}
+
 struct GasEntry {
     handle: optix_sys::OptixTraversableHandle,
     sbt_offset: u32,
@@ -557,11 +631,23 @@ pub fn render_to_pixels(
     );
 
     // --- Lights ---
-    let d_points = alloc_and_copy_slice(&stream, &scene.point_lights)?;
+    // IES profiles must be uploaded BEFORE the light vectors are
+    // copied to the device, so each light struct carries its IES
+    // device pointer when it lands on the GPU. Patch the host-side
+    // copies in place; the upstream (LoadedScene) is consumed below
+    // anyway. `_d_ies_*` keep the device buffers alive for the
+    // lifetime of the render — drop on render exit.
+    let mut point_lights = scene.point_lights.clone();
+    let mut spot_lights = scene.spot_lights.clone();
+    let mut rect_lights = scene.rect_lights.clone();
+    let _d_ies_point = upload_ies_buffers(&stream, &mut point_lights, &scene.point_ies)?;
+    let _d_ies_spot = upload_ies_buffers(&stream, &mut spot_lights, &scene.spot_ies)?;
+    let _d_ies_rect = upload_ies_buffers(&stream, &mut rect_lights, &scene.rect_ies)?;
+    let d_points = alloc_and_copy_slice(&stream, &point_lights)?;
     let d_suns = alloc_and_copy_slice(&stream, &scene.sun_lights)?;
-    let d_spots = alloc_and_copy_slice(&stream, &scene.spot_lights)?;
-    let d_rects = alloc_and_copy_slice(&stream, &scene.rect_lights)?;
-    let rect_cdf = build_rect_light_cdf(&scene.rect_lights);
+    let d_spots = alloc_and_copy_slice(&stream, &spot_lights)?;
+    let d_rects = alloc_and_copy_slice(&stream, &rect_lights)?;
+    let rect_cdf = build_rect_light_cdf(&rect_lights);
     let d_rect_cdf = alloc_and_copy_slice(&stream, &rect_cdf)?;
 
     // --- World / envmap ---

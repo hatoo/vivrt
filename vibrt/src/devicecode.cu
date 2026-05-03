@@ -1763,6 +1763,122 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
   return s;
 }
 
+// ---------- IES profile lookup ----------
+//
+// Returns the IES table's normalised intensity multiplier in [0, 1] for
+// the world-space sample direction `dir_world` (light → surface). When
+// `ies_data == nullptr` returns 1.0 (no IES, isotropic).
+//
+// Layout of `ies_data` matches `upload_ies_buffers` in render.rs:
+//   [0           .. n_v          ): vertical angles in degrees (theta)
+//   [n_v         .. n_v + n_h    ): horizontal angles in degrees (phi)
+//   [n_v + n_h   .. + n_v * n_h  ): normalised candelas, row-major over
+//                                    phi × theta — `[h * n_v + v]`
+//
+// Convention: `light_rotation` is the light's object→world 3×3 (row-
+// major). We invert (transpose for pure rotations) to convert
+// `dir_world` into the light's local frame, then derive theta from the
+// local -Z axis (the IES "down" convention) and phi from atan2 around
+// local +Z.
+static __device__ float ies_lookup(const float *ies_data,
+                                   unsigned int n_v, unsigned int n_h,
+                                   const float *light_rotation,
+                                   float3 dir_world) {
+  if (ies_data == nullptr || n_v == 0 || n_h == 0)
+    return 1.0f;
+  // light_rotation row-major: rows are world-space basis vectors of the
+  // light's local axes. world→local = transpose(rotation), so the local
+  // dir is (rotation[col 0] · world, rotation[col 1] · world, ...)
+  // expressed as: local.x = R[0]·d + R[3]·d.y + R[6]·d.z (column 0).
+  float3 local;
+  local.x = light_rotation[0] * dir_world.x + light_rotation[3] * dir_world.y +
+            light_rotation[6] * dir_world.z;
+  local.y = light_rotation[1] * dir_world.x + light_rotation[4] * dir_world.y +
+            light_rotation[7] * dir_world.z;
+  local.z = light_rotation[2] * dir_world.x + light_rotation[5] * dir_world.y +
+            light_rotation[8] * dir_world.z;
+  float len = sqrtf(dot3(local, local));
+  if (len < 1e-12f)
+    return 1.0f;
+  // theta from -Z (IES "down" convention). cos(theta) = dot(local, -Z) =
+  // -local.z / len.
+  float cos_t = fminf(1.0f, fmaxf(-1.0f, -local.z / len));
+  float theta_deg = acosf(cos_t) * (180.0f / M_PIf);
+  // phi: angle around the IES axis. atan2(local.y, local.x) in radians,
+  // then to degrees in [0, 360).
+  float phi_rad = atan2f(local.y, local.x);
+  if (phi_rad < 0.0f)
+    phi_rad += 2.0f * M_PIf;
+  float phi_deg = phi_rad * (180.0f / M_PIf);
+
+  // Bilinear lookup in the table.
+  const float *thetas = ies_data;
+  const float *phis = ies_data + n_v;
+  const float *cands = ies_data + n_v + n_h;
+
+  // Vertical-angle bracket. Clamp to table range; IES profiles often
+  // have a sparse range like [0, 90] (downlights) so anything below
+  // theta[0] takes theta[0] and anything above theta[n_v-1] takes the
+  // last entry (typically 0 candela for properly authored downlights).
+  unsigned int v_lo = 0, v_hi = 0;
+  float tv = 0.0f;
+  if (theta_deg <= thetas[0]) {
+    v_lo = 0; v_hi = 0;
+  } else if (theta_deg >= thetas[n_v - 1]) {
+    v_lo = n_v - 1; v_hi = n_v - 1;
+  } else {
+    for (unsigned int i = 0; i + 1 < n_v; i++) {
+      if (thetas[i] <= theta_deg && theta_deg < thetas[i + 1]) {
+        v_lo = i;
+        v_hi = i + 1;
+        float span = thetas[v_hi] - thetas[v_lo];
+        tv = (span > 0.0f) ? (theta_deg - thetas[v_lo]) / span : 0.0f;
+        break;
+      }
+    }
+  }
+
+  // Horizontal-angle bracket. n_h == 1 means radially symmetric — phi
+  // is ignored. Otherwise fold phi according to the table's coverage:
+  // phi_max ≤ 90 → quadrant symmetric, ≤ 180 → bilateral, else full.
+  unsigned int h_lo = 0, h_hi = 0;
+  float th = 0.0f;
+  if (n_h > 1) {
+    float phi_max = phis[n_h - 1];
+    float p = phi_deg;
+    if (phi_max <= 90.0f) {
+      p = fmodf(p, 180.0f);
+      if (p > 90.0f) p = 180.0f - p;
+      if (p > 90.0f) p = 90.0f;
+    } else if (phi_max <= 180.0f) {
+      if (p > 180.0f) p = 360.0f - p;
+    }
+    if (p <= phis[0]) {
+      h_lo = 0; h_hi = 0;
+    } else if (p >= phis[n_h - 1]) {
+      h_lo = n_h - 1; h_hi = n_h - 1;
+    } else {
+      for (unsigned int i = 0; i + 1 < n_h; i++) {
+        if (phis[i] <= p && p < phis[i + 1]) {
+          h_lo = i;
+          h_hi = i + 1;
+          float span = phis[h_hi] - phis[h_lo];
+          th = (span > 0.0f) ? (p - phis[h_lo]) / span : 0.0f;
+          break;
+        }
+      }
+    }
+  }
+
+  float a = cands[h_lo * n_v + v_lo];
+  float b = cands[h_lo * n_v + v_hi];
+  float c = cands[h_hi * n_v + v_lo];
+  float d = cands[h_hi * n_v + v_hi];
+  float ab = a * (1.0f - tv) + b * tv;
+  float cd = c * (1.0f - tv) + d * tv;
+  return ab * (1.0f - th) + cd * th;
+}
+
 // ---------- Direct lighting (NEE) ----------
 //
 // `vstack` is the shadow ray's starting volume stack. For surface NEE this is
@@ -1790,7 +1906,13 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
     if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi);
-    L = L + b.f * vis * make_f3(pl.emission) / fmaxf(d * d, 1e-6f);
+    // IES: directional intensity multiplier in [0, 1] sampled in the
+    // light's local frame. `wi` points from surface to light, so the
+    // direction "from light toward surface" is `-wi`. ies_lookup
+    // returns 1.0 when no IES is attached.
+    float ies = ies_lookup(pl.ies_data, pl.ies_n_v, pl.ies_n_h,
+                           pl.light_rotation, -wi);
+    L = L + b.f * vis * make_f3(pl.emission) * ies / fmaxf(d * d, 1e-6f);
   }
 
   // Sun lights: sample within cone
@@ -1837,7 +1959,9 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
     if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi);
-    L = L + b.f * vis * make_f3(sp.emission) * falloff /
+    float ies = ies_lookup(sp.ies_data, sp.ies_n_v, sp.ies_n_h,
+                           sp.light_rotation, -wi);
+    L = L + b.f * vis * make_f3(sp.emission) * falloff * ies /
                 fmaxf(d * d, 1e-6f);
   }
 
@@ -1872,7 +1996,9 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
             float pdf_solid = pdf_area * d2 / cos_light;
             float pdf = pdf_solid * pmf_light;
             if (pdf > 0.0f) {
-              L = L + b.f * vis * make_f3(ar.emission) / pdf;
+              float ies = ies_lookup(ar.ies_data, ar.ies_n_v, ar.ies_n_h,
+                                     ar.light_rotation, -wi);
+              L = L + b.f * vis * make_f3(ar.emission) * ies / pdf;
             }
           }
         }
@@ -2007,7 +2133,9 @@ static __device__ float3 direct_light_volume(float3 P, float3 wi_world,
             float pdf_solid = pdf_area * d2 / cos_light;
             float pdf = pdf_solid * pmf_light;
             if (pdf > 0.0f) {
-              add(wi, make_f3(ar.emission) / pdf, vis);
+              float ies = ies_lookup(ar.ies_data, ar.ies_n_v, ar.ies_n_h,
+                                     ar.light_rotation, -wi);
+              add(wi, make_f3(ar.emission) * ies / pdf, vis);
             }
           }
         }
@@ -2351,7 +2479,18 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
                0, // miss index (radiance miss)
                hi, lo);
     if (bounce == 0 && v.hit != 0 && dot3(v.Ng, dir) > 0.0f) {
-      if (camera_skip < 4) {
+      // Only skip back-faces that are near `clip_start` — the workaround's
+      // intent is to hide a wall the camera sits inside (flat_archiviz:
+      // 0.35m wall, front at 1.7m=clip_start, back at 2.05m). Distant
+      // back-faces (e.g. ies_light's room walls authored with normals
+      // facing outward, hit at ~5.9m through clear air) are NOT what we
+      // want to skip — doing so makes the camera ray miss the entire
+      // scene and renders pitch black. Use a 1m thickness budget past
+      // `clip_start`: enough for a thick interior wall, tight enough to
+      // not eat any genuine back-facing geometry past the camera region.
+      float t_hit = sqrtf(dot3(v.P - origin, v.P - origin));
+      bool near_clip = t_hit < first_ray_tmin + 1.0f;
+      if (near_clip && camera_skip < 4) {
         // Back-face hit on the camera ray: step past it and retry without
         // counting this as a bounce. Cap the retry depth so a pathological
         // all-back-faces direction can't loop forever.
@@ -2363,12 +2502,13 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
         bounce--;  // wraps to UINT_MAX, the for-loop's bounce++ brings it back to 0
         continue;
       }
-      // Cap exhausted — flag it so the host can warn after the launch,
-      // then fall through and shade this back-face anyway (the dark
-      // interior is still better than pitch black). One increment per
-      // sample-per-pixel where this happens; the host divides by SPP for
-      // a pixel-count estimate.
-      if (params.primary_back_face_skip_exhausted != nullptr) {
+      // Cap exhausted (or back-face is far from clip_start so we treat it
+      // as a regular interior hit) — flag it so the host can warn after the
+      // launch, then fall through and shade this back-face. One increment
+      // per sample-per-pixel where the cap is the reason we fall through;
+      // distant back-faces are silent because the eval_material path below
+      // flips Ns and shades them like a normal interior surface.
+      if (near_clip && params.primary_back_face_skip_exhausted != nullptr) {
         atomicAdd(params.primary_back_face_skip_exhausted, 1u);
       }
     }
@@ -2460,8 +2600,14 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
       // here, so they don't occlude primary/specular rays. Add emission
       // on primary rays and after specular bounces; NEE covers diffuse.
       if (bounce == 0 || last_specular) {
-        float3 em =
-            throughput * make_f3(params.rect_lights[rect_idx].emission);
+        AreaRectLight &ar = params.rect_lights[rect_idx];
+        // IES applies to direct camera-ray hits too — Cycles' IES Texture
+        // multiplies emission for every visibility class, not just NEE.
+        // `dir` is camera→light here; the IES table is sampled in the
+        // light's local frame.
+        float ies = ies_lookup(ar.ies_data, ar.ies_n_v, ar.ies_n_h,
+                               ar.light_rotation, dir);
+        float3 em = throughput * make_f3(ar.emission) * ies;
         if (bounce > 0)
           em = clamp_indirect(em, params.clamp_indirect);
         L = L + em;

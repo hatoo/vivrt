@@ -19,7 +19,7 @@ import time
 
 import bpy
 
-from . import _log, hair_export, material_export
+from . import _log, hair_export, ies, material_export
 from ._log import log as _emit
 
 
@@ -623,22 +623,127 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
     }
 
 
-def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
-    """Return (strength, color) contributed by an Emission shader driving the
-    Light Output, as a multiplier on top of `light.energy`/`light.color`.
+def _resolve_ies_table(ies_node) -> dict | None:
+    """Parse a `ShaderNodeTexIES` into the JSON `ies` block expected by
+    `LightDesc.{Point,Spot,AreaRect}.ies` (`scene_format::IesProfile`).
 
-    Cycles evaluates the light's shader tree and multiplies its output with
-    `light.energy * light.color`, so an Emission node whose Strength was edited
-    directly on the node (rather than via the UI's Power field) still influences
-    the render. classroom.blend's `blackBoard_light` and `sun` both rely on
-    this: their `light.energy` is leftover UI value, and the node's Strength is
-    the real source of truth.
+    Returns None — with a warning — if the node's IES content is
+    unreadable: external file missing or unreadable, internal Text
+    datablock empty, or the IES content fails the LM-63 parse.
+    """
+    text = None
+    label = ies_node.name
+    if ies_node.mode == "INTERNAL" and ies_node.ies is not None:
+        try:
+            text = ies_node.ies.as_string()
+        except Exception as ex:
+            _emit(
+                f"[vibrt] warn: IES node {label!r}: failed to read internal "
+                f"Text datablock {ies_node.ies.name!r}: {ex}"
+            )
+            return None
+    elif ies_node.mode == "EXTERNAL" and ies_node.filepath:
+        path = bpy.path.abspath(ies_node.filepath)
+        try:
+            with open(path, "r", encoding="latin-1") as f:
+                text = f.read()
+        except OSError as ex:
+            _emit(
+                f"[vibrt] warn: IES node {label!r}: cannot open external file "
+                f"{path!r}: {ex} — light will not get an IES profile"
+            )
+            return None
+    else:
+        _emit(
+            f"[vibrt] warn: IES node {label!r}: mode={ies_node.mode!r} but "
+            f"neither internal Text nor external filepath has IES content — "
+            f"light will not get an IES profile"
+        )
+        return None
+    try:
+        table = ies.parse_ies(text)
+    except Exception as ex:
+        _emit(
+            f"[vibrt] warn: IES node {label!r}: parse error: {ex} — "
+            f"light will not get an IES profile"
+        )
+        return None
+    return {
+        "thetas_deg": list(table.thetas_deg),
+        "phis_deg": list(table.phis_deg),
+        "candelas": list(table.candelas),
+        "peak_candela": float(table.peak_candela),
+        # Solid-angle integral of the [0, 1]-normalised table. The
+        # renderer divides 4π by this to compensate for the IES being
+        # concentrated into a beam: an isotropic Point uses
+        # `power / (4π)` so flux is preserved; an IES Point should use
+        # `power / integral_norm` for the same reason. Sent across as
+        # a precomputed scalar so the GPU doesn't have to integrate.
+        "integral_norm": float(table.integral_normalised()),
+    }
 
-    Returns (1.0, (1, 1, 1)) when there's no usable Emission — callers then see
-    `light.energy`/`light.color` unchanged.
+
+def _follow_through_group(start_node, start_socket_name):
+    """Walk into a `ShaderNodeGroup` to find what drives its
+    `start_socket_name` output (the canonical IES idiom is to wrap the
+    Emission + IES Texture inside a NodeGroup, exposed as Color /
+    Strength inputs and an Emission output). Returns the (inner_node,
+    inner_input_socket_name_for_strength_lookup, group_input_strength_default,
+    group_input_color_default) tuple, or None if the group's contents
+    don't match the expected pattern.
+    """
+    if start_node.bl_idname != "ShaderNodeGroup" or start_node.node_tree is None:
+        return None
+    tree = start_node.node_tree
+    out = next(
+        (n for n in tree.nodes if n.bl_idname == "NodeGroupOutput"
+         and getattr(n, "is_active_output", True)),
+        None,
+    )
+    if out is None:
+        return None
+    sock = out.inputs.get(start_socket_name)
+    if sock is None:
+        # Some Light Outputs use "Surface", group output uses "Emission".
+        # Try the first connected input.
+        for s in out.inputs:
+            if s.is_linked:
+                sock = s
+                break
+        if sock is None:
+            return None
+    if not sock.is_linked:
+        return None
+    inner = sock.links[0].from_node
+    return inner
+
+
+def _light_node_emission(light) -> tuple[float, tuple[float, float, float], dict | None]:
+    """Return `(strength, color, ies)` contributed by the light's shader
+    tree, as multipliers on top of `light.energy`/`light.color`.
+
+    Cycles evaluates the light's shader tree and multiplies its output
+    with `light.energy * light.color`. Three patterns we recognise:
+
+    1. `Output ← Emission(Strength=K, Color=C)` — classic case;
+       returns (K, C, None).
+    2. `Output ← Emission(Strength=Light Falloff(Strength=K), Color=C)`
+       — classroom's blackBoard_light; vibrt does its own physical
+       falloff so we just fold K and ignore the Falloff output choice.
+    3. `Output ← NodeGroup(Color=C, Strength=K) → ... → Emission` with
+       an inner `ShaderNodeTexIES` driving `Emission.Strength` — the
+       canonical IES Texture idiom (Blender's official ies_light test
+       scene uses exactly this). The IES table becomes an attached
+       photometric profile on the resulting light; `K` becomes the
+       outer multiplier on light.energy. Without recognising this
+       pattern, the IES factor is dropped entirely (the wrapping
+       NodeGroup confuses the simple Emission-only walk).
+
+    Returns `(1.0, (1, 1, 1), None)` when there's no usable Emission —
+    the callers then see `light.energy`/`light.color` unchanged.
     """
     if not light.use_nodes or light.node_tree is None:
-        return 1.0, (1.0, 1.0, 1.0)
+        return 1.0, (1.0, 1.0, 1.0), None
     out = next(
         (n for n in light.node_tree.nodes
          if n.bl_idname == "ShaderNodeOutputLight" and n.is_active_output),
@@ -651,36 +756,82 @@ def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
             None,
         )
     if out is None:
-        return 1.0, (1.0, 1.0, 1.0)
+        return 1.0, (1.0, 1.0, 1.0), None
     surf = out.inputs.get("Surface")
     if surf is None or not surf.is_linked:
-        return 1.0, (1.0, 1.0, 1.0)
+        return 1.0, (1.0, 1.0, 1.0), None
     src = surf.links[0].from_node
+
+    # Pattern 3: NodeGroup wrapping IES Texture. Detect by descending
+    # through the group, finding the inner Emission, and inspecting its
+    # Strength chain for a ShaderNodeTexIES.
+    if src.bl_idname == "ShaderNodeGroup":
+        inner = _follow_through_group(src, "Emission")
+        if inner is not None and inner.bl_idname == "ShaderNodeEmission":
+            s_sock = inner.inputs.get("Strength")
+            c_sock = inner.inputs.get("Color")
+            ies_table = None
+            ies_strength_mult = 1.0
+            color_mult = (1.0, 1.0, 1.0)
+            if s_sock is not None and s_sock.is_linked:
+                up = s_sock.links[0].from_node
+                if up.bl_idname == "ShaderNodeTexIES":
+                    ies_table = _resolve_ies_table(up)
+                    # IES Texture's own Strength input is a 1.0-default
+                    # multiplier. Inside a NodeGroup it's typically driven
+                    # by Group Input → outer Group node; resolve to a
+                    # constant by querying the outer Group input.
+                    ies_strength_mult = _socket_value_via_group(
+                        up.inputs.get("Strength"), src, default=1.0
+                    )
+            if c_sock is not None:
+                color_mult = _socket_color_via_group(c_sock, src,
+                                                    default=(1.0, 1.0, 1.0))
+            if ies_table is not None:
+                return ies_strength_mult, color_mult, ies_table
+        # Fall through with a warning — group present but not the IES
+        # idiom we recognise.
+        _emit(
+            f"[vibrt] warn: light {light.name!r}: Surface driven by "
+            f"{src.bl_idname} (NodeGroup but not the IES Texture idiom) "
+            f"— using light.energy × light.color unchanged"
+        )
+        return 1.0, (1.0, 1.0, 1.0), None
+
     if src.bl_idname != "ShaderNodeEmission":
         _emit(
             f"[vibrt] warn: light {light.name!r}: Surface driven by "
             f"{src.bl_idname} (expected ShaderNodeEmission) — using "
             f"light.energy × light.color unchanged"
         )
-        return 1.0, (1.0, 1.0, 1.0)
+        return 1.0, (1.0, 1.0, 1.0), None
+
+    # Patterns 1 and 2: bare Emission, possibly with Light Falloff or
+    # IES Texture (no NodeGroup) on Strength.
     s_sock = src.inputs.get("Strength")
     c_sock = src.inputs.get("Color")
+    ies_table = None
     if s_sock is None:
         strength = 1.0
     elif s_sock.is_linked:
-        # Light Falloff drives Emission.Strength on classroom's blackBoard_light:
-        # its own Strength input is the pre-falloff multiplier. Our renderer
-        # already does physical inverse-square on area/point lights, so we use
-        # that raw value and ignore which falloff output was picked.
         up = s_sock.links[0].from_node
         if up.bl_idname == "ShaderNodeLightFalloff":
             inner = up.inputs.get("Strength")
             strength = float(inner.default_value) if inner is not None and not inner.is_linked else 1.0
+        elif up.bl_idname == "ShaderNodeTexIES":
+            # Bare IES Texture (not wrapped in a NodeGroup). Its Strength
+            # input acts as a multiplier on the IES table; bake it into
+            # the light's overall strength.
+            ies_table = _resolve_ies_table(up)
+            ies_in = up.inputs.get("Strength")
+            strength = (float(ies_in.default_value)
+                        if ies_in is not None and not ies_in.is_linked
+                        else 1.0)
         else:
             _emit(
                 f"[vibrt] warn: light {light.name!r}: Emission Strength is "
-                f"driven by {up.bl_idname} (expected ShaderNodeLightFalloff) "
-                f"— using strength=1.0"
+                f"driven by {up.bl_idname} (expected ShaderNodeLightFalloff "
+                f"or ShaderNodeTexIES) — using strength=1.0"
             )
             strength = 1.0
     else:
@@ -688,9 +839,6 @@ def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
     if c_sock is None:
         color = (1.0, 1.0, 1.0)
     elif c_sock.is_linked:
-        # Resolve via the same constant-folding machinery used for material
-        # Emission.Color, so a Blackbody / Attribute / procedural drop-in
-        # collapses to its neutral constant instead of being thrown away.
         rgb = material_export._socket_constant_rgb(c_sock)
         if rgb is None:
             _emit(
@@ -703,12 +851,57 @@ def _light_node_emission(light) -> tuple[float, tuple[float, float, float]]:
     else:
         cv = c_sock.default_value
         color = (float(cv[0]), float(cv[1]), float(cv[2]))
-    return strength, color
+    return strength, color, ies_table
+
+
+def _socket_value_via_group(socket, group_node, *, default: float) -> float:
+    """Resolve a scalar socket inside a NodeGroup by hopping out to the
+    enclosing group node's matching input, used by the IES idiom: the
+    `IES Texture.Strength` input is wired to a `Group Input`, whose
+    real value lives on the outer Group node's input slot."""
+    if socket is None:
+        return default
+    if not socket.is_linked:
+        return float(socket.default_value)
+    up = socket.links[0].from_node
+    if up.bl_idname == "NodeGroupInput":
+        outer = group_node.inputs.get(socket.links[0].from_socket.name)
+        if outer is None:
+            return default
+        if outer.is_linked:
+            # Could chain further; for simplicity just take its default.
+            return default
+        return float(outer.default_value)
+    return default
+
+
+def _socket_color_via_group(socket, group_node, *, default: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Same hop for an RGB Color socket — the NodeGroup's `Color` input
+    is exposed and the outer Group node's matching input carries the
+    artist-set value."""
+    if socket is None:
+        return default
+    if not socket.is_linked:
+        cv = socket.default_value
+        return (float(cv[0]), float(cv[1]), float(cv[2]))
+    up = socket.links[0].from_node
+    if up.bl_idname == "NodeGroupInput":
+        outer = group_node.inputs.get(socket.links[0].from_socket.name)
+        if outer is None:
+            return default
+        if outer.is_linked:
+            rgb = material_export._socket_constant_rgb(outer)
+            if rgb is None:
+                return default
+            return (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+        cv = outer.default_value
+        return (float(cv[0]), float(cv[1]), float(cv[2]))
+    return default
 
 
 def _export_light(obj, writer, textures: list) -> dict | None:
     light = obj.data
-    node_strength, node_color = _light_node_emission(light)
+    node_strength, node_color, ies_table = _light_node_emission(light)
     energy = float(light.energy) * node_strength
     col = [light.color[0] * node_color[0],
            light.color[1] * node_color[1],
@@ -716,13 +909,27 @@ def _export_light(obj, writer, textures: list) -> dict | None:
     mw = _matrix_to_row_major(obj.matrix_world)
     if light.type == "POINT":
         position = [obj.matrix_world[i][3] for i in range(3)]
-        return {
+        # Pull the 3×3 rotation out of the world matrix so the kernel
+        # can sample the IES table in the light's local frame. Without
+        # IES the rotation is invisible (Point is isotropic) but we
+        # always emit it so the schema stays uniform.
+        m = obj.matrix_world
+        light_rotation = [
+            m[0][0], m[0][1], m[0][2],
+            m[1][0], m[1][1], m[1][2],
+            m[2][0], m[2][1], m[2][2],
+        ]
+        out = {
             "type": "point",
             "position": position,
             "color": col,
             "power": energy,
             "radius": max(light.shadow_soft_size, 0.005),
+            "light_rotation": light_rotation,
         }
+        if ies_table is not None:
+            out["ies"] = ies_table
+        return out
     if light.type == "SUN":
         # Blender sun: local -Z is the direction photons travel (i.e.
         # the forward / away-from-sun direction in world). Export that;
@@ -737,7 +944,7 @@ def _export_light(obj, writer, textures: list) -> dict | None:
             "angle_rad": float(light.angle),
         }
     if light.type == "SPOT":
-        return {
+        out = {
             "type": "spot",
             "transform": mw,
             "color": col,
@@ -745,6 +952,9 @@ def _export_light(obj, writer, textures: list) -> dict | None:
             "cone_rad": float(light.spot_size) * 0.5,
             "blend": float(light.spot_blend),
         }
+        if ies_table is not None:
+            out["ies"] = ies_table
+        return out
     if light.type == "AREA":
         if light.shape == "SQUARE":
             size = [float(light.size), float(light.size)]
@@ -764,7 +974,7 @@ def _export_light(obj, writer, textures: list) -> dict | None:
         mw_flipz[6] = -mw_flipz[6]
         mw_flipz[10] = -mw_flipz[10]
         mw_flipz[14] = -mw_flipz[14]
-        return {
+        out = {
             "type": "area_rect",
             "transform": mw_flipz,
             "size": size,
@@ -777,6 +987,9 @@ def _export_light(obj, writer, textures: list) -> dict | None:
             # on the Rust side (camera_visible=1) draws them as geometry.
             "camera_visible": 1 if getattr(obj, "visible_camera", True) else 0,
         }
+        if ies_table is not None:
+            out["ies"] = ies_table
+        return out
     _emit(
         f"[vibrt] warn: light {obj.name!r}: type={light.type!r} not supported "
         f"(only POINT/SUN/SPOT/AREA) — light dropped"
@@ -2290,7 +2503,17 @@ def _export_into(
     # generous defaults when Cycles' settings are missing (e.g. a
     # vibrt-only scene without the cycles addon active).
     cy = getattr(scene, "cycles", None)
-    max_depth = int(getattr(cy, "max_bounces", 12)) if cy is not None else 12
+    # Off-by-one between Cycles and vibrt: Cycles' `max_bounces=N` means
+    # at most N *secondary* bounces (the camera ray + first-hit NEE
+    # always run, even at N=0), while vibrt's path-tracer loop iterates
+    # `bounce in 0..max_depth` and does NEE inside the loop body. So
+    # `max_depth = max_bounces + 1` keeps "first iteration = primary +
+    # direct" intact at small N. Without this, a regression scene with
+    # `cycles.max_bounces=0` (Blender's official ies_light test) renders
+    # all-black because the loop never executes. Larger production caps
+    # (12+) drift by one but the difference is invisible there.
+    cy_mb = int(getattr(cy, "max_bounces", 12)) if cy is not None else 12
+    max_depth = cy_mb + 1
     max_diffuse = int(getattr(cy, "diffuse_bounces", max_depth)) if cy is not None else max_depth
     max_glossy = int(getattr(cy, "glossy_bounces", max_depth)) if cy is not None else max_depth
     max_transmission = int(getattr(cy, "transmission_bounces", max_depth)) if cy is not None else max_depth
