@@ -73,6 +73,68 @@ def _approx_mesh_as_rect(mesh, m3, mw):
     return centroid, u_axis_w, v_axis_w, normal_w, side, side
 
 
+def _try_mixed_emissive_proxy(obj, obj_eval, mat_params):
+    """For meshes whose material has both emission AND a non-emissive lobe
+    (Principled BSDF with `emission_strength != 0` plus a non-zero
+    base_color, or a MixShader of an emissive Principled and a Translucent
+    fabric), return a `camera_visible=False` rect light dict that
+    approximates the mesh's emission for NEE. The caller should keep the
+    mesh in the geometry export so primary visibility, BSDF reflections,
+    and the diffuse half of the surface are unchanged.
+
+    The kernel's "add emission only on bounce==0 or last_specular" gate
+    keeps double-counting under control: at diffuse bounces the BSDF-
+    sampled emission is suppressed, so the rect proxy is the only
+    emission contributor — exactly what we want. At specular bounces
+    (mirror reflection of the lamp) the mesh's emission is what gets
+    added, and the proxy doesn't fire because NEE skips delta lobes.
+
+    Returns None when emission is effectively zero or the mesh is
+    geometrically degenerate. Pure-emissive meshes are still routed
+    through `_try_emissive_quad_as_rect_light` first (full replacement)
+    — this function is the second-chance path for everything else.
+    """
+    if mat_params is None:
+        return None
+    emission = mat_params.get("emission", [0, 0, 0])
+    if not any(e > 1e-6 for e in emission):
+        return None
+    # Skip materials whose emission comes from a per-pixel texture — a
+    # uniform rect proxy would average over the texture's spatial detail
+    # and inject a uniform glow where the texture has cold areas.
+    if "emission_tex" in mat_params:
+        return None
+
+    mesh = obj_eval.data
+    if len(mesh.polygons) == 0:
+        return None
+    mw = obj_eval.matrix_world
+    m3 = mw.to_3x3()
+    rect_info = _approx_mesh_as_rect(mesh, m3, mw)
+    if rect_info is None:
+        return None
+    center_w, u_axis_w, v_axis_w, normal_w, size_u, size_v = rect_info
+
+    transform = [
+        u_axis_w.x, v_axis_w.x, normal_w.x, center_w.x,
+        u_axis_w.y, v_axis_w.y, normal_w.y, center_w.y,
+        u_axis_w.z, v_axis_w.z, normal_w.z, center_w.z,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    area = size_u * size_v
+    return {
+        "type": "area_rect",
+        "transform": transform,
+        "size": [size_u, size_v],
+        "color": list(emission),
+        "power": area * math.pi,
+        # Critical: NEE-only proxy. Camera and specular rays still see
+        # the original mesh, so emission isn't double-counted.
+        "camera_visible": 0,
+        "two_sided": 1,
+    }
+
+
 def _try_emissive_quad_as_rect_light(obj, obj_eval, mat_params):
     """If obj_eval is a pure-emissive mesh, return an AreaRect light JSON
     dict that vibrt's NEE can sample. Otherwise None.
@@ -1881,6 +1943,19 @@ def _export_into(
                         if rect is not None:
                             lights_json.append(rect)
                             continue
+                        # Mixed-emissive (mesh has emission + a non-zero
+                        # diffuse lobe / textures). Add a NEE-only rect proxy
+                        # so diffuse receivers can sample the lamp; keep the
+                        # mesh visible to the camera so its actual silhouette
+                        # / fabric / specular response renders normally.
+                        # flat_archiviz's Lamp Gubi (Principled with
+                        # emission_strength=2 mixed with Translucent fabric)
+                        # is the canonical case.
+                        proxy = _try_mixed_emissive_proxy(
+                            obj, obj_eval, materials[slot_mat_ids[0]]
+                        )
+                        if proxy is not None:
+                            lights_json.append(proxy)
 
                     # Skip meshes that Cycles hides from camera — they're light
                     # portals (e.g. classroom's `windows` dayLight_portal) meant
