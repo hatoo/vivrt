@@ -186,25 +186,38 @@ pub fn load_scene_from_bytes<'a>(
                 // using it as I made pendants ~1/(πr²) times too bright.
                 let r = radius.max(1e-3);
                 // Without IES: isotropic, divide by 4π so ∫ I dΩ = power.
-                // With IES: divide by the IES profile's solid-angle
-                // integral over the sphere of the [0, 1]-normalised
-                // candela table, so ∫ I(θ, φ) dΩ = coeff × integral_norm
-                // = power. This concentrates `power` into a sharper
-                // peak when the IES beam is narrow (downlight, spot,
-                // etc.). It's a flux-preservation normalisation, not
-                // an exact Cycles match — Cycles' IES Texture node
-                // returns absolute candelas multiplied by the per-light
-                // strength, which empirically tracks 2× brighter than
-                // this approach on the official ies_light test scene
-                // (likely an additional factor in Cycles' light eval
-                // chain we haven't replicated). The basic directional
-                // shape is correct here; absolute brightness may need
-                // a second pass once we pin down Cycles' formula.
-                let denom = match ies {
-                    Some(p) if p.integral_norm > 1e-6 => p.integral_norm,
-                    _ => 4.0 * std::f32::consts::PI,
+                // With IES: Cycles convention — `coeff = power ×
+                // peak_absolute_candela / (4π)`. Reasoning from
+                // `c:/tmp/cycles-src/src/util/ies.cpp:151,164-180` +
+                // `kernel/svm/ies.h:31` + `scene/light.cpp:107,141-144`
+                // + `kernel/light/point.h:64-77`:
+                //
+                //   - `normalize=true` (default for Cycles Point lights) →
+                //     `invarea = 1/area_sphere = 1/(4πr²)`, special-cased to
+                //     `invarea = 1/4` when r=0 (`area = 4` sentinel).
+                //   - `eval_fac = invarea × 1/π = 1/(4π)` for r=0.
+                //   - For the ad-hoc disk path used at r=0,
+                //     `pdf = 1 × d²/cos_disc = d²` (disc-normal aligned with
+                //     ray, so cos=1).
+                //   - contribution = bsdf × Le × eval_fac / pdf
+                //     = bsdf × Le × 1/(4π) × cos_surf / d²,
+                //     with Le = color × klight->strength ×
+                //              kernel_ies_interp(angle).
+                //
+                // vibrt's kernel uses `Le_per_dir_vibrt = color × coeff ×
+                // ies_normalised(angle)` (table stores `cd/peak_cd`), so
+                // to match: coeff = power × peak_absolute_candela / (4π).
+                // For old json blobs without `peak_absolute_candela`, fall
+                // back to the legacy `power / integral_norm`
+                // flux-preservation path.
+                let coeff = match ies {
+                    Some(p) if p.peak_absolute_candela > 1e-6 => {
+                        power * p.peak_absolute_candela
+                            / (4.0 * std::f32::consts::PI)
+                    }
+                    Some(p) if p.integral_norm > 1e-6 => power / p.integral_norm,
+                    _ => power / (4.0 * std::f32::consts::PI),
                 };
-                let coeff = power / denom;
                 let emission = [color[0] * coeff, color[1] * coeff, color[2] * coeff];
                 point_lights.push(PointLight {
                     position: *position,
@@ -261,11 +274,19 @@ pub fn load_scene_from_bytes<'a>(
                 // spot cone) controls concentration. See the Point
                 // branch for the same formulation and caveats.
                 let solid_angle = 2.0 * std::f32::consts::PI * (1.0 - cos_outer).max(1e-4);
-                let denom = match ies {
-                    Some(p) if p.integral_norm > 1e-6 => p.integral_norm,
-                    _ => solid_angle,
+                let coeff = match ies {
+                    Some(p) if p.peak_absolute_candela > 1e-6 => {
+                        // Cycles convention — see Point branch for the
+                        // `power × peak_absolute_candela / π` derivation.
+                        // Spot-cone attenuation is layered on top in the
+                        // kernel, but the IES already encodes the
+                        // beam shape so the spot's own cone usually
+                        // matches or exceeds the IES envelope.
+                        power * p.peak_absolute_candela / std::f32::consts::PI
+                    }
+                    Some(p) if p.integral_norm > 1e-6 => power / p.integral_norm,
+                    _ => power / solid_angle,
                 };
-                let coeff = power / denom;
                 let emission = [color[0] * coeff, color[1] * coeff, color[2] * coeff];
                 // Light's local frame for IES sampling: build from the
                 // 3×3 rotation part of `t4`. The IES table is sampled

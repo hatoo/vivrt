@@ -673,13 +673,18 @@ def _resolve_ies_table(ies_node) -> dict | None:
         "phis_deg": list(table.phis_deg),
         "candelas": list(table.candelas),
         "peak_candela": float(table.peak_candela),
-        # Solid-angle integral of the [0, 1]-normalised table. The
-        # renderer divides 4π by this to compensate for the IES being
-        # concentrated into a beam: an isotropic Point uses
-        # `power / (4π)` so flux is preserved; an IES Point should use
-        # `power / integral_norm` for the same reason. Sent across as
-        # a precomputed scalar so the GPU doesn't have to integrate.
+        # Solid-angle integral of the [0, 1]-normalised table. Kept for
+        # the legacy "flux preservation" path the renderer used to apply
+        # (`power / integral_norm`); now superseded by the absolute-candela
+        # Cycles convention via `peak_absolute_candela`, but still emitted
+        # so old scene.json blobs round-trip cleanly.
         "integral_norm": float(table.integral_normalised()),
+        # Cycles' absolute peak intensity in W/sr: `peak_candela ×
+        # multiplier × ballast × ballast_lamp × 4π/177.83`. The renderer
+        # uses this with the user's lamp energy to deliver
+        # `Le_at_angle = energy × peak_absolute_candela × ies_normalised`,
+        # mirroring `kernel/svm/ies.h:31` × `surface_shader_emission`.
+        "peak_absolute_candela": float(table.peak_absolute_candela),
     }
 
 

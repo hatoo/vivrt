@@ -588,16 +588,22 @@ pub struct IesProfile {
     /// treated as "no IES" (returns multiplier 1.0).
     pub peak_candela: f32,
     /// Solid-angle integral of `candela / peak_candela` over the
-    /// sphere (steradians). The renderer uses this to preserve total
-    /// flux when an IES is attached to a Point/Spot/Area — without
-    /// IES these lights normalise emission by `4π` (isotropic
-    /// hemisphere/sphere), with IES they use `integral_norm` instead
-    /// so a sharply-focused beam concentrates the same `power` into
-    /// a brighter peak (Cycles' convention). Computed once at export
-    /// time; zero falls back to `4π` (no normalisation, behaviour
-    /// matches an isotropic light scaled by the IES factor in [0, 1]).
+    /// sphere (steradians). Legacy "flux preservation" support — kept
+    /// so older scene.json blobs without `peak_absolute_candela` still
+    /// load. The renderer prefers `peak_absolute_candela` when present.
     #[serde(default)]
     pub integral_norm: f32,
+    /// Absolute peak intensity in W/sr — `peak_candela × multiplier ×
+    /// ballast × ballast_lamp_photometric × 4π/177.83`. Mirrors Cycles'
+    /// `util/ies.cpp:151,164-180` candela→W/sr conversion (177.83 lm/W
+    /// is D65's luminous efficacy). The renderer uses
+    /// `coeff = power × peak_absolute_candela / π` so `Le_at_angle =
+    /// color × power × candela_absolute(angle) / π` exactly matches the
+    /// `kernel/svm/ies.h:31` × point-light `eval_fac=1/π` chain Cycles
+    /// uses. Zero (or missing in old json) falls back to the legacy
+    /// `power / integral_norm` flux-preservation path.
+    #[serde(default)]
+    pub peak_absolute_candela: f32,
 }
 
 #[derive(Deserialize)]

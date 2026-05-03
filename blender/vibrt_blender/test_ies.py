@@ -50,6 +50,11 @@ class TestIesParse(unittest.TestCase):
         self.assertEqual(t.multiplier, 1.0)
         self.assertEqual(t.n_v, 3)
         self.assertEqual(t.n_h, 1)
+        # multiplier=1, ballast=1, ballast_lamp=1 → absolute_factor = 4π/177.83
+        self.assertAlmostEqual(t.absolute_factor, 0.0706650768394, places=6)
+        # peak_candela × absolute_factor
+        self.assertAlmostEqual(t.peak_absolute_candela,
+                               100.0 * 0.0706650768394, places=4)
 
     def test_three_lobe_vee(self):
         t = parse_ies(_THREE_LOBE_VEE)

@@ -36,12 +36,21 @@ class IesTable:
 
     `candelas` is row-major over `phis_deg × thetas_deg`. So
     `candelas[h * V + v]` is intensity at (phis_deg[h], thetas_deg[v]).
+
+    `absolute_factor` packs the LM-63 multiplier × ballast_factor ×
+    ballast_lamp_photometric_factor × Cycles' candela→watts/sr constant
+    (4π / 177.83, where 177.83 lm/W is the D65 luminous efficacy).
+    Multiplying any raw `candela` by `absolute_factor` gives the
+    radiometric W/sr value Cycles' kernel returns from
+    `kernel_ies_interp`. Mirrors `c:/tmp/cycles-src/src/util/ies.cpp:151,
+    164-180` so vibrt's IES-attached lamps match Cycles' absolute brightness.
     """
     thetas_deg: list[float]
     phis_deg: list[float]
     candelas: list[float]
     lumens_per_lamp: float
     multiplier: float
+    absolute_factor: float
 
     @property
     def n_v(self) -> int:
@@ -54,6 +63,13 @@ class IesTable:
     @property
     def peak_candela(self) -> float:
         return max(self.candelas) if self.candelas else 0.0
+
+    @property
+    def peak_absolute_candela(self) -> float:
+        """Peak intensity in W/sr (the value Cycles' `kernel_ies_interp`
+        returns at the table's brightest direction). Equals `peak_candela
+        × absolute_factor`."""
+        return self.peak_candela * self.absolute_factor
 
     def integral_normalised(self) -> float:
         """Solid-angle integral of `candela / peak_candela` over the
@@ -250,9 +266,12 @@ def parse_ies(text: str) -> IesTable:
         raise IesParseError(
             f"invalid header: num_lamps={num_lamps} n_v={n_v} n_h={n_h}"
         )
-    # Standard line: 3 values (ballast_factor, future_use, input_watts) —
-    # discarded.
-    _ = _take_floats(tokens, 3, "header line 2")
+    # Standard line: 3 values (ballast_factor, ballast_lamp_photometric_factor,
+    # input_watts). Cycles folds the first two into its candela→watts factor;
+    # input_watts is ignored.
+    h2 = _take_floats(tokens, 3, "header line 2")
+    ballast_factor = h2[0]
+    ballast_lamp_photometric = h2[1]
 
     thetas = _take_floats(tokens, n_v, "vertical angles")
     phis = _take_floats(tokens, n_h, "horizontal angles")
@@ -264,12 +283,23 @@ def parse_ies(text: str) -> IesTable:
     if n_h > 1 and any(phis[i] >= phis[i + 1] for i in range(n_h - 1)):
         raise IesParseError("horizontal angles not strictly increasing")
 
+    # Cycles' candela→W/sr conversion: 4π/177.83 (D65 luminous efficacy
+    # 177.83 lm/W; the 4π is folded so the per-direction lookup reads as
+    # the lamp's "isotropic-equivalent watts per steradian" — matches
+    # `util/ies.cpp:177-180`). Multiplier × ballast factors are the file's
+    # own scalars (often 1.0).
+    candela_to_watts_per_sr = 0.0706650768394
+    absolute_factor = (multiplier * ballast_factor
+                       * ballast_lamp_photometric
+                       * candela_to_watts_per_sr)
+
     return IesTable(
         thetas_deg=thetas,
         phis_deg=phis,
         candelas=candelas,
         lumens_per_lamp=lumens_per_lamp,
         multiplier=multiplier,
+        absolute_factor=absolute_factor,
     )
 
 
