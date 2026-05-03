@@ -538,6 +538,24 @@ def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
     link = sock.links[0]
     src = link.from_node
     bl = src.bl_idname
+    if bl == "NodeGroupInput":
+        # Inside a NodeGroup, the inner BSDF's scalar input may be wired to
+        # the group's external interface. Follow the live `_GROUP_STACK` to
+        # the parent ShaderNodeGroup and resolve from the matching outer
+        # socket. This is what unblocks Glass BSDFs whose IOR comes from a
+        # NodeGroup's "IOR" parameter (flat_archiviz wraps every glass
+        # surface in such a group with IOR=1.45 default).
+        out_name = link.from_socket.name
+        if not _GROUP_STACK:
+            return None
+        parent = _GROUP_STACK.pop()
+        try:
+            external = parent.inputs.get(out_name)
+            if external is None:
+                return None
+            return _resolve_exact_scalar(external, depth + 1)
+        finally:
+            _GROUP_STACK.append(parent)
     if bl == "ShaderNodeValue":
         return float(src.outputs[0].default_value)
     if bl == "ShaderNodeMath":
