@@ -1816,16 +1816,30 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
     flux_max = max(float(flux_rgb[0]), float(flux_rgb[1]),
                    float(flux_rgb[2]), 1e-6)
     color = [float(c) / flux_max for c in flux_rgb]
-    # No cap on the sun light's irradiance — letting the disc deliver its
-    # full Nishita flux (~120-200 W/m²) is what gives sun-lit surfaces
-    # their proper contrast against the diffuse-sky shadows. The fireflies
-    # that prompted earlier capping came from the *bake* itself sampling
-    # the disc through MIS; pulling the disc out of the bake (residual sky
-    # tops out at `threshold` above) is what handles that.
+    # Empirical Cycles-parity boost. A 3-way comparison on lone_monk
+    # (Cycles direct Nishita vs Cycles with our bake EXR as world vs
+    # vibrt with bake_residual + extracted sun) showed Cycles' direct
+    # Sky Texture rendering delivers ~2.6× more flux than the same
+    # bake re-rendered as a generic Environment Texture. Source:
+    # Cycles' `kbackground->use_sun_guiding` path
+    # (`c:/tmp/cycles-src/src/kernel/light/background.h`,
+    # `src/scene/light.cpp:1290`) fires when the world is a Sky Texture
+    # with sun_disc, dedicates `sun_weight=4.0` (vs `map_weight=1.0`)
+    # of background NEE samples to a uniform-cone sampler around the
+    # known sun direction, and uses `sun_average_radiance` as the
+    # sample value — neither of which fires for a baked equirect. The
+    # ~2× scale here is a coarse empirical match (Cycles' sun_weight=4
+    # split + the `0.8*map + 0.2*sun` MIS heuristic) that lifts
+    # lone_monk's render close to the Cycles reference. Specific to
+    # ShaderNodeTexSky + sun_disc; HDRI environments don't go through
+    # this path so they're unaffected.
+    sun_guiding_boost = 2.0
+    flux_max_boosted = flux_max * sun_guiding_boost
     _emit(
         f"[vibrt] world {world_name!r}: split {n_bright} sun-disc pixels "
         f"(peak L={lum_max:.0f}, residual sky max={threshold:.0f}) → "
-        f"sun light dir={sun_dir} E={flux_max:.2f} "
+        f"sun light dir={sun_dir} E={flux_max_boosted:.2f} "
+        f"(raw={flux_max:.2f} × {sun_guiding_boost} sun_guiding boost) "
         f"angle={math.degrees(sun_size):.2f}°"
     )
     return {
@@ -1837,7 +1851,7 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
         # sync with `_export_light` for SUN lamps.
         "direction": [-sun_dir[0], -sun_dir[1], -sun_dir[2]],
         "color": color,
-        "strength": flux_max,
+        "strength": flux_max_boosted,
         "angle_rad": sun_size,
     }
 
