@@ -93,6 +93,17 @@ struct PrincipledGpu {
   int color_graph_output;
   Volume *volume;       // nullptr if the material has no volume
   int volume_only;      // 1 if Surface socket is unlinked (boundary is invisible)
+  // 1 = Cycles' ShaderNodeBsdfAnisotropic / Glossy semantics on the
+  // metallic specular lobe: skip Schlick Fresnel and use `base_color`
+  // as a uniform tint (Cycles sets MicrofacetFresnel::NONE for plain
+  // GGX). Set alongside metallic=1 by the exporter when mapping a
+  // Glossy / Anisotropic BSDF.
+  int pure_glossy;
+  // 1 = Cycles' ShaderNodeBsdfDiffuse: pure Lambertian with no
+  // specular / coat lobes. The kernel returns base_color × Lambert × NoL
+  // and skips the spec/coat eval+sampling entirely. Set alongside
+  // metallic=0 by the exporter when mapping a Diffuse BSDF.
+  int pure_diffuse;
 };
 
 struct HitGroupData {

@@ -3477,6 +3477,16 @@ def _from_diffuse(node, writer, textures) -> dict:
     p = _default_params()
     p["roughness"] = 1.0
     p["metallic"] = 0.0
+    # `ShaderNodeBsdfDiffuse` is pure Lambertian — no specular layer.
+    # Without this flag the Principled mapping above leaks a residual
+    # `(1-VoH)^5 × GGX` from the dielectric Schlick term (because F0_d
+    # is positive at any ior > 1 and the Fresnel curve still hits 1.0
+    # at grazing) plus the Kulla-Conty MS dielectric compensation,
+    # both of which lift a "diffuse" surface toward white at grazing
+    # angles. BMW27's car body (BMWWhite, BMWBlue, Interior, TireRubber
+    # — ~30k polys total) was visibly +0.10 brighter than Cycles
+    # because of this; the gate brings it back in line.
+    p["pure_diffuse"] = True
     color_sock = node.inputs["Color"]
     vc_attrs: list[str] = []
     graph = (
@@ -3548,6 +3558,14 @@ def _from_hair(node, writer, textures) -> dict:
 def _from_glossy(node, writer, textures) -> dict:
     p = _default_params()
     p["metallic"] = 1.0
+    # `ShaderNodeBsdfAnisotropic` / `ShaderNodeBsdfGlossy` is Cycles' pure
+    # GGX reflector — `bsdf_microfacet_ggx_setup` sets MicrofacetFresnel::NONE
+    # and the per-direction reflectance is `Color × D × G / (4·NoV·NoL)`,
+    # not `schlick(Color, V·H) × D × G / (4·NoV·NoL)`. Without this flag
+    # the metallic mapping above lifts spec toward white at grazing,
+    # which over-brightens dark Glossy materials (BMWBlack on the bmw27
+    # car body was visibly too bright vs Cycles).
+    p["pure_glossy"] = True
     img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)

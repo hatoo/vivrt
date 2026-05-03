@@ -1395,9 +1395,19 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
   float w_base_diff = (1.0f - e.metallic) * (1.0f - e.transmission);
   float w_diffuse = w_base_diff * (1.0f - t_w);
   float w_translucent = w_base_diff * t_w;
-  float w_spec = e.metallic + (1.0f - e.metallic) * (1.0f - e.transmission);
-  float w_trans = (1.0f - e.metallic) * e.transmission;
-  float w_coat = coat_w_mat * schlick_scalar(NoV, cF0);
+  // Cycles' Diffuse BSDF has no specular / coat layer. Force the
+  // associated lobes to zero so we end up with exactly one Lambertian
+  // term — the existing Principled mapping leaks a `(1-VoH)^5 × GGX`
+  // spec contribution at grazing even with metallic=0, which over-
+  // brightens scenes dominated by ShaderNodeBsdfDiffuse (BMW27's car
+  // body).
+  bool pure_diff = (mc->pure_diffuse != 0);
+  float w_spec = pure_diff ? 0.0f
+      : e.metallic + (1.0f - e.metallic) * (1.0f - e.transmission);
+  float w_trans = pure_diff ? 0.0f
+      : (1.0f - e.metallic) * e.transmission;
+  float w_coat = pure_diff ? 0.0f
+      : coat_w_mat * schlick_scalar(NoV, cF0);
   float w_sum = w_diffuse + w_translucent + w_spec + w_trans + w_coat;
   if (w_sum <= 0.0f)
     return r;
@@ -1434,7 +1444,13 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
       r.f = r.f + bc_sss * (INV_PIf * w_diffuse * effective);
       r.pdf += p_diff * NoL_std * INV_PIf;
     }
-    // Specular (metallic + dielectric spec layer)
+    // Specular (metallic + dielectric spec layer). Skipped entirely for
+    // pure-Lambertian Diffuse mappings — Cycles' Diffuse BSDF has no
+    // specular layer and the residual `(1-VoH)^5 × GGX` from the
+    // dielectric Schlick lifts diffuse materials toward white at
+    // glancing angles (the BMW27 car body went +0.10 brighter than
+    // Cycles before this gate).
+    if (!pure_diff) {
     float3 H = normalize3(wo + wi);
     float NoH = fmaxf(dot3(e.Ns, H), 0.0f);
     float VoH = fmaxf(dot3(wo, H), 0.0f);
@@ -1445,7 +1461,16 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
     float G1_v = smith_G1_aniso(Vloc, e.alpha_x, e.alpha_y);
     float G1_l = smith_G1_aniso(Lloc, e.alpha_x, e.alpha_y);
     float G = G1_v * G1_l;
-    float3 F_metal = schlick_rgb(VoH, e.base_color);
+    // For Cycles' Glossy / Anisotropic BSDF the GGX lobe carries no
+    // Fresnel — `bsdf_microfacet_ggx_setup` sets MicrofacetFresnel::NONE
+    // and the per-direction reflectance is just `Color × D × G / (4·NoV·NoL)`.
+    // `pure_glossy` short-circuits Schlick to a uniform `base_color` tint;
+    // without this the spec lobe lifts toward white at grazing on dark
+    // metallic mappings (BMWBlack on bmw27 was visibly too bright on the
+    // rounded car body). Default Principled metal still uses Schlick.
+    float3 F_metal = (mc->pure_glossy != 0)
+        ? e.base_color
+        : schlick_rgb(VoH, e.base_color);
     // Glass / transmissive materials sample the reflect-vs-refract split via
     // `fresnel_dielectric` (exact), so the eval has to use the same Fresnel
     // function — Schlick over-predicts F by ~2× at low IOR (1.0–1.2), which
@@ -1480,7 +1505,12 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
     float f_ms_scalar =
         (1.0f - E_wo) * (1.0f - E_wi) / fmaxf(M_PIf * one_minus_Eavg, 1e-8f);
 
-    float3 F_avg_m = f_avg_schlick(e.base_color);
+    // pure_glossy: F is constant base_color across all angles, so the
+    // hemispherical Fresnel average is just base_color (skip the
+    // Schlick-averaged form which assumes Schlick lift to F90=1).
+    float3 F_avg_m = (mc->pure_glossy != 0)
+        ? e.base_color
+        : f_avg_schlick(e.base_color);
     float3 one3 = make_float3(1.0f, 1.0f, 1.0f);
     float3 denom_m = one3 - F_avg_m * (1.0f - E_avg);
     float3 F_ms_m = make_float3(
@@ -1530,6 +1560,7 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
                        fmaxf(4.0f * NoV, 1e-12f);
       r.pdf += p_coat * pdf_coat;
     }
+    } // !pure_diff
 
     // --- Sheen: soft grazing-angle lobe on top of diffuse. Symmetric in
     // NoV and NoL so the BRDF is reciprocal, and normalised by 1/π so the

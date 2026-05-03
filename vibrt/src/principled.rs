@@ -466,5 +466,7 @@ pub fn make_material_data(
         color_graph_output: graph.output,
         volume: volume_ptr,
         volume_only: if mat.volume_only { 1 } else { 0 },
+        pure_glossy: if mat.pure_glossy { 1 } else { 0 },
+        pure_diffuse: if mat.pure_diffuse { 1 } else { 0 },
     }
 }

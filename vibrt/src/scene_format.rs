@@ -201,6 +201,33 @@ pub struct PrincipledMaterial {
     pub base_color: [f32; 3],
     #[serde(default)]
     pub metallic: f32,
+    /// Cycles' `ShaderNodeBsdfAnisotropic` / `ShaderNodeBsdfGlossy` is
+    /// a pure GGX reflector with NO Fresnel — `bsdf_microfacet_ggx_setup`
+    /// in Cycles sets `MicrofacetFresnel::NONE`, and the per-direction
+    /// reflectance is just `Color × D × G / (4·NoV·NoL)`. vibrt's metal
+    /// lobe applies Schlick Fresnel with F0 = base_color, which lifts
+    /// reflectance toward white at grazing — over-bright on dark
+    /// materials (BMWBlack on the bmw27 test scene rendered visibly
+    /// brighter on the rounded car body). When `pure_glossy` is true,
+    /// the device code skips the Schlick lift on the metallic lobe and
+    /// uses `base_color` as a uniform tint, matching Cycles' Glossy
+    /// semantics. Implies `metallic = 1.0` (the exporter sets both
+    /// when mapping `ShaderNodeBsdfAnisotropic` / Glossy).
+    #[serde(default)]
+    pub pure_glossy: bool,
+    /// Cycles' `ShaderNodeBsdfDiffuse` is a Lambertian / Oren-Nayar
+    /// reflector with NO specular component. vibrt's Principled at
+    /// `metallic=0, transmission=0` still emits a small dielectric
+    /// Schlick term `(1-VoH)^5 × GGX` (because `F0_d` is positive even
+    /// at ior=1.45 and grows toward 1 at grazing) plus the Kulla-Conty
+    /// dielectric MS compensation — both lift the rounded surfaces of
+    /// BMW27's diffuse car body (BMWWhite, BMWBlue, Interior, TireRubber
+    /// account for ~30k polys) toward white at glancing angles. When
+    /// `pure_diffuse` is true, the device code drops the specular and
+    /// coat lobes entirely and returns just `base_color × Lambert × NoL`.
+    /// Set by the exporter's `_from_diffuse` alongside `metallic=0`.
+    #[serde(default)]
+    pub pure_diffuse: bool,
     #[serde(default = "half_f32")]
     pub roughness: f32,
     #[serde(default = "default_ior")]

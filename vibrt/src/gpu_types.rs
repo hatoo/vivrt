@@ -125,6 +125,20 @@ pub struct PrincipledGpu {
     /// 0 when there's both a Surface and a Volume (glass-with-fog case;
     /// surface BSDF runs alongside the volume entry).
     pub volume_only: i32,
+    /// 1 when the source shader was Cycles' `ShaderNodeBsdfAnisotropic`
+    /// or `ShaderNodeBsdfGlossy` — pure GGX with no Fresnel. The device
+    /// code skips Schlick on the metallic lobe and uses `base_color`
+    /// uniformly, matching Cycles' `bsdf_microfacet_ggx_setup`
+    /// (which sets `MicrofacetFresnel::NONE`). Set by the exporter's
+    /// `_from_glossy`; alongside `metallic = 1.0`. Default 0 preserves
+    /// existing Principled metal behaviour.
+    pub pure_glossy: i32,
+    /// 1 when the source shader was Cycles' `ShaderNodeBsdfDiffuse` —
+    /// pure Lambertian with no specular. The device code drops the
+    /// spec + coat lobes entirely and returns just the diffuse Lambert
+    /// term. Default 0 keeps the existing Principled dielectric
+    /// behaviour.
+    pub pure_diffuse: i32,
 }
 
 /// Homogeneous volume parameters precomputed by the host. Layout mirrors
