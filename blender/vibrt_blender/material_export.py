@@ -3236,9 +3236,7 @@ def _resolve_shader(node, writer, textures, mat_name: str) -> dict:
     if bl == "ShaderNodeBsdfTransparent":
         return _from_transparent(node, writer, textures)
     if bl == "ShaderNodeBsdfSheen" or bl == "ShaderNodeBsdfVelvet":
-        # Sheen has no native slot in the simplified Principled; treat the
-        # Color input as a rough diffuse so the surface isn't blacked out.
-        return _from_diffuse(node, writer, textures)
+        return _from_sheen(node, writer, textures)
     if bl == "ShaderNodeBsdfHair":
         return _from_hair(node, writer, textures)
     if bl == "ShaderNodeMixShader":
@@ -3454,6 +3452,57 @@ def _from_principled(node, writer, textures) -> dict:
                     )
         elif alpha_val < 1.0:
             p["alpha_threshold"] = alpha_val
+    return p
+
+
+def _from_sheen(node, writer, textures) -> dict:
+    """ShaderNodeBsdfSheen / Velvet → vibrt's sheen lobe.
+
+    Cycles' Sheen BSDF (LTC-based "Practical Multiple-Scattering Sheen")
+    is a fabric / fuzz / brushed-cloth lobe with no diffuse component
+    and a characteristic bright glow at glancing angles. The previous
+    fallback to `_from_diffuse` collapsed it to pure Lambert, which
+    misses the grazing brightness entirely — a Sheen-only surface
+    showed as a flat dark Lambertian gray instead of the soft fabric
+    sheen the artist intended.
+
+    vibrt's sheen lobe (`devicecode.cu` line ~1567) is the obvious
+    target — it's an ad-hoc Disney/Charlie-ish form, not LTC, but it
+    captures the qualitative behaviour: bright at grazing, dim at
+    normal incidence. Map the BSDF's Color → both `sheen_tint` and
+    `pure_diffuse` so the surface returns *only* the sheen
+    contribution (Cycles' SheenBsdf has no diffuse). Roughness maps
+    directly to `sheen_roughness` (vibrt clamps the inv-roughness
+    falloff exponent internally).
+    """
+    p = _default_params()
+    p["metallic"] = 0.0
+    p["roughness"] = 1.0
+    # Suppress the diffuse / spec / coat lobes — Cycles' Sheen has
+    # none of these, only the LTC sheen kernel. With pure_diffuse=True
+    # the device drops the spec+coat eval; setting base_color=0 zeros
+    # the diffuse Lambert that would otherwise survive the gate.
+    p["pure_diffuse"] = True
+    p["base_color"] = [0.0, 0.0, 0.0]
+    color_sock = node.inputs.get("Color")
+    if color_sock is not None:
+        if color_sock.is_linked:
+            rgb = _socket_constant_rgb(color_sock)
+            tint = list(rgb) if rgb is not None else [1.0, 1.0, 1.0]
+        else:
+            cv = color_sock.default_value
+            tint = [float(cv[0]), float(cv[1]), float(cv[2])]
+        p["sheen_tint"] = tint
+    p["sheen_weight"] = 1.0
+    rough_sock = node.inputs.get("Roughness")
+    if rough_sock is not None and not rough_sock.is_linked:
+        # Cycles' SheenBsdf clamps roughness to [1e-3, 1.0]; vibrt's
+        # ad-hoc lobe uses 1/sheen_roughness as the falloff exponent
+        # so very small values produce a razor-thin grazing edge —
+        # match Cycles' clamp range.
+        r = float(rough_sock.default_value)
+        p["sheen_roughness"] = max(min(r, 1.0), 1e-3)
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
     return p
 
 
