@@ -109,6 +109,15 @@ struct PrincipledGpu {
   // and skips the spec/coat eval+sampling entirely. Set alongside
   // metallic=0 by the exporter when mapping a Diffuse BSDF.
   int pure_diffuse;
+  // Constant-Alpha mix weight from Cycles Principled's `Alpha` socket.
+  // Defaults to 1.0 (fully opaque). When < 1.0, the kernel adds a
+  // straight-through transparent-passthrough lobe with weight
+  // `1 - alpha_blend` so the surface mixes mirror/glass-like reflection
+  // with see-through transmission — matches Cycles'
+  // `alpha × principled + (1-alpha) × transparent` blend. Distinct from
+  // `alpha_threshold` (texture-driven binary alpha cutout used for
+  // leaves / grass).
+  float alpha_blend;
 };
 
 struct HitGroupData {

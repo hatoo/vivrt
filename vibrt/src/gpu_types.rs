@@ -144,6 +144,12 @@ pub struct PrincipledGpu {
     /// term. Default 0 keeps the existing Principled dielectric
     /// behaviour.
     pub pure_diffuse: i32,
+    /// Constant Cycles `Alpha` socket value (no texture). When < 1.0
+    /// the kernel adds a transparent-passthrough lobe with weight
+    /// `1 - alpha_blend`, mixing the opaque BSDF with straight-through
+    /// transmission — matches Cycles' `alpha × principled +
+    /// (1-alpha) × transparent` blend. Default 1.0 = fully opaque.
+    pub alpha_blend: f32,
 }
 
 /// Homogeneous volume parameters precomputed by the host. Layout mirrors

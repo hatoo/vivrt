@@ -274,6 +274,14 @@ pub struct PrincipledMaterial {
     /// If > 0, any-hit discards the hit when base_color_tex.a < threshold.
     #[serde(default)]
     pub alpha_threshold: f32,
+    /// Constant Alpha < 1 mix weight from Principled's `Alpha` socket
+    /// (no texture). Cycles' Principled blends `alpha × principled_lobes
+    /// + (1-alpha) × straight-through transparent`. Defaults to 1.0
+    /// (fully opaque); the kernel adds a transparent-passthrough lobe
+    /// with weight `1 - alpha_blend` when this is < 1. Distinct from
+    /// `alpha_threshold` (texture-driven binary cutout for leaves/grass).
+    #[serde(default = "one_f32")]
+    pub alpha_blend: f32,
     /// [0,1]; stretches GGX along tangent vs. bitangent.
     #[serde(default)]
     pub anisotropy: f32,

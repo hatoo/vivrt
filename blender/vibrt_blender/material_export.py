@@ -3458,6 +3458,9 @@ def _from_principled(node, writer, textures) -> dict:
     if alpha_sock is not None:
         alpha_val = _socket_f(alpha_sock)
         if alpha_sock.is_linked:
+            # Texture-driven alpha → binary cutout via `alpha_threshold`.
+            # The kernel any-hit reads base_color_tex.a and discards the
+            # hit when below threshold (leaves, grass, fence cards).
             p["alpha_threshold"] = 0.5
             if "base_color_tex" not in p:
                 img = _socket_linked_image(alpha_sock)
@@ -3471,7 +3474,16 @@ def _from_principled(node, writer, textures) -> dict:
                         f"disabled (no per-pixel alpha to compare against)",
                     )
         elif alpha_val < 1.0:
-            p["alpha_threshold"] = alpha_val
+            # Constant Alpha < 1 → smooth Cycles-style mix with a
+            # transparent BSDF: `alpha × principled + (1-alpha) ×
+            # transparent`. flat_archiviz's `Glass Window` (Metallic=1,
+            # Alpha=0.35) was rendering as a perfect mirror because the
+            # old path stored this in `alpha_threshold` (a per-texel
+            # binary cutout that's a no-op without an alpha texture).
+            # The kernel handles `alpha_blend` by adding a transparent
+            # passthrough lobe with weight `(1-alpha_blend)` and
+            # scaling the opaque BSDF eval by `alpha_blend`.
+            p["alpha_blend"] = alpha_val
     return p
 
 

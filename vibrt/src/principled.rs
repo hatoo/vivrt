@@ -469,5 +469,6 @@ pub fn make_material_data(
         volume_only: if mat.volume_only { 1 } else { 0 },
         pure_glossy: if mat.pure_glossy { 1 } else { 0 },
         pure_diffuse: if mat.pure_diffuse { 1 } else { 0 },
+        alpha_blend: mat.alpha_blend.clamp(0.0, 1.0),
     }
 }

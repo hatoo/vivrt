@@ -1637,6 +1637,16 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
       }
     }
   }
+  // Cycles Principled `Alpha` socket: `alpha × principled + (1-alpha) ×
+  // transparent` blend. The transparent component is a delta in the
+  // through-surface direction, so it contributes 0 to eval at any finite
+  // wi — we just scale the opaque part by alpha. sample_bsdf handles
+  // the (1-alpha) passthrough branch separately.
+  float ab = e.mat->alpha_blend;
+  if (ab < 1.0f) {
+    r.f = r.f * ab;
+    r.pdf *= ab;
+  }
   return r;
 }
 
@@ -1669,6 +1679,23 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
   float NoV = dot3(e.Ns, wo);
   if (NoV <= 0.0f)
     return s;
+
+  // Cycles Principled `Alpha` socket: `alpha × principled + (1-alpha) ×
+  // transparent` blend. With probability (1-alpha), pick the transparent
+  // passthrough branch — the ray continues straight through the surface
+  // (wi = -wo, the back hemisphere) with full transmission. The path
+  // tracer's `throughput *= bs.f / bs.pdf` then preserves throughput on
+  // this branch. eval_bsdf scales the opaque branch by alpha so NEE and
+  // BSDF-sampled emission see the correct mixing weight.
+  float ab = e.mat->alpha_blend;
+  if (ab < 1.0f && rng.next() >= ab) {
+    s.wi = -1.0f * wo;
+    s.f = make_float3(1.0f, 1.0f, 1.0f);
+    s.pdf = 1.0f;
+    s.specular = true;
+    s.lobe = LOBE_TRANSMISSION;
+    return s;
+  }
 
   // Hair: cosine-weighted sample around Ns. Not optimal for the tangent
   // cone lobe, but MIS against NEE covers for it and stratification is cheap.
@@ -2324,6 +2351,18 @@ extern "C" __global__ void __anyhit__ah() {
   bool is_shadow_ray =
       (optixGetRayFlags() & OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT) != 0;
   if (is_shadow_ray && m->transmission > 0.5f) {
+    optixIgnoreIntersection();
+  }
+  // Cycles' Principled `Alpha < 1` mixes the BSDF with a Transparent
+  // BSDF; shadow rays through the (1-alpha) portion pass straight
+  // through. We approximate as fully transparent for shadows when
+  // alpha_blend < 1 (loses the small `alpha` blocking but matches the
+  // dominant behaviour for typical window/glass uses where
+  // alpha is small). The opaque-branch shadow contribution would need
+  // a stochastic alpha test using path RNG; payload state isn't
+  // currently threaded through any-hit, so this binary approximation
+  // is the trade-off.
+  if (is_shadow_ray && m->alpha_blend < 1.0f) {
     optixIgnoreIntersection();
   }
   // Pure volume-container surfaces are invisible to *binary* shadow rays
