@@ -2237,7 +2237,8 @@ static __device__ int intersect_rect_lights(float3 origin, float3 dir,
   return best;
 }
 
-static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
+static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
+                                    float first_ray_tmin) {
   float3 throughput = make_float3(1, 1, 1);
   float3 L = make_float3(0, 0, 0);
   bool last_specular = true;
@@ -2271,7 +2272,17 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
     v.hit = 0;
     unsigned int hi, lo;
     pack_ptr(&v, hi, lo);
-    optixTrace(params.traversable, origin, dir, 1e-4f, 1e20f, 0.0f,
+    // Bounce 0 is the camera ray and must honour Cycles' Camera "Clip
+    // Start": ignore intersections closer than `first_ray_tmin` from the
+    // eye. We do this via OptiX's t_min instead of pushing `origin`
+    // forward, because a forward push can land the new origin inside
+    // geometry (e.g. flat_archiviz puts the camera ~0.6m from the east
+    // wall; pushing 2m forward placed the origin INSIDE that wall and
+    // primary rays lost the entire left half of the frame). Subsequent
+    // bounces use a small epsilon so reflections / refractions still
+    // self-clear.
+    float ray_tmin = (bounce == 0) ? first_ray_tmin : 1e-4f;
+    optixTrace(params.traversable, origin, dir, ray_tmin, 1e20f, 0.0f,
                OptixVisibilityMask(0x01), OPTIX_RAY_FLAG_NONE,
                0, // SBT offset (radiance ray type)
                2, // SBT stride (2 ray types: radiance + shadow)
@@ -2286,7 +2297,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
       t_geom = sqrtf(dot3(delta, delta));
     }
     float t_rect;
-    int rect_idx = intersect_rect_lights(origin, dir, 1e-4f, t_geom, t_rect);
+    int rect_idx = intersect_rect_lights(origin, dir, ray_tmin, t_geom, t_rect);
     float t_segment = (rect_idx >= 0) ? t_rect : t_geom;
 
     // Volume distance sampling: if we're currently inside a volume, decide
@@ -2559,16 +2570,17 @@ extern "C" __global__ void __raygen__rg() {
     // Skip volume-only boundaries on the AOV ray — the denoiser guides
     // should describe the *visible* surface (the wall behind a smoke
     // cube), not the invisible volume container. Capped to a few
-    // iterations so a pathological scene can't loop forever.
-    // Push the AOV ray origin forward by clip_start so the denoiser
-    // guides describe the *visible* surface (the one beyond the near
-    // clip plane), matching what the SPP loop below sees.
-    float3 origin = eye + dir0 * params.cam_clip_start;
+    // iterations so a pathological scene can't loop forever. The first
+    // iteration honours `cam_clip_start` via t_min so the AOV agrees
+    // with what the SPP loop below sees; later iterations use a small
+    // epsilon to clear the previous boundary surface.
+    float3 origin = eye;
+    float ray_tmin = params.cam_clip_start;
     for (int i = 0; i < VOL_STACK_MAX + 2; i++) {
       v.hit = 0;
       unsigned int hi, lo;
       pack_ptr(&v, hi, lo);
-      optixTrace(params.traversable, origin, dir0, 1e-4f, 1e20f, 0.0f,
+      optixTrace(params.traversable, origin, dir0, ray_tmin, 1e20f, 0.0f,
                  OptixVisibilityMask(0x01), OPTIX_RAY_FLAG_NONE, 0, 2, 0, hi, lo);
       if (v.hit == 0)
         break;
@@ -2579,6 +2591,7 @@ extern "C" __global__ void __raygen__rg() {
           fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
       float eps = fmaxf(1e-4f, p_scale * 1e-5f);
       origin = v.P + dir0 * eps;
+      ray_tmin = 1e-4f;
     }
     float3 alb = make_float3(0, 0, 0);
     float3 nrm = make_float3(0, 0, 0);
@@ -2626,10 +2639,14 @@ extern "C" __global__ void __raygen__rg() {
     float py = (2.0f * ((float)idx.y + jy) / (float)dim.y) - 1.0f
                + 2.0f * params.cam_shift_y;
     float3 dir = normalize3(U * px + V * py + W);
-    // Honour Cycles' Camera "Clip Start" by moving the ray origin
-    // forward — anything closer than clip_start is invisible to the
-    // first hit (and therefore to NEE as well).
-    float3 origin = eye + dir * params.cam_clip_start;
+    // Honour Cycles' Camera "Clip Start" via t_min on the first ray
+    // inside trace_path. We deliberately do NOT push `origin` forward:
+    // when the camera sits close to a wall on one side (flat_archiviz
+    // ~0.6m east wall, lens=50mm, clip_start=2m), shifting the origin
+    // by `dir * clip_start` lands inside the wall for rays going that
+    // way, and OptiX returns no hit → a hard black corner on that side
+    // of the frame.
+    float3 origin = eye;
 
     if (params.cam_lens_radius > 0.0f) {
       float u1 = rng.next();
@@ -2640,12 +2657,16 @@ extern "C" __global__ void __raygen__rg() {
       float ly = r * sinf(phi) * params.cam_lens_radius;
       float3 Uunit = normalize3(U);
       float3 Vunit = normalize3(V);
-      float3 focus_point = origin + dir * params.cam_focal_distance;
-      origin = origin + Uunit * lx + Vunit * ly;
+      // Cycles' focus_distance is measured from the camera (eye),
+      // not from the near-clip plane. Place the focus point at
+      // eye + dir*focal_distance so the bokeh is sharp where Cycles
+      // says it should be.
+      float3 focus_point = eye + dir * params.cam_focal_distance;
+      origin = eye + Uunit * lx + Vunit * ly;
       dir = normalize3(focus_point - origin);
     }
 
-    accum = accum + trace_path(origin, dir, rng);
+    accum = accum + trace_path(origin, dir, rng, params.cam_clip_start);
   }
   float inv = 1.0f / (float)params.samples_per_pixel;
   accum = accum * inv;
