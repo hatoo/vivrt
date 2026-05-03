@@ -659,6 +659,21 @@ def _resolve_constant_socket(sock, depth: int = 0):
         return _socket_rgb(sock)
     link = sock.links[0]
     src = link.from_node
+    if src.bl_idname == "NodeGroupInput":
+        # See _resolve_exact_scalar: hop out to the parent ShaderNodeGroup's
+        # matching external socket so a NodeGroup-wrapped Color input
+        # (Glass.Color from a Glass NodeGroup, etc.) folds to its callsite
+        # value instead of dead-ending here.
+        if not _GROUP_STACK:
+            return None
+        parent = _GROUP_STACK.pop()
+        try:
+            external = parent.inputs.get(link.from_socket.name)
+            if external is None:
+                return None
+            return _resolve_constant_socket(external, depth + 1)
+        finally:
+            _GROUP_STACK.append(parent)
     mean = _node_mean_color(src, link.from_socket)
     if mean is not None:
         return mean
@@ -839,6 +854,20 @@ def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
             return None
     link = sock.links[0]
     src = link.from_node
+    if src.bl_idname == "NodeGroupInput":
+        # Same NodeGroup-hop pattern as _resolve_exact_scalar — handles
+        # MixShader Factor / scalar inputs that come from a NodeGroup's
+        # external interface.
+        if not _GROUP_STACK:
+            return None
+        parent = _GROUP_STACK.pop()
+        try:
+            external = parent.inputs.get(link.from_socket.name)
+            if external is None:
+                return None
+            return _resolve_constant_scalar(external, depth + 1)
+        finally:
+            _GROUP_STACK.append(parent)
     if src.bl_idname == "ShaderNodeValue":
         return float(src.outputs[0].default_value)
     if src.bl_idname == "ShaderNodeMath":
