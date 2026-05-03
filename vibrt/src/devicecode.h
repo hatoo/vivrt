@@ -37,6 +37,11 @@ struct PrincipledGpu {
   float roughness;
   float ior;
   float transmission;
+  // Cycles Principled "Specular IOR Level" (default 0.5). Multiplies
+  // the dielectric Schlick F0 by `2 × specular_ior_level` so default
+  // leaves F0 = F0_from_ior unchanged. Cycles convention from
+  // src/kernel/svm/closure.h:418-422 of the Cycles repo.
+  float specular_ior_level;
   float emission[3];
   float *base_color_tex;
   int base_color_tex_w;

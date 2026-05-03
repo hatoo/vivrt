@@ -412,6 +412,7 @@ pub fn make_material_data(
         roughness: mat.roughness.clamp(0.0, 1.0),
         ior: mat.ior.max(1.0),
         transmission: mat.transmission.clamp(0.0, 1.0),
+        specular_ior_level: mat.specular_ior_level.max(0.0),
         emission: mat.emission,
         base_color_tex: bc_ptr,
         base_color_tex_w: bc_w,

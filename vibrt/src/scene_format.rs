@@ -228,6 +228,16 @@ pub struct PrincipledMaterial {
     /// Set by the exporter's `_from_diffuse` alongside `metallic=0`.
     #[serde(default)]
     pub pure_diffuse: bool,
+    /// Cycles' Principled `Specular IOR Level` input (default 0.5).
+    /// Scales the dielectric Schlick F0:
+    ///   F0_d = ((ior-1)/(ior+1))² × 2 × specular_ior_level
+    /// At the default 0.5 the multiplier is 1.0 (no change). flat_archiviz
+    /// has 48 of 97 Principled materials with non-default values (most
+    /// in 0.30-0.40 range), which lower F0 and reduce the dielectric
+    /// spec lift at grazing — without honouring this, the surfaces
+    /// over-bright. See `c:/tmp/cycles-src/src/kernel/svm/closure.h:418`.
+    #[serde(default = "half_f32")]
+    pub specular_ior_level: f32,
     #[serde(default = "half_f32")]
     pub roughness: f32,
     #[serde(default = "default_ior")]

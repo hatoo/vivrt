@@ -55,6 +55,11 @@ pub struct PrincipledGpu {
     pub roughness: f32,
     pub ior: f32,
     pub transmission: f32,
+    /// Cycles Principled `Specular IOR Level` (default 0.5). The
+    /// device code multiplies the dielectric Schlick F0 by
+    /// `2 × specular_ior_level` so default leaves F0 = F0_from_ior
+    /// unchanged.
+    pub specular_ior_level: f32,
     pub emission: [f32; 3],
     pub base_color_tex: optix_sys::CUdeviceptr,
     pub base_color_tex_w: i32,

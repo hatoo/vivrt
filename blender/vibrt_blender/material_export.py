@@ -3385,6 +3385,20 @@ def _from_principled(node, writer, textures) -> dict:
         if ior != 1.5:
             p["coat_ior"] = ior
 
+    # Cycles Principled "Specular IOR Level" (Blender 4.x; legacy
+    # 3.x called this "Specular"). Scales the dielectric Schlick F0
+    # by `2 × specular_ior_level` (default 0.5 → multiplier 1.0).
+    # flat_archiviz has 48 of 97 Principled materials with non-default
+    # values (mostly 0.30-0.40), which lower F0 and reduce dielectric
+    # spec at grazing — without honouring this, vibrt over-brights
+    # diffuse-ish surfaces. See `c:/tmp/cycles-src/src/kernel/svm/closure.h:418`.
+    for name in ("Specular IOR Level", "Specular"):
+        if name in node.inputs:
+            sil = _warn_linked_scalar(node, name)
+            if sil != 0.5:
+                p["specular_ior_level"] = sil
+            break
+
     # Sheen (Blender 4.x: "Sheen Weight" / "Sheen Roughness" / "Sheen Tint";
     # legacy: "Sheen" / "Sheen Tint" scalar).
     for name in ("Sheen Weight", "Sheen"):

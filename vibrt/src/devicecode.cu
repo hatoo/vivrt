@@ -744,7 +744,8 @@ static __device__ float3 shadow_transmittance(float3 P, float3 dir, float tmax,
       float3 base = make_f3(v.mat->base_color);
       float cos_i = fabsf(dot3(v.Ns, dir));
       float F0_d = ((v.mat->ior - 1.0f) / (v.mat->ior + 1.0f)) *
-                   ((v.mat->ior - 1.0f) / (v.mat->ior + 1.0f));
+                   ((v.mat->ior - 1.0f) / (v.mat->ior + 1.0f))
+                   * (2.0f * v.mat->specular_ior_level);
       float F = schlick_scalar(cos_i, F0_d);
       float3 t_factor = base * (1.0f - F) * v.mat->transmission;
       // Surfaces with `transmission < 1` (e.g. Principled at 0.5) still
@@ -1375,8 +1376,14 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
   bool translucent_active =
       !reflect && e.mat->translucent_weight > 0.0f && e.transmission <= 0.0f;
 
+  // Cycles Principled F0 = ((ior-1)/(ior+1))² × 2 × specular_ior_level.
+  // The user-set Specular IOR Level (default 0.5 → multiplier 1.0)
+  // scales F0 — flat_archiviz's Anta Cucina / Base / Book materials
+  // (Specular IOR Level 0.30-0.35) pushed the dielectric Schlick lift
+  // by 30-40% over Cycles before this fix.
   float F0_d =
-      ((e.ior - 1.0f) / (e.ior + 1.0f)) * ((e.ior - 1.0f) / (e.ior + 1.0f));
+      ((e.ior - 1.0f) / (e.ior + 1.0f)) * ((e.ior - 1.0f) / (e.ior + 1.0f))
+      * (2.0f * e.mat->specular_ior_level);
 
   // Coat Fresnel parameters (used both for MIS weighting and the coat BRDF).
   PrincipledGpu *mc = e.mat;
