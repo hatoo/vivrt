@@ -2355,15 +2355,32 @@ extern "C" __global__ void __anyhit__ah() {
   }
   // Cycles' Principled `Alpha < 1` mixes the BSDF with a Transparent
   // BSDF; shadow rays through the (1-alpha) portion pass straight
-  // through. We approximate as fully transparent for shadows when
-  // alpha_blend < 1 (loses the small `alpha` blocking but matches the
-  // dominant behaviour for typical window/glass uses where
-  // alpha is small). The opaque-branch shadow contribution would need
-  // a stochastic alpha test using path RNG; payload state isn't
-  // currently threaded through any-hit, so this binary approximation
-  // is the trade-off.
+  // through and `alpha` of them are blocked by the opaque BSDF. We
+  // approximate this stochastically: hash ray origin + direction +
+  // primitive index into [0, 1) and ignore (pass through) when the
+  // hash exceeds alpha_blend. Across many shadow rays through the
+  // same surface the expected pass-through fraction is `(1-alpha_blend)`,
+  // matching Cycles' transparent-branch fraction. PCG hash gives
+  // per-ray decorrelation without needing to thread the path RNG
+  // through OptiX's any-hit payload (which would require restructuring
+  // every NEE call site). With the pure full-pass-through approximation
+  // the camera-side window mix worked but rooms ended up ~5% too bright
+  // because shadow rays through windows weren't attenuated.
   if (is_shadow_ray && m->alpha_blend < 1.0f) {
-    optixIgnoreIntersection();
+    float3 ray_o = optixGetWorldRayOrigin();
+    float3 ray_d = optixGetWorldRayDirection();
+    unsigned int h = __float_as_uint(ray_o.x) ^ __float_as_uint(ray_o.y * 1.31f) ^
+                     __float_as_uint(ray_o.z * 1.71f) ^
+                     __float_as_uint(ray_d.x * 2.13f) ^
+                     __float_as_uint(ray_d.y * 2.71f) ^
+                     __float_as_uint(ray_d.z * 3.13f) ^
+                     (prim * 747796405u + 2891336453u);
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    h = (h >> 22u) ^ h;
+    float u = (h >> 9) * (1.0f / 8388608.0f);
+    if (u >= m->alpha_blend) {
+      optixIgnoreIntersection();
+    }
   }
   // Pure volume-container surfaces are invisible to *binary* shadow rays
   // (the legacy `shadow_visible` path used by surface NEE on volumeless
