@@ -2296,18 +2296,27 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
                2, // SBT stride (2 ray types: radiance + shadow)
                0, // miss index (radiance miss)
                hi, lo);
-    if (bounce == 0 && v.hit != 0 && camera_skip < 4 &&
-        dot3(v.Ng, dir) > 0.0f) {
-      // Back-face hit on the camera ray: step past it and retry without
-      // counting this as a bounce. Cap the retry depth so a pathological
-      // all-back-faces direction can't loop forever.
-      float p_scale =
-          fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
-      float eps = fmaxf(1e-3f, p_scale * 1e-5f);
-      origin = v.P + dir * eps;
-      camera_skip++;
-      bounce--;  // wraps to UINT_MAX, the for-loop's bounce++ brings it back to 0
-      continue;
+    if (bounce == 0 && v.hit != 0 && dot3(v.Ng, dir) > 0.0f) {
+      if (camera_skip < 4) {
+        // Back-face hit on the camera ray: step past it and retry without
+        // counting this as a bounce. Cap the retry depth so a pathological
+        // all-back-faces direction can't loop forever.
+        float p_scale =
+            fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
+        float eps = fmaxf(1e-3f, p_scale * 1e-5f);
+        origin = v.P + dir * eps;
+        camera_skip++;
+        bounce--;  // wraps to UINT_MAX, the for-loop's bounce++ brings it back to 0
+        continue;
+      }
+      // Cap exhausted — flag it so the host can warn after the launch,
+      // then fall through and shade this back-face anyway (the dark
+      // interior is still better than pitch black). One increment per
+      // sample-per-pixel where this happens; the host divides by SPP for
+      // a pixel-count estimate.
+      if (params.primary_back_face_skip_exhausted != nullptr) {
+        atomicAdd(params.primary_back_face_skip_exhausted, 1u);
+      }
     }
 
     // Geometry hit distance (∞ on miss). Needed so a rect light only counts

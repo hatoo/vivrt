@@ -320,6 +320,13 @@ pub struct LaunchParams {
     /// scene. 0 means "vacuum"; non-null is a `VolumeGpu*`. Always part of
     /// the volume stack at depth 0.
     pub world_volume: optix_sys::CUdeviceptr,
+
+    /// Device pointer to a single `u32` counter. The kernel atomically
+    /// increments it whenever the camera-ray back-face skip's retry cap
+    /// is exhausted (camera sits >4 layers deep inside back-facing
+    /// geometry). The host clones it back and warns if non-zero so the
+    /// fallback shading doesn't go unnoticed.
+    pub primary_back_face_skip_exhausted: optix_sys::CUdeviceptr,
 }
 
 #[repr(C)]

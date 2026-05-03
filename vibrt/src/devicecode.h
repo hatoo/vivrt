@@ -244,6 +244,12 @@ struct LaunchParams {
   // Global homogeneous volume that fills the scene (atmospheric haze).
   // nullptr = vacuum. Always sits at the bottom of the volume stack.
   Volume *world_volume;
+
+  // Single u32 counter atomically incremented by the camera-ray back-face
+  // skip when its retry cap (4) is exhausted on a primary ray. The host
+  // reads this back and logs a warning if non-zero so a thick wall the
+  // camera sits >4 layers deep inside doesn't silently mis-shade.
+  unsigned int *primary_back_face_skip_exhausted;
 };
 
 struct RayGenData {};

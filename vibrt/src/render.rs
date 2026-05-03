@@ -647,6 +647,13 @@ pub fn render_to_pixels(
     let d_depth: CudaSlice<f32> = stream.alloc_zeros(pixel_count).cuda()?;
     let depth_aov = dptr_f32(&d_depth, &stream);
 
+    // Single u32 counter for the camera-ray back-face skip's exhausted-cap
+    // event (see trace_path in devicecode.cu). Always allocated so the
+    // kernel never has to null-check the pointer; the host warns after
+    // the render if it came back non-zero.
+    let d_back_face_warn: CudaSlice<u32> = stream.alloc_zeros(1).cuda()?;
+    let primary_back_face_skip_exhausted = dptr_u32(&d_back_face_warn, &stream);
+
     let lp = LaunchParams {
         image: dptr_f32(&d_image, &stream),
         width: render_settings.width,
@@ -706,6 +713,7 @@ pub fn render_to_pixels(
         normal_aov,
         depth_aov,
         world_volume: world_volume_ptr,
+        primary_back_face_skip_exhausted,
     };
     let d_params = alloc_and_copy(&stream, &lp)?;
 
@@ -724,6 +732,27 @@ pub fn render_to_pixels(
         .context("launch")?;
     stream.synchronize().cuda()?;
     progress.log(&format!("Render: {:.2?}", t0.elapsed()));
+
+    // Read back the camera-ray back-face skip counter. Non-zero means the
+    // camera ray hit > 4 back-facing surfaces in a row on at least one
+    // sample — clip_start was set inside an unusually deep stack of
+    // hidden geometry, and the affected pixels fell back to shading the
+    // last back-face we hit. Emit one warn line so this isn't silent.
+    let back_face_warn: Vec<u32> =
+        stream.clone_dtoh(&d_back_face_warn).cuda()?;
+    if let Some(&n) = back_face_warn.first() {
+        if n > 0 {
+            let spp = render_settings.spp.max(1) as f64;
+            let est_pixels = (n as f64 / spp).round() as u64;
+            progress.log(&format!(
+                "[vibrt] warn: camera-ray back-face skip exhausted its retry \
+                 cap on {n} samples (~{est_pixels} pixels at {spp} spp); \
+                 those pixels fall back to shading the last back-face. \
+                 Likely cause: clip_start lands the camera inside thick / \
+                 deeply-nested geometry."
+            ));
+        }
+    }
 
     // --- Optional OptiX denoiser (AOV model, HDR float4, no guides) ---
     let d_final = if opts.denoise {
