@@ -3330,12 +3330,18 @@ def _from_principled(node, writer, textures) -> dict:
     # keeps its spatial detail; otherwise fold to a constant.
     emit_sock = None
     strength = 1.0
+    # `Emission Strength` lives on Principled in *both* Blender 3.x
+    # (alongside the "Emission" colour socket) and 4.x (alongside
+    # "Emission Color"), but the 3.x branch above was reading it only
+    # via `Emission Color`. Read it unconditionally so a 3.x Principled
+    # with a custom Strength survives the round-trip — flat_archiviz
+    # has 68 of 97 Principled materials with non-default values.
+    if "Emission Strength" in node.inputs:
+        strength = _warn_linked_scalar(node, "Emission Strength")
     if "Emission" in node.inputs:
         emit_sock = node.inputs["Emission"]
     elif "Emission Color" in node.inputs:
         emit_sock = node.inputs["Emission Color"]
-        if "Emission Strength" in node.inputs:
-            strength = _warn_linked_scalar(node, "Emission Strength")
     if emit_sock is not None:
         emit_img = None
         emit_chain = ()
