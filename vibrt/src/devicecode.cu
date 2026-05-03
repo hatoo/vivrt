@@ -2267,6 +2267,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
   VolumeStack vstack;
   vstack.depth = 0;
 
+  int camera_skip = 0;
   for (unsigned int bounce = 0; bounce < params.max_depth; bounce++) {
     PathVertex v;
     v.hit = 0;
@@ -2281,13 +2282,33 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
     // primary rays lost the entire left half of the frame). Subsequent
     // bounces use a small epsilon so reflections / refractions still
     // self-clear.
-    float ray_tmin = (bounce == 0) ? first_ray_tmin : 1e-4f;
+    //
+    // Once we're inside the bounce-0 loop, also advance through back-face
+    // hits. Cycles' clip_start is meant to hide a thick wall the camera
+    // sits next to (flat_archiviz: 0.35m wall front=1.7m, back=2.05m); a
+    // strict t_min skips the front face but we still hit the back face
+    // just past it and shade it as a dark interior. The back-face advance
+    // mimics Cycles' "skip the whole hidden object" intent.
+    float ray_tmin = (bounce == 0 && camera_skip == 0) ? first_ray_tmin : 1e-4f;
     optixTrace(params.traversable, origin, dir, ray_tmin, 1e20f, 0.0f,
                OptixVisibilityMask(0x01), OPTIX_RAY_FLAG_NONE,
                0, // SBT offset (radiance ray type)
                2, // SBT stride (2 ray types: radiance + shadow)
                0, // miss index (radiance miss)
                hi, lo);
+    if (bounce == 0 && v.hit != 0 && camera_skip < 4 &&
+        dot3(v.Ng, dir) > 0.0f) {
+      // Back-face hit on the camera ray: step past it and retry without
+      // counting this as a bounce. Cap the retry depth so a pathological
+      // all-back-faces direction can't loop forever.
+      float p_scale =
+          fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
+      float eps = fmaxf(1e-3f, p_scale * 1e-5f);
+      origin = v.P + dir * eps;
+      camera_skip++;
+      bounce--;  // wraps to UINT_MAX, the for-loop's bounce++ brings it back to 0
+      continue;
+    }
 
     // Geometry hit distance (∞ on miss). Needed so a rect light only counts
     // when it occludes geometry rather than being behind a wall.
