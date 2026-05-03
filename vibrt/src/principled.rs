@@ -455,6 +455,7 @@ pub fn make_material_data(
         sheen_tint: mat.sheen_tint,
         sss_weight: mat.sss_weight.clamp(0.0, 1.0),
         sss_radius: mat.sss_radius,
+        translucent_weight: mat.translucent_weight.clamp(0.0, 1.0),
         hair_weight: mat.hair_weight.clamp(0.0, 1.0),
         hair_offset: mat.hair_offset,
         hair_roughness_u: mat.hair_roughness_u.clamp(1e-3, 1.0),

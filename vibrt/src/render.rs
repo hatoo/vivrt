@@ -605,10 +605,20 @@ pub fn render_to_pixels(
     } else {
         (0, 0, 0)
     };
-    let (env_strength_a, env_strength_b, env_rot_a, env_rot_b, env_mix_fac) =
+    let (env_strength_a, env_strength_b, env_rot_a, env_rot_b, env_mix_fac, env_split_camera) =
         match &scene.file.world {
-            Some(scene_format::WorldDesc::Mixed { a, b, fac }) => (
-                a.strength, b.strength, a.rotation, b.rotation, *fac,
+            Some(scene_format::WorldDesc::Mixed {
+                a,
+                b,
+                fac,
+                split_by_camera_ray,
+            }) => (
+                a.strength,
+                b.strength,
+                a.rotation,
+                b.rotation,
+                *fac,
+                if *split_by_camera_ray { 1 } else { 0 },
             ),
             _ => (
                 0.0,
@@ -616,6 +626,7 @@ pub fn render_to_pixels(
                 [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                 [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                 0.0,
+                0,
             ),
         };
 
@@ -709,6 +720,7 @@ pub fn render_to_pixels(
         envmap_rotation_a: env_rot_a,
         envmap_rotation_b: env_rot_b,
         envmap_mix_fac: env_mix_fac,
+        envmap_split_by_camera_ray: env_split_camera,
         albedo_aov,
         normal_aov,
         depth_aov,

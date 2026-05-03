@@ -480,9 +480,25 @@ static __forceinline__ __device__ void make_rotation_z(float angle,
   m[6] = 0; m[7] = 0;  m[8] = 1;
 }
 
-static __device__ float3 world_background(float3 dir) {
+static __device__ float3 world_background(float3 dir, bool is_camera_ray) {
   if (params.world_type == 0) {
     return make_f3(params.world_color) * params.world_strength;
+  }
+  // Light-Path camera-ray split: camera-visible misses read layer b
+  // directly (the artist's backplate), while all other rays fall through
+  // to envmap_data (= the lighting envmap = layer a). The CDF / NEE
+  // sampler stays on envmap_data so MIS pdfs match the radiance lighting
+  // rays observe — camera rays don't go through MIS, so the asymmetry
+  // is unbiased.
+  if (params.world_type == 2 &&
+      params.envmap_split_by_camera_ray != 0 &&
+      is_camera_ray &&
+      params.envmap_data_b != nullptr) {
+    float3 col = sample_equirect_layer(params.envmap_data_b,
+                                       params.envmap_width_b,
+                                       params.envmap_height_b,
+                                       params.envmap_rotation_b, dir);
+    return col * params.envmap_strength_b;
   }
   // Both single-layer and mixed worlds read from `envmap_data` so that
   // MIS-combined NEE and BSDF-sampled-miss strategies see the same
@@ -1354,6 +1370,10 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
   // SSS can also contribute diffusely when the light is slightly behind the
   // surface (wraparound lobe).
   bool sss_backlit = !reflect && e.mat->sss_weight > 0.0f && NoL > -1.0f;
+  // Translucent BSDF: Lambertian on the back hemisphere. Active when wi is
+  // on the side opposite wo (NoL < 0) — light passing through a thin sheet.
+  bool translucent_active =
+      !reflect && e.mat->translucent_weight > 0.0f && e.transmission <= 0.0f;
 
   float F0_d =
       ((e.ior - 1.0f) / (e.ior + 1.0f)) * ((e.ior - 1.0f) / (e.ior + 1.0f));
@@ -1368,14 +1388,21 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
   // Weights for MIS between lobes. Coat gets `coat_weight·F_coat(V)` so its
   // sampling budget follows the actual lobe intensity at this view angle —
   // at grazing the coat dominates, at normal it contributes weakly.
-  float w_diffuse = (1.0f - e.metallic) * (1.0f - e.transmission);
+  // translucent_weight steals from the forward diffuse budget: t_w=1 → no
+  // forward Lambert, all diffuse energy on the back hemisphere; t_w=0.5 →
+  // even split (Mix Shader of Diffuse + Translucent).
+  float t_w = mc->translucent_weight;
+  float w_base_diff = (1.0f - e.metallic) * (1.0f - e.transmission);
+  float w_diffuse = w_base_diff * (1.0f - t_w);
+  float w_translucent = w_base_diff * t_w;
   float w_spec = e.metallic + (1.0f - e.metallic) * (1.0f - e.transmission);
   float w_trans = (1.0f - e.metallic) * e.transmission;
   float w_coat = coat_w_mat * schlick_scalar(NoV, cF0);
-  float w_sum = w_diffuse + w_spec + w_trans + w_coat;
+  float w_sum = w_diffuse + w_translucent + w_spec + w_trans + w_coat;
   if (w_sum <= 0.0f)
     return r;
   float p_diff = w_diffuse / w_sum;
+  float p_translucent = w_translucent / w_sum;
   float p_spec = w_spec / w_sum;
   float p_trans = w_trans / w_sum;
   float p_coat = w_coat / w_sum;
@@ -1517,16 +1544,6 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
       float3 tint = make_f3(mc->sheen_tint);
       r.f = r.f + tint * sf * NoL;
     }
-  } else if (sss_backlit) {
-    // Back-lit diffuse via SSS wrap lobe only. The cosine-hemisphere sampler
-    // can't reach below-surface directions, so r.pdf stays 0 here — NEE
-    // carries these paths and the MIS weight falls to the NEE side.
-    float w_wrap = fmaxf(NoL_wrap, 0.0f);
-    if (w_wrap > 0.0f && w_diffuse > 0.0f) {
-      float3 bc_sss = e.base_color * (make_float3(1, 1, 1) * (1.0f - sss_w) +
-                                      sss_tint * sss_w);
-      r.f = r.f + bc_sss * (INV_PIf * w_diffuse * sss_w * w_wrap);
-    }
   } else if (transmit) {
     // Rough dielectric transmission (Walter et al.). Half-vector
     // h ∝ η_i·ωo + η_t·ωi → divide by η_i, so with eta = η_t/η_i the form is
@@ -1559,6 +1576,28 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
     float pdf_h = D * G1_v * abs_VoH / fmaxf(abs_NoV, 1e-12f);
     float jacobian = eta * eta * abs_LoH / den2;
     r.pdf += p_trans * (1.0f - F) * pdf_h * jacobian;
+  } else if (translucent_active || sss_backlit) {
+    // Back hemisphere (NoL < 0). Translucent (proper back-Lambert) and the
+    // SSS wrap lobe both contribute additively here. Refraction is mutually
+    // exclusive (handled above) — Glass + Translucent isn't a Cycles combo.
+    if (translucent_active && w_translucent > 0.0f) {
+      float abs_NoL = -NoL;
+      r.f = r.f + e.base_color * (INV_PIf * w_translucent * abs_NoL);
+      // sample_bsdf uses a cosine-weighted *back* hemisphere, so the pdf
+      // matches the forward-Lambert form with |NoL|.
+      r.pdf += p_translucent * abs_NoL * INV_PIf;
+    }
+    if (sss_backlit) {
+      // Wrap-Lambert SSS hack — the cosine-hemisphere sampler can't reach
+      // below-surface directions on its own, so r.pdf gets no SSS term;
+      // NEE carries these paths.
+      float w_wrap = fmaxf(NoL_wrap, 0.0f);
+      if (w_wrap > 0.0f && w_diffuse > 0.0f) {
+        float3 bc_sss = e.base_color * (make_float3(1, 1, 1) * (1.0f - sss_w) +
+                                        sss_tint * sss_w);
+        r.f = r.f + bc_sss * (INV_PIf * w_diffuse * sss_w * w_wrap);
+      }
+    }
   }
   return r;
 }
@@ -1619,14 +1658,18 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
   float coat_alpha = e.coat_alpha;  // already filter-glossy-clamped
   float cF0 = ((e.mat->coat_ior - 1.0f) / (e.mat->coat_ior + 1.0f)) *
               ((e.mat->coat_ior - 1.0f) / (e.mat->coat_ior + 1.0f));
-  float w_diffuse = (1.0f - e.metallic) * (1.0f - e.transmission);
+  float t_w = e.mat->translucent_weight;
+  float w_base_diff = (1.0f - e.metallic) * (1.0f - e.transmission);
+  float w_diffuse = w_base_diff * (1.0f - t_w);
+  float w_translucent = w_base_diff * t_w;
   float w_spec = e.metallic + (1.0f - e.metallic) * (1.0f - e.transmission);
   float w_trans = (1.0f - e.metallic) * e.transmission;
   float w_coat = coat_w_mat * schlick_scalar(NoV, cF0);
-  float total = w_diffuse + w_spec + w_trans + w_coat;
+  float total = w_diffuse + w_translucent + w_spec + w_trans + w_coat;
   if (total <= 0.0f)
     return s;
   float p_diff = w_diffuse / total;
+  float p_translucent = w_translucent / total;
   float p_spec = w_spec / total;
   float p_trans = w_trans / total;
 
@@ -1642,7 +1685,18 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
                                sqrtf(fmaxf(0.0f, 1.0f - u1)));
     s.wi = normalize3(e.T * local.x + e.B * local.y + e.Ns * local.z);
     s.lobe = LOBE_DIFFUSE;
-  } else if (u < p_diff + p_spec) {
+  } else if (u < p_diff + p_translucent) {
+    // Translucent: cosine-weighted *back* hemisphere. Negate the local Z so
+    // wi exits the surface on the side opposite Ns. Bucketed as
+    // LOBE_DIFFUSE so it shares Cycles' diffuse-bounces budget — Cycles
+    // categorises Translucent BSDF as a diffuse path-type as well.
+    float r = sqrtf(u1);
+    float phi = 2.0f * M_PIf * u2;
+    float3 local = make_float3(r * cosf(phi), r * sinf(phi),
+                               -sqrtf(fmaxf(0.0f, 1.0f - u1)));
+    s.wi = normalize3(e.T * local.x + e.B * local.y + e.Ns * local.z);
+    s.lobe = LOBE_DIFFUSE;
+  } else if (u < p_diff + p_translucent + p_spec) {
     // GGX VNDF specular (anisotropic)
     float3 Vlocal = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
     float3 Hlocal =
@@ -1659,7 +1713,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
     if (e.alpha <= 0.02f * 0.02f)
       s.specular = true;
     s.lobe = LOBE_GLOSSY;
-  } else if (u < p_diff + p_spec + p_trans) {
+  } else if (u < p_diff + p_translucent + p_spec + p_trans) {
     // Rough-dielectric transmission
     float eta = e.ior;
     float3 Vlocal = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
@@ -2416,7 +2470,11 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
     }
 
     if (v.hit == 0) {
-      float3 bg = world_background(dir);
+      // is_camera_ray for the world-bg split: bounce==0 is the primary
+      // ray, and a chain of specular bounces (mirror / glass) preserves
+      // the camera-ray semantic in Cycles' Light Path classification.
+      bool is_camera_ray = (bounce == 0) || last_specular;
+      float3 bg = world_background(dir, is_camera_ray);
       float w = 1.0f;
       if (bounce > 0 && !last_specular && params.world_type != 0) {
         float p_env = envmap_pdf(dir);

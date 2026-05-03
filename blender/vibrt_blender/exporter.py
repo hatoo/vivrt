@@ -872,6 +872,62 @@ def _sky_node_alone_cache_key(world, sky_node) -> str:
             f"{sun_rot}__{sun_elev}__{sun_size}__{sun_disc}__1024x512")
 
 
+def _detect_mix_world_camera_ray_split(world):
+    """Detect `MixShader(Background_a, Background_b, fac=Light Path.Is Camera Ray)`.
+
+    This is the canonical archiviz idiom for separating a high-strength
+    ambient lighting envmap from a low-strength backplate visible to
+    the camera (and to specular reflections). The MixShader's factor is
+    `is_camera_ray`, so:
+      - fac=0 (non-camera rays: NEE / indirect / diffuse) → input 1 (lighting)
+      - fac=1 (camera + specular-chain rays)              → input 2 (camera)
+
+    Returns `(bg_lighting, bg_camera)` matching that mapping, or None
+    if any of the topology requirements aren't met. The caller then
+    bakes each branch separately.
+    """
+    if world is None or not world.use_nodes or world.node_tree is None:
+        return None
+    out = world.node_tree.nodes.get("World Output") or next(
+        (n for n in world.node_tree.nodes
+         if n.bl_idname == "ShaderNodeOutputWorld"),
+        None,
+    )
+    if out is None:
+        return None
+    surf = out.inputs.get("Surface")
+    if surf is None or not surf.is_linked:
+        return None
+    src = surf.links[0].from_node
+    if src.bl_idname != "ShaderNodeMixShader":
+        return None
+    fac_sock = src.inputs[0]
+    if not fac_sock.is_linked:
+        return None
+    fac_link = fac_sock.links[0]
+    if fac_link.from_node.bl_idname != "ShaderNodeLightPath":
+        return None
+    if fac_link.from_socket.name != "Is Camera Ray":
+        return None
+    in1 = src.inputs[1]
+    in2 = src.inputs[2]
+    if not in1.is_linked or not in2.is_linked:
+        return None
+    bg_lighting = in1.links[0].from_node
+    bg_camera = in2.links[0].from_node
+    if bg_lighting.bl_idname != "ShaderNodeBackground":
+        return None
+    if bg_camera.bl_idname != "ShaderNodeBackground":
+        return None
+    return bg_lighting, bg_camera
+
+
+def _world_branch_cache_key(world, branch_node, role: str) -> str:
+    """Stable cache key for a Light-Path camera-ray-split branch bake.
+    `role` is "lighting" or "camera" so the two halves stay distinct."""
+    return f"__world_split__{world.name}__{role}__{branch_node.name}__2048x1024"
+
+
 def _detect_mix_world(world):
     """If the world's Surface is `MixShader(Background, Background, fac=const)`,
     return `(bg_a, bg_b, fac)`. Otherwise None.
@@ -1111,6 +1167,68 @@ def _try_export_mixed_world(world, mix_pat, writer, textures, lights_json):
     }
 
 
+def _try_export_split_world(world, split_pat, writer, textures):
+    """Emit a Mixed envmap with `split_by_camera_ray=true` from a
+    Light-Path-driven Mix Shader. Returns None when the per-branch
+    bakes aren't in `_SKY_BAKE_CACHE` (e.g. update() didn't run, or a
+    bake failed) so the caller falls back to the combined-bake path.
+
+    Layer convention: `a` = lighting branch (drives the CDF / NEE),
+    `b` = camera branch (camera-visible backplate). The bakes already
+    fold Background.Strength + any upstream Mapping rotation into the
+    pixels, so each layer carries strength=1.0 and identity rotation.
+    """
+    bg_lighting, bg_camera = split_pat
+    key_a = _world_branch_cache_key(world, bg_lighting, "lighting")
+    key_b = _world_branch_cache_key(world, bg_camera, "camera")
+    baked_a = _SKY_BAKE_CACHE.get(key_a)
+    baked_b = _SKY_BAKE_CACHE.get(key_b)
+    if baked_a is None or baked_b is None:
+        _emit(
+            f"[vibrt] warn: world {world.name!r}: camera-ray split "
+            f"detected but per-branch bakes were not cached "
+            f"(lighting={'OK' if baked_a is not None else 'MISSING'}, "
+            f"camera={'OK' if baked_b is not None else 'MISSING'}) — "
+            f"falling back to legacy combined bake. Was the engine "
+            f"update() hook invoked?"
+        )
+        return None
+    rgb_a, aw, ah, _ = baked_a
+    rgb_b, bw, bh, _ = baked_b
+    pb_a = material_export._PreBakedTexture(rgb=rgb_a, w=aw, h=ah, cache_key=key_a)
+    pb_b = material_export._PreBakedTexture(rgb=rgb_b, w=bw, h=bh, cache_key=key_b)
+    tex_a = material_export.export_image_texture(
+        pb_a, writer, textures, colorspace="linear"
+    )
+    tex_b = material_export.export_image_texture(
+        pb_b, writer, textures, colorspace="linear"
+    )
+    identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    _emit(
+        f"[vibrt] world {world.name!r}: emitting camera-ray split "
+        f"envmap (lighting={aw}x{ah}, camera={bw}x{bh})"
+    )
+    return {
+        "type": "mixed",
+        "a": {
+            "texture": tex_a,
+            "rotation": identity,
+            "strength": 1.0,
+            "projection": "equirect",
+            "extension": "repeat",
+        },
+        "b": {
+            "texture": tex_b,
+            "rotation": identity,
+            "strength": 1.0,
+            "projection": "equirect",
+            "extension": "repeat",
+        },
+        "fac": 0.0,
+        "split_by_camera_ray": True,
+    }
+
+
 def _world_needs_full_bake(world) -> bool:
     """True when the world's shader graph isn't a plain
     `ShaderNodeBackground -> Output.Surface`. Catches the
@@ -1159,6 +1277,24 @@ def prebake_sky_envmaps_for_world(world, w: int = 2048, h: int = 1024) -> None:
     if sky is not None:
         _prebake_sky_texture(world, sky, w=w, h=h)
         return
+    # Light-Path camera-ray split: bake each branch in isolation so the
+    # camera-visible backplate and the lighting envmap stay separate
+    # (Cycles' single-equirect render of this graph would only ever
+    # capture is_camera_ray=1, dropping the lighting branch entirely).
+    split = _detect_mix_world_camera_ray_split(world)
+    if split is not None:
+        bg_lighting, bg_camera = split
+        _prebake_world_branch_alone(
+            world, bg_lighting, w=w, h=h,
+            cache_key=_world_branch_cache_key(world, bg_lighting, "lighting"),
+            role="lighting",
+        )
+        _prebake_world_branch_alone(
+            world, bg_camera, w=w, h=h,
+            cache_key=_world_branch_cache_key(world, bg_camera, "camera"),
+            role="camera",
+        )
+        return
     # If the world surface is `MixShader(Background_a, Background_b, fac=const)`,
     # bake each Sky Texture present in either branch separately so the
     # exporter's option-A path can emit `WorldDesc::Mixed` with per-layer
@@ -1171,6 +1307,72 @@ def prebake_sky_envmaps_for_world(world, w: int = 2048, h: int = 1024) -> None:
         return
     if _world_needs_full_bake(world):
         _prebake_world_full(world, w=w, h=h)
+
+
+def _prebake_world_branch_alone(world, branch_bg, *, w, h, cache_key, role):
+    """Bake one Background branch of a Light-Path-driven world Mix in
+    isolation. Clones the world, rewires the clone's World Output to the
+    branch's Background output (bypassing the MixShader), bakes via
+    `_bake_sky_world_to_pixels`, then removes the clone. The bake captures
+    Background.Strength and any upstream Mapping rotation in the pixels,
+    so the resulting EnvmapLayer carries strength=1.0 and identity rotation.
+    """
+    if cache_key in _SKY_BAKE_CACHE:
+        return
+    if branch_bg is None or branch_bg.bl_idname != "ShaderNodeBackground":
+        return
+    t0 = time.perf_counter()
+    tmp_world = world.copy()
+    tmp_world.name = f"__vibrt_world_branch_{role}_{branch_bg.name}"
+    nt = tmp_world.node_tree
+    out_n = nt.nodes.get("World Output") or next(
+        (n for n in nt.nodes if n.bl_idname == "ShaderNodeOutputWorld"),
+        None,
+    )
+    if out_n is None:
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    # `world.copy()` preserves node names, so the cloned counterpart of
+    # the branch's Background is reachable by name.
+    tmp_branch = nt.nodes.get(branch_bg.name)
+    if tmp_branch is None:
+        _emit(
+            f"[vibrt] warn: world {world.name!r}: failed to find cloned "
+            f"branch node {branch_bg.name!r} in temp world — skipping "
+            f"camera-ray split bake for {role!r}"
+        )
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    surf_sock = out_n.inputs.get("Surface")
+    if surf_sock is None:
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    # Clear any existing links on Surface (the cloned MixShader chain) so
+    # the rewired Background drives the bake by itself.
+    for lk in list(surf_sock.links):
+        nt.links.remove(lk)
+    nt.links.new(tmp_branch.outputs["Background"], surf_sock)
+    try:
+        baked = _bake_sky_world_to_pixels(tmp_world, w=w, h=h)
+    except Exception as ex:
+        _emit(
+            f"[vibrt] warn: world {world.name!r}: failed to bake "
+            f"camera-ray split branch {role!r} ({branch_bg.name!r}): "
+            f"{ex} — split path will fall back to combined bake"
+        )
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    if baked is None:
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    rgb, bw, bh = baked
+    _SKY_BAKE_CACHE[cache_key] = (rgb, bw, bh, None)
+    _emit(
+        f"[vibrt] world {world.name!r}: pre-baked {role!r} branch "
+        f"{branch_bg.name!r} (camera-ray split) to a {bw}x{bh} envmap "
+        f"in {time.perf_counter() - t0:.2f}s"
+    )
+    bpy.data.worlds.remove(tmp_world, do_unlink=True)
 
 
 def _prebake_sky_node_alone(world, sky_node, w: int, h: int) -> None:
@@ -1734,6 +1936,20 @@ def _export_world(world, writer, textures: list, lights_json: list | None = None
                     f"ShaderNodeTexEnvironment) — using constant default"
                 )
         return {"type": "constant", "color": col, "strength": float(strength)}
+
+    # Light-Path camera-ray split: emit a Mixed envmap with
+    # `split_by_camera_ray=true` so the kernel picks layer b for camera-
+    # visible misses and layer a for lighting / NEE / indirect rays.
+    # Both layers come from per-branch Cycles bakes populated by
+    # `_prebake_world_branch_alone`.
+    split_pat = _detect_mix_world_camera_ray_split(world)
+    if split_pat is not None:
+        split = _try_export_split_world(world, split_pat, writer, textures)
+        if split is not None:
+            return split
+        # If the per-branch bake didn't land in cache, fall through to
+        # the legacy full-world bake (which captures only the camera
+        # branch — same behaviour as before this change).
 
     # Option A: detect `MixShader(Background_a, Background_b, fac=const)`
     # and emit `WorldDesc::Mixed` so each layer can be sampled at its

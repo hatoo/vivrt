@@ -3113,7 +3113,27 @@ def _normal_perturbation(normal_sock):
     normal_sock = _follow_reroutes(normal_sock)
     if not normal_sock.is_linked:
         return None, 1.0, None, 1.0
-    src = normal_sock.links[0].from_node
+    link = normal_sock.links[0]
+    src = link.from_node
+    # `Geometry → Normal` is a Cycles idiom that explicitly wires the smooth
+    # shading normal back into the Normal input — a no-op against vibrt's
+    # default. `Geometry → Incoming` is the canonical archiviz "Translucent
+    # always faces the camera" trick: feeding the view direction back as
+    # the BSDF's normal aligns the back hemisphere with the light side of
+    # a thin sheet. trace_path already flips Ns to face the incoming ray
+    # for any back-face hit, so the trick collapses to a no-op for us
+    # too. Other Geometry outputs (True Normal = geometric/face normal,
+    # Tangent, Position, Random Per Island) carry per-fragment data the
+    # renderer can't bake — those still drop through to the warning below.
+    # NodeGroupInput as Normal source is similarly a no-op when the
+    # wrapping group's external Normal socket is unlinked.
+    if (src.bl_idname == "ShaderNodeNewGeometry"
+            and link.from_socket.name in ("Normal", "Incoming")):
+        return None, 1.0, None, 1.0
+    if src.bl_idname == "NodeGroupInput" and _GROUP_STACK:
+        outer = _GROUP_STACK[-1].inputs.get(link.from_socket.name)
+        if outer is not None and not outer.is_linked:
+            return None, 1.0, None, 1.0
     if src.bl_idname == "ShaderNodeNormalMap":
         strength = _socket_f(src.inputs["Strength"]) if "Strength" in src.inputs else 1.0
         return src.inputs["Color"], strength, None, 1.0
@@ -3438,21 +3458,18 @@ def _from_principled(node, writer, textures) -> dict:
 
 
 def _from_translucent(node, writer, textures) -> dict:
-    """ShaderNodeBsdfTranslucent → diffuse with backlit-SSS turned on so
-    a thin sheet (lotus leaf, cloth, etc.) actually picks up some
-    illumination on the side away from the light source. The previous
-    fallback routed Translucent through `_from_diffuse`, which left
-    `sss_weight=0` and made the BSDF return zero for any NoL<0
-    direction — back-lit lotus leaves rendered black even when the sun
-    was right behind them. Same chain Cycles uses, just collapsed onto
-    the existing wrap-Lambert SSS path.
+    """ShaderNodeBsdfTranslucent → proper Translucent BSDF lobe.
+
+    Routes the Color socket through `_from_diffuse` to pick up the texture /
+    colour-graph machinery, then sets `translucent_weight=1.0` so the kernel
+    redirects the diffuse budget onto a back-hemisphere Lambertian. Unlike
+    the previous wrap-Lambert SSS hack (which stayed on the front hemisphere
+    with a smooth fall-off across the terminator), this matches Cycles'
+    Translucent BSDF: light passing *through* a thin sheet from the side
+    opposite the viewer.
     """
     p = _from_diffuse(node, writer, textures)
-    p["sss_weight"] = 1.0
-    # Wide isotropic radius — Translucent has no spatial scattering
-    # parameter and the SSS-wrap term only uses radius for the per-channel
-    # tint ratio, so equal channels keep the colour the user authored.
-    p["sss_radius"] = [1.0, 1.0, 1.0]
+    p["translucent_weight"] = 1.0
     return p
 
 
@@ -3612,8 +3629,8 @@ def _from_add(node, writer, textures, mat_name: str) -> dict:
     contributions. Transmission takes the max so Add(Glass, Emission) still
     refracts. Special case: `Add(Diffuse, Translucent)` is the canonical
     thin-leaf idiom (front lobe = diffuse, back lobe = translucent); we
-    promote it to the surface's wrap-Lambert SSS branch so back-lit leaves
-    don't render black.
+    promote it to translucent_weight=0.5 on the surface so the kernel splits
+    the diffuse budget between forward and back hemispheres.
     """
     in1 = _follow_reroutes(node.inputs[0])
     in2 = _follow_reroutes(node.inputs[1])
@@ -3621,24 +3638,20 @@ def _from_add(node, writer, textures, mat_name: str) -> dict:
     n2 = in2.links[0].from_node if in2.is_linked else None
     p1 = _resolve_shader(n1, writer, textures, mat_name) if n1 else _default_params()
     p2 = _resolve_shader(n2, writer, textures, mat_name) if n2 else _default_params()
-    # Asymmetric Translucent contribution: only one side has sss_weight>0
-    # because `_from_translucent` is the only path that sets it. Keep the
-    # opaque-surface side and turn the wrap-Lambert SSS lobe on so back-lit
-    # leaves get the translucent contribution our renderer can express.
-    p1_sss = p1.get("sss_weight", 0.0) > 0.0
-    p2_sss = p2.get("sss_weight", 0.0) > 0.0
-    if p1_sss != p2_sss:
-        surf = p2 if p1_sss else p1
-        translu = p1 if p1_sss else p2
+    # Asymmetric Translucent contribution (canonical thin-leaf idiom): keep
+    # the opaque-surface side as the base lobe and split the diffuse budget
+    # 50/50 between forward Lambert and back-Lambert via translucent_weight.
+    # This is energy-conserving (sums to 1) — Cycles' Add Shader is not, but
+    # 50/50 mirrors what artists actually want (and what Mix Shader at 0.5
+    # does). The translucent side's base_color is dropped: the schema only
+    # carries one base_color slot, and most leaves use the same hue both
+    # sides anyway.
+    p1_t = p1.get("translucent_weight", 0.0) > 0.0
+    p2_t = p2.get("translucent_weight", 0.0) > 0.0
+    if p1_t != p2_t:
+        surf = p2 if p1_t else p1
         out = dict(surf)
-        out["sss_weight"] = 1.0
-        # Per-channel mean-free-path → SSS tint via radius/max in the
-        # device code. The translucent side's base_color is the back-lit
-        # tint the user authored; if it was textured (base_color=[1,1,1])
-        # we fall back to a flat tint so the wrap term still fires.
-        bc = translu.get("base_color", [1.0, 1.0, 1.0])
-        if max(bc) > 1e-6:
-            out["sss_radius"] = list(bc)
+        out["translucent_weight"] = 0.5
         out["emission"] = [a + b for a, b in zip(p1["emission"], p2["emission"])]
         out["transmission"] = max(p1["transmission"], p2["transmission"])
         return out
@@ -4249,6 +4262,14 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
     out["transmission"] = (
         p1["transmission"] * (1.0 - fac) + p2["transmission"] * fac
     )
+    # Translucent weight lerps so Mix(Diffuse, Translucent, fac) → translucent
+    # contribution scales with fac (fac=1 → pure Translucent, fac=0 → pure
+    # Diffuse, mid → split). Without this the MixShader fallback above only
+    # kept one side's surface and the back-hemisphere lobe vanished.
+    t1 = p1.get("translucent_weight", 0.0)
+    t2 = p2.get("translucent_weight", 0.0)
+    if t1 != 0.0 or t2 != 0.0:
+        out["translucent_weight"] = t1 * (1.0 - fac) + t2 * fac
     return out
 
 

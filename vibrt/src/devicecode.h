@@ -80,6 +80,9 @@ struct PrincipledGpu {
   float sheen_tint[3];
   float sss_weight;
   float sss_radius[3];
+  // Cycles Translucent BSDF weight. Back-hemisphere Lambertian — shares
+  // budget with the forward diffuse lobe.
+  float translucent_weight;
   float hair_weight;
   float hair_offset;
   float hair_roughness_u;
@@ -215,6 +218,11 @@ struct LaunchParams {
   float envmap_rotation_a[9];
   float envmap_rotation_b[9];
   float envmap_mix_fac;
+  // 1 when the world's MixShader factor was driven by Light Path's
+  // is_camera_ray. Camera-ray misses (bounce==0 or after a specular chain)
+  // read layer b directly; other rays fall back to envmap_data (= layer a)
+  // so the CDF / NEE sampler stays unchanged.
+  int envmap_split_by_camera_ray;
 
   float *ggx_e_lut;
   float *ggx_e_avg_lut;

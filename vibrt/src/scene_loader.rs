@@ -279,30 +279,54 @@ pub fn load_scene_from_bytes<'a>(
         Some(WorldDesc::Envmap { texture, .. }) => {
             (Some(extract_rgb(*texture)?), None, None)
         }
-        Some(WorldDesc::Mixed { a, b, fac }) => {
-            // Host-rasterise a "mixed grid" by sampling each layer at
-            // every pixel direction (with its rotation + projection) and
-            // blending. The grid is what the kernel reads at render
-            // time and what drives the importance-sampling CDF.
-            //
-            // Resolution matters: a 1024×512 grid leaves only ~30
-            // pixels covering a 0.5° sun disc, so a single-tap bilinear
-            // sample of the source texture often misses bright pixels
-            // entirely (the sun in pabellon's HDRI was effectively
-            // invisible at 1024×512). 2048×1024 gives a 1×4 px bright
-            // region per sun (still narrow but enough for the CDF to
-            // weight it). Source textures up to ~4k can drive this
-            // safely; the per-layer cap stays the input image's
-            // native resolution.
+        Some(WorldDesc::Mixed {
+            a,
+            b,
+            fac,
+            split_by_camera_ray,
+        }) => {
             let layer_a = extract_rgb(a.texture)?;
             let layer_b = extract_rgb(b.texture)?;
-            let mixed = build_mixed_envmap_grid(
-                &layer_a, &a.rotation, a.strength,
-                &a.projection, &a.extension,
-                &layer_b, &b.rotation, b.strength,
-                &b.projection, &b.extension,
-                *fac, 2048, 1024,
-            );
+            let mixed = if *split_by_camera_ray {
+                // Light-Path camera-ray split: lighting (= layer a) drives
+                // the CDF / NEE on its own. The host-rasterised mix grid
+                // would average two unrelated radiance distributions and
+                // bias both NEE-light and direct-camera lookups; instead
+                // we rasterise *just* layer a at the standard 2048×1024
+                // CDF resolution. Layer b is uploaded separately for the
+                // camera-ray direct lookup in `world_background`.
+                let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+                build_mixed_envmap_grid(
+                    &layer_a, &a.rotation, a.strength,
+                    &a.projection, &a.extension,
+                    &layer_a, &identity, 0.0,
+                    &a.projection, &a.extension,
+                    0.0, 2048, 1024,
+                )
+            } else {
+                // Host-rasterise a "mixed grid" by sampling each layer at
+                // every pixel direction (with its rotation + projection)
+                // and blending. The grid is what the kernel reads at
+                // render time and what drives the importance-sampling
+                // CDF.
+                //
+                // Resolution matters: a 1024×512 grid leaves only ~30
+                // pixels covering a 0.5° sun disc, so a single-tap
+                // bilinear sample of the source texture often misses
+                // bright pixels entirely (the sun in pabellon's HDRI was
+                // effectively invisible at 1024×512). 2048×1024 gives a
+                // 1×4 px bright region per sun (still narrow but enough
+                // for the CDF to weight it). Source textures up to ~4k
+                // can drive this safely; the per-layer cap stays the
+                // input image's native resolution.
+                build_mixed_envmap_grid(
+                    &layer_a, &a.rotation, a.strength,
+                    &a.projection, &a.extension,
+                    &layer_b, &b.rotation, b.strength,
+                    &b.projection, &b.extension,
+                    *fac, 2048, 1024,
+                )
+            };
             (Some(mixed), Some(layer_a), Some(layer_b))
         }
         _ => (None, None, None),

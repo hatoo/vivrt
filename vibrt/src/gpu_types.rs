@@ -99,6 +99,10 @@ pub struct PrincipledGpu {
     pub sheen_tint: [f32; 3],
     pub sss_weight: f32,
     pub sss_radius: [f32; 3],
+    /// Cycles Translucent BSDF weight. Lambertian on the back hemisphere;
+    /// shares budget with `w_diffuse` (translucent_weight=1 → all diffuse
+    /// energy goes to the back lobe instead of the front).
+    pub translucent_weight: f32,
     pub hair_weight: f32,
     pub hair_offset: f32,
     pub hair_roughness_u: f32,
@@ -293,6 +297,11 @@ pub struct LaunchParams {
     pub envmap_rotation_a: [f32; 9],
     pub envmap_rotation_b: [f32; 9],
     pub envmap_mix_fac: f32,
+    /// 1 when `WorldDesc::Mixed.split_by_camera_ray` was set: camera rays
+    /// (bounce==0 or after a chain of specular bounces) read layer `b`,
+    /// other rays use `envmap_data` (which the loader filled with `a`).
+    /// 0 selects the legacy fac-mixed behaviour driven by `envmap_mix_fac`.
+    pub envmap_split_by_camera_ray: i32,
 
     pub ggx_e_lut: optix_sys::CUdeviceptr,
     pub ggx_e_avg_lut: optix_sys::CUdeviceptr,

@@ -259,6 +259,16 @@ pub struct PrincipledMaterial {
     pub sss_weight: f32,
     #[serde(default = "default_sss_radius")]
     pub sss_radius: [f32; 3],
+    /// Cycles `ShaderNodeBsdfTranslucent` weight in [0,1]. A real Translucent
+    /// lobe — Lambertian on the *back* hemisphere — that lights paper /
+    /// lampshade / leaf surfaces from the side opposite the viewer. Replaces
+    /// the previous wrap-Lambert SSS hack which under-illuminated thin
+    /// sheets (archiviz lamp shade was visibly darker than Cycles). When
+    /// > 0 the same fraction of `w_diffuse` is redirected to the back
+    /// hemisphere, so `translucent_weight=1` yields pure Translucent and
+    /// intermediate values mix with forward Lambert (Mix Shader case).
+    #[serde(default)]
+    pub translucent_weight: f32,
     /// When > 0, the surface is shaded with a Kajiya-Kay hair lobe instead
     /// of the standard diffuse+specular path. Triggered by Cycles'
     /// `ShaderNodeBsdfHair` and MixShader'd fractions of it.
@@ -640,6 +650,20 @@ pub enum WorldDesc {
         b: EnvmapLayer,
         #[serde(default = "half_f32")]
         fac: f32,
+        /// When true, `fac` is ignored and the world is split by ray type:
+        /// `a` is what *non-camera* (lighting / NEE / indirect) rays see,
+        /// `b` is what *camera* rays (and rays after a chain of specular
+        /// bounces) see. Set by the exporter when the MixShader's factor
+        /// is driven by `ShaderNodeLightPath.is_camera_ray` — the canonical
+        /// archiviz idiom for separating a high-strength ambient lighting
+        /// envmap from a low-strength backplate visible to the camera.
+        ///
+        /// The CDF is built from `a` only (NEE samples lighting); `b` is
+        /// looked up directly on camera-ray misses. With this flag set the
+        /// scene loader skips `build_mixed_envmap_grid` and uses `a`'s
+        /// pixels verbatim as `envmap_data`.
+        #[serde(default)]
+        split_by_camera_ray: bool,
     },
 }
 
