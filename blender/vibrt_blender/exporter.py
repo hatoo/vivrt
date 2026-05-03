@@ -27,9 +27,65 @@ def _matrix_to_row_major(m) -> list[float]:
     return [m[i][j] for i in range(4) for j in range(4)]
 
 
+def _approx_mesh_as_rect(mesh, m3, mw):
+    """Build an oriented rect that approximates a multi-poly emissive mesh
+    for NEE sampling. Returns (center_w, u_axis_w, v_axis_w, normal_w,
+    size_u, size_v) or None if the mesh is degenerate.
+
+    Strategy: walk every triangle, accumulate area-weighted centroid +
+    normal in world space, then build orthonormal basis (U, V) in the
+    plane perpendicular to the average normal. Set the rect size so its
+    area equals the mesh's full surface area (two-sided emission keeps
+    the integrated radiated power roughly equal to a thin emissive sheet
+    of the same surface area).
+    """
+    from mathutils import Vector
+    total_area = 0.0
+    centroid = Vector((0.0, 0.0, 0.0))
+    avg_n = Vector((0.0, 0.0, 0.0))
+    for poly in mesh.polygons:
+        vs = [mw @ mesh.vertices[vi].co for vi in poly.vertices]
+        # Triangulate fan-style around vs[0].
+        for i in range(1, len(vs) - 1):
+            a, b, c = vs[0], vs[i], vs[i + 1]
+            cross = (b - a).cross(c - a)
+            tri_area = cross.length * 0.5
+            if tri_area < 1e-12:
+                continue
+            tri_n = cross.normalized()
+            tri_centroid = (a + b + c) / 3.0
+            total_area += tri_area
+            centroid += tri_centroid * tri_area
+            avg_n += tri_n * tri_area
+    if total_area < 1e-12 or avg_n.length < 1e-9:
+        return None
+    centroid /= total_area
+    normal_w = avg_n.normalized()
+    # Pick a U axis that's perpendicular to normal_w. Use the world axis
+    # least aligned with normal_w as a seed for stable orthonormalisation.
+    seed = Vector((1.0, 0.0, 0.0)) if abs(normal_w.x) < 0.9 else Vector((0.0, 1.0, 0.0))
+    u_axis_w = (seed - normal_w * seed.dot(normal_w)).normalized()
+    v_axis_w = normal_w.cross(u_axis_w).normalized()
+    # Square rect with area = total mesh surface area. (For a flat mesh
+    # this matches the mesh's projected area exactly; for a curved one it
+    # over-estimates the visible cross-section but preserves total power.)
+    side = math.sqrt(total_area)
+    return centroid, u_axis_w, v_axis_w, normal_w, side, side
+
+
 def _try_emissive_quad_as_rect_light(obj, obj_eval, mat_params):
-    """If obj_eval is a single-quad mesh with pure-emissive material, return
-    an AreaRect light JSON dict. Otherwise None.
+    """If obj_eval is a pure-emissive mesh, return an AreaRect light JSON
+    dict that vibrt's NEE can sample. Otherwise None.
+
+    Single-quad meshes use the quad's edges as the rect's U/V axes
+    (preserving the source rectangle exactly). Multi-poly meshes fall
+    through `_approx_mesh_as_rect`: a square rect placed at the
+    area-weighted centroid, oriented along the area-weighted average
+    normal, with side = √(total surface area). The mesh is then dropped
+    from the geometry export (the rect takes its place in the scene), so
+    the only visible footprint is the rect itself — fine for emissive
+    panels of any topology, less faithful for curved/long emissive
+    bodies whose silhouette matters.
 
     Pure emissive = emission > 0 with base_color ≈ 0, no transmission, no
     textures/graphs tinting the lobes. vibrt only importance-samples light
@@ -64,37 +120,46 @@ def _try_emissive_quad_as_rect_light(obj, obj_eval, mat_params):
             return None
 
     mesh = obj_eval.data
-    if len(mesh.polygons) != 1:
+    if len(mesh.polygons) == 0:
         return None
-    poly = mesh.polygons[0]
-    if len(poly.vertices) != 4:
-        return None
-
-    verts = [mesh.vertices[vi].co.copy() for vi in poly.vertices]
-    # Treat the quad's edge[0]=v1-v0 and edge[3]=v3-v0 as the U/V axes.
-    # Assumes a reasonably rectangular quad — sheared/twisted ones fold to
-    # an approximate axis-aligned rect, which is fine for light sampling
-    # purposes (the emission and area are preserved).
-    u_edge = verts[1] - verts[0]
-    v_edge = verts[3] - verts[0]
-    if u_edge.length < 1e-6 or v_edge.length < 1e-6:
-        return None
-
     mw = obj_eval.matrix_world
     m3 = mw.to_3x3()
-    center_w = mw @ ((verts[0] + verts[1] + verts[2] + verts[3]) * 0.25)
-    u_edge_w = m3 @ u_edge
-    v_edge_w = m3 @ v_edge
-    size_u = u_edge_w.length
-    size_v = v_edge_w.length
-    if size_u < 1e-6 or size_v < 1e-6:
-        return None
-    u_axis_w = u_edge_w / size_u
-    v_axis_w = v_edge_w / size_v
-    # Cross product gives the face normal; consistent with Blender's poly
-    # winding for a single 4-vert face. No need for the inverse-transpose
-    # trick (that only matters for shading normals under non-uniform scale).
-    normal_w = u_axis_w.cross(v_axis_w).normalized()
+    if len(mesh.polygons) == 1 and len(mesh.polygons[0].vertices) == 4:
+        # Exact single-quad fast path: take the quad's two edges as the
+        # rect's U/V axes (preserves shape exactly).
+        poly = mesh.polygons[0]
+        verts = [mesh.vertices[vi].co.copy() for vi in poly.vertices]
+        u_edge = verts[1] - verts[0]
+        v_edge = verts[3] - verts[0]
+        if u_edge.length < 1e-6 or v_edge.length < 1e-6:
+            return None
+        center_w = mw @ ((verts[0] + verts[1] + verts[2] + verts[3]) * 0.25)
+        u_edge_w = m3 @ u_edge
+        v_edge_w = m3 @ v_edge
+        size_u = u_edge_w.length
+        size_v = v_edge_w.length
+        if size_u < 1e-6 or size_v < 1e-6:
+            return None
+        u_axis_w = u_edge_w / size_u
+        v_axis_w = v_edge_w / size_v
+        # Cross product gives the face normal; consistent with Blender's poly
+        # winding for a single 4-vert face. No need for the inverse-transpose
+        # trick (that only matters for shading normals under non-uniform scale).
+        normal_w = u_axis_w.cross(v_axis_w).normalized()
+    else:
+        # Multi-poly fallback: approximate the mesh's emission with a rect
+        # placed at the area-weighted centroid, oriented along the
+        # area-weighted average normal, sized so its area matches the
+        # mesh's actual surface area / 2 (two-sided, so each face emits π·Le
+        # and total radiated power matches a thin emissive sheet of the
+        # same surface area). Accuracy degrades on highly anisotropic
+        # shapes (long tubes, ribbons), but it's a strict improvement over
+        # the BSDF-only path that emissive multi-poly geometry was on
+        # before — NEE on shaded surfaces nearby now finds the lamp.
+        rect_info = _approx_mesh_as_rect(mesh, m3, mw)
+        if rect_info is None:
+            return None
+        center_w, u_axis_w, v_axis_w, normal_w, size_u, size_v = rect_info
 
     # vibrt's area_rect transform: columns are (U, V, N) axes in world space
     # with translation at rect centre. scene_loader.rs reconstructs the rect
