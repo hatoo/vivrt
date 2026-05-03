@@ -1905,6 +1905,18 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
         tmp.cycles.samples = 256
         tmp.cycles.use_denoising = False
         tmp.cycles.use_adaptive_sampling = False
+        # No pixel reconstruction filter for the bake. The bake is treated
+        # as a direct radiance grid by the importance sampler — Cycles' default
+        # Blackman-Harris 1.5px filter would convolve each sample's value
+        # into multiple pixels, which is what you want for a viewing image
+        # but blurs sharp features (sun discs, HDRI hot spots) for a
+        # radiance lookup. BOX width=1.0 makes each sample contribute only
+        # to its own pixel. (Empirically didn't move lone_monk's |diff| —
+        # the bake at 256 spp was already converged on the sun pixels —
+        # but the change keeps the bake conceptually correct as a radiance
+        # source.)
+        tmp.cycles.pixel_filter_type = 'BOX'
+        tmp.cycles.filter_width = 1.0
     except Exception:
         pass
     tmp.render.resolution_x = int(w)
