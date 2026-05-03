@@ -1450,6 +1450,15 @@ _PASSTHROUGH_INPUTS: dict[str, tuple[str, ...] | None] = {
     # one and folds the rest as constants via `_node_color_transform`.
     "ShaderNodeCombineColor": ("Red", "Green", "Blue"),
     "ShaderNodeCombineRGB": ("R", "G", "B"),
+    # ShaderNodeVectorMath was tried as a generic passthrough during a
+    # cycles-compat session; the chains it would have opened up
+    # (Glass Plane Library / Glass Bottle / Glass Spot caustics colour)
+    # don't drive the dominant pixel value, so |diff| didn't move.
+    # Leaving Vector Math out of the dict keeps the existing "stop with
+    # warning" behaviour, which is honest about what's been dropped.
+    # If a future scene needs a specific op (NORMALIZE / DOT_PRODUCT /
+    # ...), add it here only after confirming the op is energy-safe to
+    # drop (i.e. the math result is just shape, not magnitude).
 }
 
 

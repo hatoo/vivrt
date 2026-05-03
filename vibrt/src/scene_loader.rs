@@ -331,7 +331,32 @@ pub fn load_scene_from_bytes<'a>(
                     center[2] - 0.5 * size[0] * u_axis[2] - 0.5 * size[1] * v_axis[2],
                 ];
                 let area = (size[0] * size[1]).max(1e-6);
-                let coeff = power / (area * std::f32::consts::PI);
+                // Without IES: legacy area-light radiance (W/m²/sr) =
+                //   power / (area × π).
+                // With IES (Cycles convention): the kernel multiplies by
+                // `ies_normalised(angle) ∈ [0, 1]`, so to get a peak
+                // delivered intensity matching `kernel/svm/ies.h:31`'s
+                // `strength × candela_absolute` we set
+                //   coeff = power × peak_absolute_candela / (area × π).
+                // Same eval_fac=1/(π × area) chain Cycles uses for
+                // AreaLight (`scene/light.cpp:237` invarea, `eval_fac =
+                // M_1_PI_F × invarea`); the only swap is replacing the
+                // implicit `strength=1` with `power × peak_absolute_candela`
+                // so the IES table's absolute candela values flow
+                // through the same way they do for Point/Spot.
+                // Net visual impact on current test scenes is nil
+                // (ies_light's Area lamp's IES profile is zero in the
+                // rendered direction; flat_archiviz's rect lights are
+                // mesh-emissive proxies without IES) but keeping the
+                // formula consistent across Point/Spot/AreaRect avoids
+                // a future scene needing a separate Cycles-parity fix.
+                let coeff = match ies {
+                    Some(p) if p.peak_absolute_candela > 1e-6 => {
+                        power * p.peak_absolute_candela
+                            / (area * std::f32::consts::PI)
+                    }
+                    _ => power / (area * std::f32::consts::PI),
+                };
                 let emission = [color[0] * coeff, color[1] * coeff, color[2] * coeff];
                 // Light's local frame for IES sampling: 3×3 rotation
                 // part of `t4`. The IES table is sampled with theta from
