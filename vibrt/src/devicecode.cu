@@ -2397,6 +2397,42 @@ static __device__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
     }
   }
 
+  // Constant-world NEE: cosine-weighted hemisphere sample around the
+  // primary closure's shading normal. world_type==0 bypasses the
+  // importance-sampled envmap branch above, so without a dedicated NEE
+  // path here the world's `world_color × world_strength` only reaches
+  // surfaces via BSDF-sampled rays that escape to a miss — observed as
+  // 10× under-delivery on a uniform grey world (lone_monk debug,
+  // 2026-05-04). Cosine sampling matches Lambertian pdfs so the
+  // power-heuristic MIS in `trace_path`'s envmap-miss block balances
+  // cleanly with the BSDF side; both strategies sum to a single
+  // unbiased estimator.
+  if (params.world_type == 0 && e.n > 0) {
+    float3 Le = make_f3(params.world_color) * params.world_strength;
+    if (luminance(Le) > 0.0f) {
+      const MaterialEval &e0 = e.slots[0];
+      float u1 = rng.next();
+      float u2 = rng.next();
+      float r = sqrtf(u1);
+      float phi = 2.0f * M_PIf * u2;
+      float3 local = make_float3(r * cosf(phi), r * sinf(phi),
+                                 sqrtf(fmaxf(0.0f, 1.0f - u1)));
+      float3 wi = normalize3(e0.T * local.x + e0.B * local.y + e0.Ns * local.z);
+      float NoL = dot3(e0.Ns, wi);
+      if (NoL > 0.0f) {
+        float pdf_cos = NoL * INV_PIf;
+        float3 vis = shadow_transmittance(P, wi, 1e20f, vstack);
+        if (luminance(vis) > 0.0f) {
+          BsdfEval b = eval_bsdf(e, wo, wi);
+          if (b.pdf > 0.0f) {
+            float w = power_heuristic(pdf_cos, b.pdf);
+            L = L + b.f * vis * Le * (w / pdf_cos);
+          }
+        }
+      }
+    }
+  }
+
   return L;
 }
 
@@ -2911,6 +2947,13 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
   float3 L = make_float3(0, 0, 0);
   bool last_specular = true;
   float prev_bsdf_pdf = 0.0f;
+  // Last BSDF-sampled vertex's shading normal. Used by the
+  // constant-world (`world_type==0`) branch in the envmap-miss block to
+  // MIS-weight against the cosine-weighted hemisphere NEE that
+  // `direct_light` adds for constant worlds. Initial value never read
+  // (gated by `bounce > 0`); kept defined to silence uninitialised-
+  // read complaints.
+  float3 prev_normal = make_float3(0.0f, 0.0f, 1.0f);
   // Cycles caps diffuse / glossy / transmission bounces independently of
   // the total path-length cap. Track per-lobe counters; once one runs out
   // the path terminates (diffuse-saturated scenes — lone_monk's brick
@@ -3115,9 +3158,21 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
       bool is_camera_ray = (bounce == 0) || last_specular;
       float3 bg = world_background(dir, is_camera_ray);
       float w = 1.0f;
-      if (bounce > 0 && !last_specular && params.world_type != 0) {
-        float p_env = envmap_pdf(dir);
-        w = power_heuristic(prev_bsdf_pdf, p_env);
+      if (bounce > 0 && !last_specular) {
+        if (params.world_type != 0) {
+          float p_env = envmap_pdf(dir);
+          w = power_heuristic(prev_bsdf_pdf, p_env);
+        } else {
+          // Constant world: NEE samples cosine-weighted hemisphere with
+          // pdf = max(0, NoL) / π. MIS against the BSDF sample's pdf
+          // so the two strategies (NEE in `direct_light` and BSDF-miss
+          // here) sum to a single unbiased estimator. Without this
+          // weight the constant-world NEE addition double-counts the
+          // sky on every diffuse miss path.
+          float NoL = dot3(prev_normal, dir);
+          float pdf_cos = (NoL > 0.0f) ? NoL * INV_PIf : 0.0f;
+          w = power_heuristic(prev_bsdf_pdf, pdf_cos);
+        }
       }
       float3 bg_contrib = throughput * bg * w;
       if (bounce > 0)
@@ -3295,6 +3350,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
     throughput = throughput * contrib;
     last_specular = bs.specular;
     prev_bsdf_pdf = bs.pdf;
+    prev_normal = e_slots[0].Ns;
 
     // Cycles-style per-lobe bounce caps. Cycles' `diffuse_bounces=N`
     // means up to N diffuse reflections may appear in the path, which
