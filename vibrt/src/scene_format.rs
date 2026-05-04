@@ -24,6 +24,15 @@ pub struct SceneFile {
     pub objects: Vec<ObjectDesc>,
     #[serde(default)]
     pub lights: Vec<LightDesc>,
+    /// Emissive meshes registered for true mesh-light NEE. The exporter
+    /// adds an entry per object whose mesh has at least one material with
+    /// nonzero emission; the loader walks the object's triangles, computes
+    /// world-space corners + per-triangle emission, and builds a CDF for
+    /// the device-side NEE sampler. The mesh stays in `objects[]` /
+    /// `meshes[]` like any other geometry — emission still fires through
+    /// BSDF eval on camera/specular hits, NEE adds it on diffuse paths.
+    #[serde(default)]
+    pub mesh_lights: Vec<MeshLightDesc>,
     pub world: Option<WorldDesc>,
     /// Optional homogeneous volume that fills the entire scene (atmospheric
     /// haze / fog). Cycles' "World Output → Volume" socket lands here.
@@ -358,6 +367,42 @@ pub struct PrincipledMaterial {
     /// Set by the exporter alongside `volume`.
     #[serde(default)]
     pub volume_only: bool,
+    /// Right child of a binary Mix node. When `Some`, the surface is a
+    /// MixShader: `eval = (1-fac) × left + fac × secondary`. The "left"
+    /// side is `left_subtree` when present, otherwise this node's own
+    /// lobe params (used as a leaf). When `secondary == None` this node
+    /// is a pure leaf and own params are used directly. Combined with
+    /// `left_subtree`, the schema represents arbitrary binary trees:
+    /// `Mix(Mix(A,B), C)` and `Mix(Mix(A,B), Mix(C,D))` survive without
+    /// linear-chain collapse. The kernel walks the tree iteratively into
+    /// a flat list of (closure, weight) pairs at hit time —
+    /// `devicecode.cu::eval_material` caps at 4 leaves, `render.rs`'s
+    /// upload caps the recursion at 8 to leave room for both children
+    /// of internal nodes.
+    #[serde(default)]
+    pub secondary: Option<Box<PrincipledMaterial>>,
+    /// Left child of a binary Mix node. When `Some`, this node is a
+    /// balanced internal Mix (own lobe params are unused) and the left
+    /// side is `left_subtree`. When `None` and `secondary` is `Some`,
+    /// the left side is "this node as a leaf" (own params). When both
+    /// are `None`, this node is a pure leaf. Lets the exporter encode
+    /// `Mix(Mix(A,B), C)` and `Mix(Mix(A,B), Mix(C,D))` without
+    /// collapsing the inner Mixes — the linear right-leaning chain
+    /// representation alone cannot express trees whose weights don't
+    /// factor as a product of right-side fractions.
+    #[serde(default)]
+    pub left_subtree: Option<Box<PrincipledMaterial>>,
+    /// Constant Mix factor in [0, 1]. Multiplied by `mix_fac_tex` (when
+    /// present) at the hit UV to give the per-pixel weight of the right
+    /// side (`secondary`). 0 = pure left, 1 = pure right. Ignored when
+    /// both `secondary` and `left_subtree` are `None` (leaf).
+    #[serde(default)]
+    pub mix_fac: f32,
+    /// Optional single-channel mask texture (R channel sampled) for the
+    /// per-pixel mix factor. Multiplied with `mix_fac` to produce the
+    /// right side's weight at each hit point.
+    #[serde(default)]
+    pub mix_fac_tex: Option<u32>,
 }
 
 /// Sequential list of colour-producing nodes. Each node reads either from
@@ -563,9 +608,31 @@ pub struct ObjectDesc {
     /// camera-visible but transparent to NEE.
     #[serde(default = "default_true")]
     pub cast_shadow: bool,
+    /// Cycles' object "Ray Visibility → Camera". When false, camera rays
+    /// and specular bounces (mirror / glass continuation chains) skip the
+    /// instance. The mesh stays in the BLAS so diffuse-bounce radiance
+    /// rays + NEE shadow rays still see it — required for emissive
+    /// surfaces an artist authored as camera-hidden but still wanted in
+    /// the lighting solution (BMW27's `Light`, classroom's blackboard
+    /// emission panels). Without this, the exporter had to promote
+    /// camera-hidden emissive meshes to a `camera_visible=0` rect light
+    /// approximation, losing actual mesh geometry detail.
+    #[serde(default = "default_true")]
+    pub camera_visible: bool,
 }
 
 fn default_true() -> bool { true }
+
+/// One entry per emissive mesh registered for NEE. The loader looks up
+/// `objects[object_idx]` to find the mesh + materials + transform; any
+/// triangle whose material has nonzero emission contributes to the
+/// per-light triangle table. Multiple instances of the same mesh produce
+/// independent `MeshLightDesc` entries (different transforms → different
+/// world-space triangles).
+#[derive(Deserialize, Clone, Copy)]
+pub struct MeshLightDesc {
+    pub object_idx: u32,
+}
 
 /// IES (Illuminating Engineering Society) photometric profile.
 ///

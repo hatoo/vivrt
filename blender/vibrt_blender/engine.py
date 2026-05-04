@@ -51,6 +51,12 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         try:
             exporter.clear_sky_bake_cache()
             exporter.prebake_sky_envmaps_for_world(scene.world)
+            # Daylight portals carry an artist-tagged Sky Texture chain
+            # in their MixShader's Emission branch. Cycles uses this for
+            # importance-sampled sky lighting; we bake it as a fallback
+            # world envmap when the actual World output is constant
+            # black (classroom is the canonical case).
+            exporter.prebake_portal_emissions_for_scene(scene)
         except Exception as ex:
             # Don't take down the whole render if the bake fails — emit a
             # visible warning and let _export_world fall back to constant.

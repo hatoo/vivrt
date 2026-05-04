@@ -43,6 +43,65 @@ pub struct LoadedObject {
     pub transform: [f32; 12],
 }
 
+/// OptiX instance visibility mask bit layout. Camera/specular radiance
+/// rays use `PRIMARY`, diffuse-bounce radiance rays use `SECONDARY`,
+/// shadow rays use `SHADOW`. An instance's mask `(PRIMARY ? 1 : 0) |
+/// (SECONDARY ? 4 : 0) | (SHADOW ? 2 : 0)` selects which ray classes
+/// can hit it, matching Cycles' Ray Visibility → Camera / Diffuse /
+/// Shadow toggles.
+pub const VIS_MASK_PRIMARY: u32 = 0x01;
+pub const VIS_MASK_SHADOW: u32 = 0x02;
+pub const VIS_MASK_SECONDARY: u32 = 0x04;
+
+/// Host-side per-triangle data for a mesh-light. render.rs converts each
+/// of these into the GPU-side `MeshLightTri` POD by patching in the
+/// texture pointer/dimensions for the emissive material's texture (if
+/// any). Splitting into host vs GPU structs keeps the texture index
+/// resolution out of scene_loader, which doesn't have visibility into
+/// the device-upload pipeline.
+pub struct LoadedMeshLightTri {
+    pub v0: [f32; 3],
+    pub v1: [f32; 3],
+    pub v2: [f32; 3],
+    pub area: f32,
+    pub uv0: [f32; 2],
+    pub uv1: [f32; 2],
+    pub uv2: [f32; 2],
+    /// Constant emission radiance multiplier from the material's
+    /// `emission` field (color × strength). Multiplied into the
+    /// per-sample texture lookup at NEE time when `emission_tex_idx`
+    /// is `Some`; used directly otherwise.
+    pub emission: [f32; 3],
+    /// Index into `SceneFile::textures` for the material's emission
+    /// texture, or `None` for constant-emissive materials. The kernel
+    /// samples at the NEE-sample's barycentric → UV when set.
+    pub emission_tex_idx: Option<u32>,
+}
+
+/// World-space triangle table + per-triangle CDF for one emissive mesh,
+/// ready for the GPU upload pass in render.rs. `triangles` is the host
+/// representation; render.rs converts each entry into a GPU
+/// `MeshLightTri` (resolving the `emission_tex_idx` to a CUDA pointer).
+/// `cdf` is normalised to [0, 1) with a leading 0 sentinel (n+1
+/// entries). `power` is the un-normalised integral (sum of area ×
+/// luminance(emission)) used to weight this mesh-light against others
+/// in the outer CDF.
+pub struct LoadedMeshLight {
+    pub triangles: Vec<LoadedMeshLightTri>,
+    pub cdf: Vec<f32>,
+    pub power: f32,
+    pub two_sided: bool,
+    /// Index into `LoadedScene::objects` of the geometry instance this
+    /// mesh-light corresponds to. Used in render.rs to populate each
+    /// instance's `HitGroupData::area_light_group`, which the closest-hit
+    /// shader reads to decide whether a BSDF-sampled hit on this surface
+    /// should be MIS-weighted against the NEE sampler (the `power_heuristic`
+    /// branch in `trace_path`'s emission gate). Without this, BSDF rays
+    /// landing on a mesh-light surface would be either lost (legacy
+    /// diffuse-bounce gate) or double-counted (no gate).
+    pub object_idx: u32,
+}
+
 pub struct LoadedScene<'bin> {
     pub file: SceneFile,
     pub meshes: Vec<LoadedMesh<'bin>>,
@@ -62,6 +121,11 @@ pub struct LoadedScene<'bin> {
     pub point_ies: Vec<Option<IesProfile>>,
     pub spot_ies: Vec<Option<IesProfile>>,
     pub rect_ies: Vec<Option<IesProfile>>,
+    /// Mesh lights — one entry per emissive mesh registered by the
+    /// exporter. Empty when `SceneFile::mesh_lights` is empty (the
+    /// scene has no emissive meshes, or the exporter hasn't been
+    /// updated yet).
+    pub mesh_lights: Vec<LoadedMeshLight>,
     /// Envmap texture fully materialised (linear RGB only, width*height*3 floats).
     /// For `Mixed` worlds this is the host-rasterised mix grid used for
     /// the importance-sampling CDF; the two source layers live in
@@ -146,7 +210,7 @@ pub fn load_scene_from_bytes<'a>(
         }
     }
 
-    let objects = file
+    let objects: Vec<LoadedObject> = file
         .objects
         .iter()
         .map(|o| LoadedObject {
@@ -459,6 +523,8 @@ pub fn load_scene_from_bytes<'a>(
         _ => (None, None, None),
     };
 
+    let mesh_lights = build_mesh_lights(&file, &objects, &meshes)?;
+
     Ok(LoadedScene {
         file,
         meshes,
@@ -471,10 +537,175 @@ pub fn load_scene_from_bytes<'a>(
         point_ies,
         spot_ies,
         rect_ies,
+        mesh_lights,
         envmap_rgb,
         envmap_layer_a_rgb,
         envmap_layer_b_rgb,
     })
+}
+
+/// Walk every `mesh_lights[]` entry, look up the referenced object's
+/// mesh + materials + transform, and build a per-triangle world-space
+/// table for the device-side NEE sampler. Triangles whose material has
+/// zero emission (or whose area is degenerate) are skipped; if no
+/// emissive triangles remain the entry is dropped.
+fn build_mesh_lights(
+    file: &SceneFile,
+    objects: &[LoadedObject],
+    meshes: &[LoadedMesh<'_>],
+) -> Result<Vec<LoadedMeshLight>> {
+    let mut out = Vec::new();
+    for desc in &file.mesh_lights {
+        let oi = desc.object_idx as usize;
+        let obj = objects
+            .get(oi)
+            .ok_or_else(|| anyhow!("mesh_lights: object_idx {} out of range", oi))?;
+        let mi = obj.mesh as usize;
+        let mesh = meshes
+            .get(mi)
+            .ok_or_else(|| anyhow!("mesh_lights: mesh {} out of range", mi))?;
+        let obj_desc = &file.objects[oi];
+
+        // Resolve per-triangle material: when the mesh carries
+        // `material_indices` it indexes into ObjectDesc::materials; otherwise
+        // every triangle uses obj_desc.material.
+        let materials_table: &[u32] = if !obj_desc.materials.is_empty() {
+            &obj_desc.materials
+        } else {
+            std::slice::from_ref(&obj_desc.material)
+        };
+
+        let num_tris = mesh.indices.len() / 3;
+        let mut tris: Vec<LoadedMeshLightTri> = Vec::new();
+        for tri in 0..num_tris {
+            let slot = if !mesh.material_indices.is_empty() {
+                mesh.material_indices[tri] as usize
+            } else {
+                0
+            };
+            let mat_idx = match materials_table.get(slot).copied() {
+                Some(v) => v as usize,
+                None => continue,
+            };
+            let mat = match file.materials.get(mat_idx) {
+                Some(m) => m,
+                None => continue,
+            };
+            let em = mat.emission;
+            // For non-textured emission, require positive luminance — a
+            // material with `emission=(0,0,0)` and no texture has nothing
+            // to deliver. For textured emission, the constant `emission`
+            // is the multiplier (Principled BSDF emission strength); the
+            // texture itself carries the colour, so a (1,1,1) constant
+            // is the typical case. Don't gate on luminance there — the
+            // texture might be locally bright even if `emission` is
+            // moderate.
+            let lum_const = 0.2126 * em[0] + 0.7152 * em[1] + 0.0722 * em[2];
+            if mat.emission_tex.is_none() && lum_const <= 1e-8 {
+                continue;
+            }
+            if mat.emission_tex.is_some() && lum_const <= 1e-8 {
+                continue;
+            }
+            let i0 = mesh.indices[tri * 3] as usize;
+            let i1 = mesh.indices[tri * 3 + 1] as usize;
+            let i2 = mesh.indices[tri * 3 + 2] as usize;
+            let v0_l = [
+                mesh.vertices[i0 * 3],
+                mesh.vertices[i0 * 3 + 1],
+                mesh.vertices[i0 * 3 + 2],
+            ];
+            let v1_l = [
+                mesh.vertices[i1 * 3],
+                mesh.vertices[i1 * 3 + 1],
+                mesh.vertices[i1 * 3 + 2],
+            ];
+            let v2_l = [
+                mesh.vertices[i2 * 3],
+                mesh.vertices[i2 * 3 + 1],
+                mesh.vertices[i2 * 3 + 2],
+            ];
+            let v0 = transform::transform_point(&obj.transform, v0_l);
+            let v1 = transform::transform_point(&obj.transform, v1_l);
+            let v2 = transform::transform_point(&obj.transform, v2_l);
+            let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+            let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+            let cx = e1[1] * e2[2] - e1[2] * e2[1];
+            let cy = e1[2] * e2[0] - e1[0] * e2[2];
+            let cz = e1[0] * e2[1] - e1[1] * e2[0];
+            let area = 0.5 * (cx * cx + cy * cy + cz * cz).sqrt();
+            if !area.is_finite() || area < 1e-12 {
+                continue;
+            }
+            // Per-vertex UVs for textured-emission triangles. When the
+            // mesh has no UV layer the kernel won't sample the texture
+            // (texture pointer falls back to null too on the GPU side),
+            // so passing zeros here is safe — the constant `emission`
+            // path takes over.
+            let uv = |vidx: usize| -> [f32; 2] {
+                if mesh.uvs.len() >= (vidx + 1) * 2 {
+                    [mesh.uvs[vidx * 2], mesh.uvs[vidx * 2 + 1]]
+                } else {
+                    [0.0, 0.0]
+                }
+            };
+            // Apply the material's `uv_transform` (Cycles' Mapping node
+            // baked into a 2x3 affine — see scene_format::PrincipledMaterial
+            // and `principled.rs`). `_apply_uv_transform` mirrors the
+            // device-side eval in `eval_material`.
+            let m = mat.uv_transform;
+            let xform = |u: [f32; 2]| -> [f32; 2] {
+                [
+                    m[0] * u[0] + m[1] * u[1] + m[2],
+                    m[3] * u[0] + m[4] * u[1] + m[5],
+                ]
+            };
+            tris.push(LoadedMeshLightTri {
+                v0,
+                v1,
+                v2,
+                area,
+                uv0: xform(uv(i0)),
+                uv1: xform(uv(i1)),
+                uv2: xform(uv(i2)),
+                emission: em,
+                emission_tex_idx: mat.emission_tex,
+            });
+        }
+        if tris.is_empty() {
+            eprintln!(
+                "[vibrt] warn: mesh_light object_idx={} has no emissive triangles — skipping",
+                oi
+            );
+            continue;
+        }
+        // Per-triangle CDF weighted by area × luminance(emission). Same
+        // pattern as `build_rect_light_cdf` in render.rs but lives here so
+        // the loader is the sole place that knows how to convert the
+        // exporter's MeshLightDesc into device-ready data.
+        let n = tris.len();
+        let mut cdf = vec![0.0f32; n + 1];
+        for (i, t) in tris.iter().enumerate() {
+            let lum = 0.2126 * t.emission[0] + 0.7152 * t.emission[1] + 0.0722 * t.emission[2];
+            cdf[i + 1] = cdf[i] + t.area * lum.max(0.0);
+        }
+        let total = cdf[n];
+        if total <= 0.0 {
+            continue;
+        }
+        let inv = 1.0 / total;
+        for v in cdf.iter_mut().skip(1) {
+            *v *= inv;
+        }
+        out.push(LoadedMeshLight {
+            triangles: tris,
+            cdf,
+            power: total,
+            two_sided: true,
+            object_idx: desc.object_idx,
+        });
+    }
+    Ok(out)
 }
 
 #[derive(Copy, Clone)]

@@ -118,6 +118,24 @@ struct PrincipledGpu {
   // `alpha_threshold` (texture-driven binary alpha cutout used for
   // leaves / grass).
   float alpha_blend;
+  // Right child of a binary Mix node. Null = leaf (no Mix), unless
+  // `left_subtree` is also non-null (balanced internal node). When
+  // non-null, the eval is `(1-fac)*left + fac*secondary` with `fac =
+  // mix_fac × mix_fac_tex(uv)` clamped to [0,1]. The kernel walks the
+  // tree into a flat list of (closure, weight) leaves at hit time and
+  // evaluates them as a weighted sum. Mirrors `gpu_types::PrincipledGpu`.
+  PrincipledGpu *secondary;
+  // Left child of a binary Mix node. Null + secondary!=null means the
+  // left side is "this node's own lobe params as a leaf" (the right-
+  // leaning compact case). Non-null encodes `Mix(Mix(A,B), C)` and
+  // balanced trees `Mix(Mix(A,B), Mix(C,D))`; internal nodes with
+  // both children non-null ignore their own lobe params.
+  PrincipledGpu *left_subtree;
+  float mix_fac;
+  float *mix_fac_tex;
+  int mix_fac_tex_w;
+  int mix_fac_tex_h;
+  int mix_fac_tex_channels;
 };
 
 struct HitGroupData {
@@ -198,6 +216,44 @@ struct AreaRectLight {
   float light_rotation[9];
 };
 
+// Per-triangle data for emissive-mesh NEE. Layout mirrors
+// `gpu_types::MeshLightTri`. World-space vertices (instance transform
+// pre-applied at scene-load); `emission` is the material's constant
+// emission radiance multiplier. When `emission_tex != nullptr` the
+// kernel samples it at the NEE-sample's barycentric → UV (interpolated
+// from `uv0/1/2`) and multiplies the texel into `emission` for the
+// per-sample radiance — preserving spatial detail of textured emissive
+// surfaces (CRT screens, LED panels with patterns, etc.) without
+// collapsing them to a uniform glow.
+struct MeshLightTri {
+  float v0[3];
+  float _pad0;
+  float v1[3];
+  float _pad1;
+  float v2[3];
+  float area;
+  float emission[3];
+  float _pad2;
+  float uv0[2];
+  float uv1[2];
+  float uv2[2];
+  float _pad3[2];
+  float *emission_tex;
+  int emission_tex_w;
+  int emission_tex_h;
+  int emission_tex_channels;
+  int _pad4[3];
+};
+
+struct MeshLight {
+  MeshLightTri *triangles;
+  float *cdf; // num_triangles + 1
+  unsigned int num_triangles;
+  unsigned int two_sided;
+  float power;
+  unsigned int _pad;
+};
+
 struct LaunchParams {
   float *image; // float4 per pixel
   unsigned int width;
@@ -241,6 +297,20 @@ struct LaunchParams {
   int num_rect_lights;
   AreaRectLight *rect_lights;
   float *rect_light_cdf;
+
+  // Mesh-light NEE: a MeshLight per emissive mesh group, each with its
+  // own per-triangle CDF. `mesh_light_cdf` is the outer CDF (num+1
+  // entries) over per-light total power. Mirrors `LaunchParams` on the
+  // host side.
+  int num_mesh_lights;
+  MeshLight *mesh_lights;
+  float *mesh_light_cdf;
+  // Sum of per-mesh-light powers (area × luminance(emission) summed over
+  // every registered emissive triangle). Used by trace_path's MIS gate
+  // to compute the NEE-side pdf at a BSDF-sampler hit without needing
+  // per-triangle indexing — `pmf_outer × pmf_tri = area_t × lum_t /
+  // total_power` regardless of which mesh-light owns the triangle.
+  float mesh_light_total_power;
 
   int world_type; // 0=constant, 1=single envmap, 2=mixed (two layers)
   float world_color[3];

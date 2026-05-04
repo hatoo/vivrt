@@ -375,11 +375,24 @@ pub fn make_volume_gpu(v: &VolumeParams) -> VolumeGpu {
 }
 
 /// Build a GPU material struct from a host Principled material.
+///
+/// `secondary_ptr` and `left_subtree_ptr` are device pointers to the
+/// right and left child PrincipledGpu of a binary Mix node (or 0 each
+/// for the common single-closure leaf case). When `left_subtree_ptr ==
+/// 0` and `secondary_ptr != 0`, the left side defaults to "this node's
+/// own lobe params as a leaf" — the right-leaning compact case. When
+/// both are non-null this is an internal Mix node and own params are
+/// unused. `mix_fac_tex_slot` matches the regular texture-slot tuple
+/// — `(ptr, w, h, channels)` — so the caller can pre-resolve the
+/// optional mask texture without paying the scene_format / textures
+/// slice plumbing inside this helper.
 pub fn make_material_data(
     mat: &PrincipledMaterial,
     textures: &[(optix_sys::CUdeviceptr, i32, i32)],
     graph: ColorGraphGpu,
     volume_ptr: optix_sys::CUdeviceptr,
+    secondary_ptr: optix_sys::CUdeviceptr,
+    left_subtree_ptr: optix_sys::CUdeviceptr,
 ) -> PrincipledGpu {
     let lookup = |id: Option<u32>| -> (optix_sys::CUdeviceptr, i32, i32, i32) {
         match id {
@@ -405,6 +418,7 @@ pub fn make_material_data(
     let (t_ptr, t_w, t_h, t_c) = lookup(mat.transmission_tex);
     let (e_ptr, e_w, e_h, e_c) = lookup(mat.emission_tex);
     let (b_ptr, b_w, b_h, b_c) = lookup(mat.bump_tex);
+    let (mf_ptr, mf_w, mf_h, mf_c) = lookup(mat.mix_fac_tex);
 
     PrincipledGpu {
         base_color: mat.base_color,
@@ -470,5 +484,12 @@ pub fn make_material_data(
         pure_glossy: if mat.pure_glossy { 1 } else { 0 },
         pure_diffuse: if mat.pure_diffuse { 1 } else { 0 },
         alpha_blend: mat.alpha_blend.clamp(0.0, 1.0),
+        secondary: secondary_ptr,
+        left_subtree: left_subtree_ptr,
+        mix_fac: mat.mix_fac.clamp(0.0, 1.0),
+        mix_fac_tex: mf_ptr,
+        mix_fac_tex_w: mf_w,
+        mix_fac_tex_h: mf_h,
+        mix_fac_tex_channels: mf_c,
     }
 }

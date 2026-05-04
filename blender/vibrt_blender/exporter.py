@@ -73,68 +73,6 @@ def _approx_mesh_as_rect(mesh, m3, mw):
     return centroid, u_axis_w, v_axis_w, normal_w, side, side
 
 
-def _try_mixed_emissive_proxy(obj, obj_eval, mat_params):
-    """For meshes whose material has both emission AND a non-emissive lobe
-    (Principled BSDF with `emission_strength != 0` plus a non-zero
-    base_color, or a MixShader of an emissive Principled and a Translucent
-    fabric), return a `camera_visible=False` rect light dict that
-    approximates the mesh's emission for NEE. The caller should keep the
-    mesh in the geometry export so primary visibility, BSDF reflections,
-    and the diffuse half of the surface are unchanged.
-
-    The kernel's "add emission only on bounce==0 or last_specular" gate
-    keeps double-counting under control: at diffuse bounces the BSDF-
-    sampled emission is suppressed, so the rect proxy is the only
-    emission contributor — exactly what we want. At specular bounces
-    (mirror reflection of the lamp) the mesh's emission is what gets
-    added, and the proxy doesn't fire because NEE skips delta lobes.
-
-    Returns None when emission is effectively zero or the mesh is
-    geometrically degenerate. Pure-emissive meshes are still routed
-    through `_try_emissive_quad_as_rect_light` first (full replacement)
-    — this function is the second-chance path for everything else.
-    """
-    if mat_params is None:
-        return None
-    emission = mat_params.get("emission", [0, 0, 0])
-    if not any(e > 1e-6 for e in emission):
-        return None
-    # Skip materials whose emission comes from a per-pixel texture — a
-    # uniform rect proxy would average over the texture's spatial detail
-    # and inject a uniform glow where the texture has cold areas.
-    if "emission_tex" in mat_params:
-        return None
-
-    mesh = obj_eval.data
-    if len(mesh.polygons) == 0:
-        return None
-    mw = obj_eval.matrix_world
-    m3 = mw.to_3x3()
-    rect_info = _approx_mesh_as_rect(mesh, m3, mw)
-    if rect_info is None:
-        return None
-    center_w, u_axis_w, v_axis_w, normal_w, size_u, size_v = rect_info
-
-    transform = [
-        u_axis_w.x, v_axis_w.x, normal_w.x, center_w.x,
-        u_axis_w.y, v_axis_w.y, normal_w.y, center_w.y,
-        u_axis_w.z, v_axis_w.z, normal_w.z, center_w.z,
-        0.0, 0.0, 0.0, 1.0,
-    ]
-    area = size_u * size_v
-    return {
-        "type": "area_rect",
-        "transform": transform,
-        "size": [size_u, size_v],
-        "color": list(emission),
-        "power": area * math.pi,
-        # Critical: NEE-only proxy. Camera and specular rays still see
-        # the original mesh, so emission isn't double-counted.
-        "camera_visible": 0,
-        "two_sided": 1,
-    }
-
-
 def _try_emissive_quad_as_rect_light(obj, obj_eval, mat_params):
     """If obj_eval is a pure-emissive mesh, return an AreaRect light JSON
     dict that vibrt's NEE can sample. Otherwise None.
@@ -623,6 +561,34 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
     }
 
 
+def _read_ies_fallback(basename: str) -> str | None:
+    """Search upward from the .blend file's directory for a sibling
+    `IES_profiles/<basename>` and return its contents, or None when no
+    candidate is found. Used to recover from .blend files whose stored
+    relative path no longer resolves (the asset was moved after the
+    .blend was authored).
+    """
+    import os
+    blend_path = bpy.data.filepath
+    if not blend_path:
+        return None
+    d = os.path.dirname(blend_path)
+    while d:
+        for sub in ("IES_profiles", "ies_profiles"):
+            cand = os.path.join(d, sub, basename)
+            if os.path.isfile(cand):
+                try:
+                    with open(cand, "r", encoding="latin-1") as f:
+                        return f.read()
+                except OSError:
+                    pass
+        new_d = os.path.dirname(d)
+        if new_d == d:
+            break
+        d = new_d
+    return None
+
+
 def _resolve_ies_table(ies_node) -> dict | None:
     """Parse a `ShaderNodeTexIES` into the JSON `ies` block expected by
     `LightDesc.{Point,Spot,AreaRect}.ies` (`scene_format::IesProfile`).
@@ -648,11 +614,26 @@ def _resolve_ies_table(ies_node) -> dict | None:
             with open(path, "r", encoding="latin-1") as f:
                 text = f.read()
         except OSError as ex:
+            # Fallback: walk up from the .blend's directory looking for
+            # an `IES_profiles/<basename>` sibling. flat_archiviz stores
+            # `..\..\..\IES_profiles\three-lobe-vee.ies` which goes one
+            # `..` too far (the file actually lives at
+            # `test_scenes/IES_profiles/`); without this fallback the
+            # IES profile silently disappears from the scene.
+            import os
+            basename = os.path.basename(path)
+            text = _read_ies_fallback(basename)
+            if text is None:
+                _emit(
+                    f"[vibrt] warn: IES node {label!r}: cannot open external file "
+                    f"{path!r}: {ex} — light will not get an IES profile"
+                )
+                return None
             _emit(
-                f"[vibrt] warn: IES node {label!r}: cannot open external file "
-                f"{path!r}: {ex} — light will not get an IES profile"
+                f"[vibrt] info: IES node {label!r}: original filepath "
+                f"{path!r} not found, using fallback (basename match in "
+                f"sibling IES_profiles/ directory)"
             )
-            return None
     else:
         _emit(
             f"[vibrt] warn: IES node {label!r}: mode={ies_node.mode!r} but "
@@ -1726,6 +1707,344 @@ def _prebake_world_full(world, w: int, h: int) -> None:
     )
 
 
+def _portal_emission_cache_key(scene_name: str, mat_name: str, em_name: str) -> str:
+    """Stable key for a per-material portal-emission bake."""
+    return f"__portal_emit__{scene_name}__{mat_name}__{em_name}__1024x512"
+
+
+def _copy_curve_mapping(src_cm, dst_cm) -> None:
+    """Mirror a `bpy.types.CurveMapping` into a freshly-created one.
+    Copies black/white levels, clip box, tone, and every CurveMap's
+    points (location + handle_type). The destination's curves must
+    already exist (they do — every `RGBCurves` node ships with the
+    standard 4 curves)."""
+    for attr in ("black_level", "white_level",
+                 "clip_min_x", "clip_min_y", "clip_max_x", "clip_max_y",
+                 "use_clip", "tone"):
+        try:
+            setattr(dst_cm, attr, getattr(src_cm, attr))
+        except (TypeError, AttributeError):
+            pass
+    for src_curve, dst_curve in zip(src_cm.curves, dst_cm.curves):
+        # Trim destination to two points (the API minimum), then add
+        # extra points to match source.
+        while len(dst_curve.points) > 2:
+            dst_curve.points.remove(dst_curve.points[-1])
+        for i, sp in enumerate(src_curve.points):
+            if i < len(dst_curve.points):
+                dst_curve.points[i].location = sp.location
+                dst_curve.points[i].handle_type = sp.handle_type
+            else:
+                np_ = dst_curve.points.new(sp.location.x, sp.location.y)
+                np_.handle_type = sp.handle_type
+    dst_cm.update()
+
+
+def _clone_shader_node(src_node, dst_tree):
+    """Create a fresh node in `dst_tree` mirroring `src_node`'s class plus
+    the type-specific data (CurveMapping, ColorRamp elements, Sky
+    Texture controls). Doesn't wire inputs — caller does that. Returns
+    the new node, or None if the class can't be created in dst_tree
+    (rare — both world and material trees are ShaderNodeTrees).
+    """
+    try:
+        new_node = dst_tree.nodes.new(src_node.bl_idname)
+    except RuntimeError:
+        return None
+    bl = src_node.bl_idname
+    if bl == "ShaderNodeTexSky":
+        for attr in ("sky_type", "sun_disc", "sun_size", "sun_intensity",
+                     "sun_elevation", "sun_rotation", "altitude",
+                     "air_density", "aerosol_density", "ozone_density",
+                     "ground_albedo", "turbidity"):
+            if hasattr(src_node, attr) and hasattr(new_node, attr):
+                try:
+                    setattr(new_node, attr, getattr(src_node, attr))
+                except (TypeError, AttributeError):
+                    pass
+    elif bl == "ShaderNodeRGBCurve":
+        _copy_curve_mapping(src_node.mapping, new_node.mapping)
+    elif bl == "ShaderNodeValToRGB":
+        src_ramp = src_node.color_ramp
+        dst_ramp = new_node.color_ramp
+        while len(dst_ramp.elements) > 1:
+            dst_ramp.elements.remove(dst_ramp.elements[-1])
+        for i, elt in enumerate(src_ramp.elements):
+            if i < len(dst_ramp.elements):
+                dst_ramp.elements[i].position = elt.position
+                dst_ramp.elements[i].color = elt.color
+            else:
+                ne = dst_ramp.elements.new(elt.position)
+                ne.color = elt.color
+        try:
+            dst_ramp.color_mode = src_ramp.color_mode
+            dst_ramp.interpolation = src_ramp.interpolation
+        except (TypeError, AttributeError):
+            pass
+    elif bl == "ShaderNodeMapping":
+        for attr in ("vector_type",):
+            if hasattr(src_node, attr) and hasattr(new_node, attr):
+                try:
+                    setattr(new_node, attr, getattr(src_node, attr))
+                except (TypeError, AttributeError):
+                    pass
+    elif bl == "ShaderNodeMath":
+        for attr in ("operation", "use_clamp"):
+            if hasattr(src_node, attr) and hasattr(new_node, attr):
+                try:
+                    setattr(new_node, attr, getattr(src_node, attr))
+                except (TypeError, AttributeError):
+                    pass
+    elif bl == "ShaderNodeMix":
+        for attr in ("data_type", "blend_type", "clamp_factor",
+                     "clamp_result", "factor_mode"):
+            if hasattr(src_node, attr) and hasattr(new_node, attr):
+                try:
+                    setattr(new_node, attr, getattr(src_node, attr))
+                except (TypeError, AttributeError):
+                    pass
+    elif bl == "ShaderNodeMixRGB":
+        for attr in ("blend_type", "use_clamp"):
+            if hasattr(src_node, attr) and hasattr(new_node, attr):
+                try:
+                    setattr(new_node, attr, getattr(src_node, attr))
+                except (TypeError, AttributeError):
+                    pass
+    # Copy unlinked input default values (do this AFTER the type-specific
+    # property copy so e.g. Math.operation is set before its Value
+    # defaults are touched).
+    for src_inp, dst_inp in zip(src_node.inputs, new_node.inputs):
+        if not src_inp.is_linked:
+            try:
+                dst_inp.default_value = src_inp.default_value
+            except (TypeError, AttributeError):
+                pass
+    return new_node
+
+
+def _clone_node_chain(src_node, dst_tree, depth: int = 0):
+    """Recursively clone `src_node` and the input-link chain reachable
+    from it into `dst_tree`. Returns the cloned root, or None on cap.
+    Cap = 12 levels (deeper than any reasonable artist material).
+    """
+    if depth > 12:
+        return None
+    new_root = _clone_shader_node(src_node, dst_tree)
+    if new_root is None:
+        return None
+    for src_inp, new_inp in zip(src_node.inputs, new_root.inputs):
+        if not src_inp.is_linked:
+            continue
+        link = src_inp.links[0]
+        cloned_src = _clone_node_chain(link.from_node, dst_tree, depth + 1)
+        if cloned_src is None:
+            continue
+        out_sock = next(
+            (o for o in cloned_src.outputs if o.name == link.from_socket.name),
+            None,
+        )
+        if out_sock is not None:
+            dst_tree.links.new(out_sock, new_inp)
+    return new_root
+
+
+def _is_daylight_portal_mix(mix_node) -> tuple | None:
+    """Match `MixShader(Transparent, Emission(TexSky chain), fac=Geometry.Backfacing)`
+    on the given Mix node and return `(emission_node,)` on hit, else None.
+    Both n1=Transparent / n2=Emission and the swap orientation are accepted.
+    """
+    if mix_node.bl_idname != "ShaderNodeMixShader":
+        return None
+    in1 = mix_node.inputs[1]
+    in2 = mix_node.inputs[2]
+    fac = mix_node.inputs[0]
+    if not (in1.is_linked and in2.is_linked):
+        return None
+    n1 = in1.links[0].from_node
+    n2 = in2.links[0].from_node
+    if n1.bl_idname == "ShaderNodeBsdfTransparent" and n2.bl_idname == "ShaderNodeEmission":
+        em_node = n2
+    elif n2.bl_idname == "ShaderNodeBsdfTransparent" and n1.bl_idname == "ShaderNodeEmission":
+        em_node = n1
+    else:
+        return None
+    # Emission must have a TexSky reachable through its Color chain.
+    if not material_export._chain_contains_texsky(em_node.inputs["Color"]):
+        return None
+    # Factor must look view-dependent (Backfacing is the canonical pattern;
+    # other view-dependent fac chains are also acceptable).
+    if not fac.is_linked:
+        return None
+    fac_link = fac.links[0]
+    fac_src = fac_link.from_node
+    if (fac_src.bl_idname == "ShaderNodeNewGeometry"
+            and fac_link.from_socket.name == "Backfacing"):
+        return (em_node,)
+    return None
+
+
+def _walk_scene_for_portal_emissions(scene):
+    """Collect every distinct (material, emission_node) tuple matching the
+    daylight-portal pattern across materials referenced by the scene's
+    visible objects. Caps at the first match per material — multiple
+    portal nodes inside one material are not supported (artist would have
+    to merge them upstream)."""
+    seen_mats: set[str] = set()
+    found: list[tuple] = []
+    for obj in scene.objects:
+        if obj.type != "MESH" or not obj.material_slots:
+            continue
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is None or mat.name in seen_mats:
+                continue
+            seen_mats.add(mat.name)
+            if not mat.use_nodes or mat.node_tree is None:
+                continue
+            for node in mat.node_tree.nodes:
+                hit = _is_daylight_portal_mix(node)
+                if hit is not None:
+                    found.append((mat, hit[0]))
+                    break
+    return found
+
+
+def _prebake_portal_emission(scene, mat, emission_node, w: int, h: int) -> None:
+    """Bake a daylight-portal Emission node's Color chain to an equirect
+    envmap. Used as a fallback world background when the actual `World`
+    output is constant-black but the scene's portals are tagged with a
+    `TexSky` chain — Cycles' canonical "no World envmap, sky comes from
+    the portal material" idiom (classroom is the test case).
+
+    Cached in `_SKY_BAKE_CACHE` keyed by `(scene, material, em_node)`
+    via `_portal_emission_cache_key`.
+    """
+    key = _portal_emission_cache_key(scene.name, mat.name, emission_node.name)
+    if key in _SKY_BAKE_CACHE:
+        return
+    color_sock = emission_node.inputs.get("Color")
+    if color_sock is None or not color_sock.is_linked:
+        return
+    src_chain_root = color_sock.links[0].from_node
+    out_socket_name = color_sock.links[0].from_socket.name
+    strength_sock = emission_node.inputs.get("Strength")
+    strength = (float(strength_sock.default_value)
+                if strength_sock is not None and not strength_sock.is_linked
+                else 1.0)
+
+    t0 = time.perf_counter()
+    tmp_world = bpy.data.worlds.new(
+        f"__vibrt_portal_emit_{scene.name}_{mat.name}_{emission_node.name}"
+    )
+    tmp_world.use_nodes = True
+    nt = tmp_world.node_tree
+    nt.nodes.clear()
+    out_n = nt.nodes.new("ShaderNodeOutputWorld")
+    bg = nt.nodes.new("ShaderNodeBackground")
+    bg.inputs["Strength"].default_value = strength
+    cloned_root = _clone_node_chain(src_chain_root, nt)
+    if cloned_root is None:
+        _emit(
+            f"[vibrt] warn: portal {mat.name!r}/{emission_node.name!r}: "
+            f"failed to clone Emission.Color chain into temp world — "
+            f"skipping portal-as-envmap bake"
+        )
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    out_sock = next(
+        (o for o in cloned_root.outputs if o.name == out_socket_name),
+        None,
+    )
+    if out_sock is None:
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    nt.links.new(out_sock, bg.inputs["Color"])
+    nt.links.new(bg.outputs["Background"], out_n.inputs["Surface"])
+    try:
+        baked = _bake_sky_world_to_pixels(tmp_world, w=w, h=h)
+    except Exception as ex:
+        _emit(
+            f"[vibrt] warn: portal {mat.name!r}/{emission_node.name!r}: "
+            f"bake failed: {ex} — falling back to constant black world"
+        )
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    if baked is None:
+        bpy.data.worlds.remove(tmp_world, do_unlink=True)
+        return
+    rgb, bw, bh = baked
+    sky_node = next(
+        (n for n in nt.nodes if n.bl_idname == "ShaderNodeTexSky"),
+        None,
+    )
+    sun_light = None
+    if sky_node is not None and getattr(sky_node, "sun_disc", False):
+        sun_light = _extract_sun_from_bake_inplace(
+            rgb, bw, bh, sky_node, tmp_world.name
+        )
+    _SKY_BAKE_CACHE[key] = (rgb, bw, bh, sun_light)
+    _emit(
+        f"[vibrt] portal {mat.name!r}: pre-baked Emission(TexSky) chain to "
+        f"{bw}x{bh} envmap in {time.perf_counter() - t0:.2f}s"
+        + (" + extracted sun" if sun_light is not None else "")
+    )
+    bpy.data.worlds.remove(tmp_world, do_unlink=True)
+
+
+def prebake_portal_emissions_for_scene(scene, w: int = 1024, h: int = 512) -> None:
+    """Pre-bake every daylight-portal Emission(TexSky) chain in the
+    scene's materials into `_SKY_BAKE_CACHE`. Called from
+    `RenderEngine.update()` alongside `prebake_sky_envmaps_for_world`.
+
+    Skipped when the scene's World already has its own non-trivial
+    background — the existing world bake covers the sky lighting in
+    that case and a portal envmap would just duplicate it.
+    """
+    world = scene.world
+    if world is not None and world.use_nodes:
+        # World has its own Background-driven envmap (TexSky / TexEnvironment)
+        # → existing bake handles it; the portal route would only confuse.
+        if _world_sky_node(world) is not None:
+            return
+        out = world.node_tree.nodes.get("World Output") if world.node_tree else None
+        if out is None and world.node_tree:
+            out = next(
+                (n for n in world.node_tree.nodes
+                 if n.bl_idname == "ShaderNodeOutputWorld"),
+                None,
+            )
+        if out is not None:
+            surf = out.inputs.get("Surface")
+            if surf is not None and surf.is_linked:
+                bg = surf.links[0].from_node
+                if bg.bl_idname == "ShaderNodeBackground":
+                    color_sock = bg.inputs.get("Color")
+                    strength_sock = bg.inputs.get("Strength")
+                    has_color_link = color_sock is not None and color_sock.is_linked
+                    strength = (float(strength_sock.default_value)
+                                if strength_sock is not None
+                                and not strength_sock.is_linked else 1.0)
+                    # World is "effectively black" when no Color link AND
+                    # (default colour is near-zero OR Strength is zero).
+                    color_default = (list(color_sock.default_value)[:3]
+                                     if color_sock is not None else [0, 0, 0])
+                    is_black = (not has_color_link
+                                and (max(color_default) < 1e-6 or strength == 0.0))
+                    if not is_black:
+                        return
+    portals = _walk_scene_for_portal_emissions(scene)
+    if not portals:
+        return
+    if len(portals) > 1:
+        _emit(
+            f"[vibrt] warn: scene {scene.name!r}: {len(portals)} daylight "
+            f"portals detected; only the first ({portals[0][0].name!r}) "
+            f"will drive the world envmap"
+        )
+    mat, emission_node = portals[0]
+    _prebake_portal_emission(scene, mat, emission_node, w=w, h=h)
+
+
 def _find_first_sky_node(world):
     """Walk the world's node tree for the first ShaderNodeTexSky regardless
     of where it sits in the graph (direct Background.Color, behind a
@@ -1821,24 +2140,22 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
     flux_max = max(float(flux_rgb[0]), float(flux_rgb[1]),
                    float(flux_rgb[2]), 1e-6)
     color = [float(c) / flux_max for c in flux_rgb]
-    # Empirical Cycles-parity boost. A 3-way comparison on lone_monk
-    # (Cycles direct Nishita vs Cycles with our bake EXR as world vs
-    # vibrt with bake_residual + extracted sun) showed Cycles' direct
-    # Sky Texture rendering delivers ~2.6× more flux than the same
-    # bake re-rendered as a generic Environment Texture. Source:
-    # Cycles' `kbackground->use_sun_guiding` path
-    # (`c:/tmp/cycles-src/src/kernel/light/background.h`,
-    # `src/scene/light.cpp:1290`) fires when the world is a Sky Texture
-    # with sun_disc, dedicates `sun_weight=4.0` (vs `map_weight=1.0`)
-    # of background NEE samples to a uniform-cone sampler around the
-    # known sun direction, and uses `sun_average_radiance` as the
-    # sample value — neither of which fires for a baked equirect. The
-    # ~2× scale here is a coarse empirical match (Cycles' sun_weight=4
-    # split + the `0.8*map + 0.2*sun` MIS heuristic) that lifts
-    # lone_monk's render close to the Cycles reference. Specific to
-    # ShaderNodeTexSky + sun_disc; HDRI environments don't go through
-    # this path so they're unaffected.
-    sun_guiding_boost = 2.0
+    # No boost on the bake-extracted sun strength. Earlier hand-tuning
+    # (boost=2.0) was empirically picked to minimise lone_monk's |diff|,
+    # but a controlled isolation test removed the rationale: rendering a
+    # 100 m × 100 m horizontal white plate under lone_monk's world in
+    # both engines (no other geometry, no indirect bounces) shows Cycles
+    # delivers a horizontal irradiance of ~(126, 107, 90) W/m² and vibrt
+    # at boost=1.0 delivers ~(122, 102, 82) — ratio ~0.97×, a clean
+    # match. boost=2.0 doubled this on direct illumination (vibrt 1.93×
+    # Cycles on the plate), trading a +93 % over-delivery on directly-
+    # lit surfaces against the +5–20× under-delivery on shadow / mid
+    # areas the indirect-bounce code has, so that the global mean ended
+    # up close to Cycles by accident. Both errors are physically wrong;
+    # boost=1.0 makes the direct path correct so any remaining gap is
+    # attributable to indirect bouncing or sky-residual-clamp artefacts
+    # (separate issues), not to the sun-extraction step itself.
+    sun_guiding_boost = 1.0
     flux_max_boosted = flux_max * sun_guiding_boost
     _emit(
         f"[vibrt] world {world_name!r}: split {n_bright} sun-disc pixels "
@@ -2054,8 +2371,48 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
     return rgb, int(w), int(h)
 
 
-def _export_world(world, writer, textures: list, lights_json: list | None = None) -> dict:
+def _maybe_export_portal_envmap(scene, writer, textures, lights_json):
+    """If a daylight-portal Emission(TexSky) chain was pre-baked for
+    this scene, return an `envmap` world descriptor consuming the bake.
+    Used as a fallback when the actual World output is constant black.
+    Returns None when no portal bake is in cache."""
+    if scene is None:
+        return None
+    portals = _walk_scene_for_portal_emissions(scene)
+    if not portals:
+        return None
+    mat, em_node = portals[0]
+    key = _portal_emission_cache_key(scene.name, mat.name, em_node.name)
+    baked = _SKY_BAKE_CACHE.get(key)
+    if baked is None:
+        return None
+    rgb, bw, bh, sun_light = baked
+    pb = material_export._PreBakedTexture(
+        rgb=rgb, w=bw, h=bh, cache_key=key,
+    )
+    tex_id = material_export.export_image_texture(
+        pb, writer, textures, colorspace="linear"
+    )
+    if sun_light is not None and lights_json is not None:
+        lights_json.append(dict(sun_light))
+    return {
+        "type": "envmap",
+        "texture": tex_id,
+        "rotation_z_rad": 0.0,
+        "strength": 1.0,
+    }
+
+
+def _export_world(world, writer, textures: list, lights_json: list | None = None,
+                   scene=None) -> dict:
     if world is None or not world.use_nodes:
+        # Constant fall-through. Try the portal-emission envmap first
+        # (classroom: the World node is empty/black but portals carry
+        # the actual sky shader).
+        if scene is not None:
+            portal_world = _maybe_export_portal_envmap(scene, writer, textures, lights_json)
+            if portal_world is not None:
+                return portal_world
         col = list(world.color)[:3] if world else [0.05, 0.05, 0.05]
         return {"type": "constant", "color": col, "strength": 1.0}
 
@@ -2179,6 +2536,17 @@ def _export_world(world, writer, textures: list, lights_json: list | None = None
                     f"driven by {linked.bl_idname} (expected "
                     f"ShaderNodeTexEnvironment) — using constant default"
                 )
+        # Background is "effectively black" (no Color link, near-zero RGB
+        # or zero strength) — try the portal-emission envmap as a
+        # fallback so artist-tagged portals (classroom's `dayLight_portal`)
+        # can drive the world lighting.
+        is_black = (max(col) < 1e-6 or float(strength) == 0.0)
+        if scene is not None and is_black:
+            portal_world = _maybe_export_portal_envmap(
+                scene, writer, textures, lights_json
+            )
+            if portal_world is not None:
+                return portal_world
         return {"type": "constant", "color": col, "strength": float(strength)}
 
     # Light-Path camera-ray split: emit a Mixed envmap with
@@ -2324,6 +2692,14 @@ def _export_into(
     # it so the material JSON stays clean and record it per-material so meshes
     # that reference the material can emit the matching vertex-colour blob.
     material_vc_attr: dict[str, str] = {}
+    # Material indices flagged as Cycles daylight portals — `MixShader(Emission,
+    # Transparent)` with TexSky driving the emission. These aren't real
+    # emitters; treating them as such double-counts the sky once via the world
+    # envmap and once via mesh-light NEE through the "window". We use this set
+    # to demote portal slots from emissive at the routing gate, so camera-
+    # hidden portals get skipped entirely (sky NEE/miss naturally fires
+    # through the empty space).
+    portal_mat_ids: set[int] = set()
 
     meshes: list[dict] = []
     objects: list[dict] = []
@@ -2331,6 +2707,14 @@ def _export_into(
 
     cam_obj = None
     lights_json: list[dict] = []
+    # Mesh lights: emissive meshes registered for true triangle-mesh NEE.
+    # Each entry is `{"object_idx": N}` referencing an object that's already
+    # in `objects[]`; the loader walks that object's mesh + material slots,
+    # finds triangles whose material has nonzero emission, and builds a
+    # per-light triangle table + CDF. Coexists with `lights_json`'s
+    # area_rect: meshes that can't be in the BLAS (camera-hidden emissive
+    # panels) still go through the rect-promotion fallback below.
+    mesh_lights_json: list[dict] = []
 
     # The reusable foreach_get buffer is now grown lazily on first use, so we
     # no longer pre-walk `bpy.data.images`. That walk used to cost ~7 s on
@@ -2361,11 +2745,23 @@ def _export_into(
                     return material_index[mat.name]
                 exported = material_export.export_material(mat, writer, textures)
                 vc_attr = exported.pop("_vertex_color_attr", None)
+                is_portal = bool(exported.pop("_is_daylight_portal", False))
                 if vc_attr:
                     material_vc_attr[mat.name] = vc_attr
+                if is_portal:
+                    # vibrt has no portal sampling; the artist's portal hint
+                    # collapses to "this mesh is a transparent window".
+                    # Zero the fake emission and force the alpha-blend
+                    # weight to full passthrough so even camera-visible
+                    # portals (rare) read as plain transparent geometry —
+                    # the world envmap delivers the sky lighting.
+                    exported["emission"] = [0.0, 0.0, 0.0]
+                    exported["alpha_blend"] = 0.0
                 mid = len(materials)
                 materials.append(exported)
                 material_index[mat.name] = mid
+                if is_portal:
+                    portal_mat_ids.add(mid)
                 return mid
 
             pre_loop_s = time.perf_counter() - t_pre
@@ -2389,40 +2785,91 @@ def _export_into(
                     if not slot_mat_ids:
                         slot_mat_ids = [resolve_material(None)]
 
-                    # Promote single-quad pure-emissive meshes to area_rect lights
-                    # so NEE can find them. Runs before the visible_camera skip
-                    # because Blender scenes routinely use camera-hidden meshes as
-                    # emissive panels (BMW27's `Light`) — without promotion their
-                    # contribution is entirely lost. The rect honours the original
-                    # visible_camera flag so hidden panels stay hidden from the
-                    # final image.
-                    if len(slot_mat_ids) == 1 and not inst.is_instance:
-                        rect = _try_emissive_quad_as_rect_light(
-                            obj, obj_eval, materials[slot_mat_ids[0]]
-                        )
-                        if rect is not None:
-                            lights_json.append(rect)
-                            continue
-                        # Mixed-emissive (mesh has emission + a non-zero
-                        # diffuse lobe / textures). Add a NEE-only rect proxy
-                        # so diffuse receivers can sample the lamp; keep the
-                        # mesh visible to the camera so its actual silhouette
-                        # / fabric / specular response renders normally.
-                        # flat_archiviz's Lamp Gubi (Principled with
-                        # emission_strength=2 mixed with Translucent fabric)
-                        # is the canonical case.
-                        proxy = _try_mixed_emissive_proxy(
-                            obj, obj_eval, materials[slot_mat_ids[0]]
-                        )
-                        if proxy is not None:
-                            lights_json.append(proxy)
+                    # Detect emissive material slots up front so we can route
+                    # the mesh through either the rect-promotion fallback (for
+                    # camera-hidden panels — they can't live in the BLAS or
+                    # they'd shadow other lights) or the mesh-light NEE path
+                    # (multi-material emissive meshes that the rect promotion
+                    # couldn't handle, plus mixed emissive+BSDF meshes).
+                    #
+                    # Both constant- and texture-emission materials are
+                    # mesh-light NEE candidates: the loader stores per-tri
+                    # UVs + emission texture handle, and the kernel
+                    # samples the texture at the NEE-sample's barycentric
+                    # → UV so spatial detail (CRT screens, billboards,
+                    # patterned panels) survives the indirect path
+                    # without collapsing to a uniform glow.
+                    def _slot_is_emissive(mid):
+                        # Daylight portals (MixShader Emission(TexSky) +
+                        # Transparent) carry nonzero emission in the dict,
+                        # but they're not real emitters — they're transparent
+                        # windows the artist tagged so Cycles can importance-
+                        # sample the sky through them. Treating them as mesh-
+                        # lights double-counts the world envmap. Demote here
+                        # so camera-hidden portals fall through to the
+                        # `not visible_camera and not has_emissive_slot`
+                        # skip (sky NEE/miss carries the lighting through
+                        # the now-empty window).
+                        if mid in portal_mat_ids:
+                            return False
+                        m = materials[mid]
+                        return any(e > 1e-6 for e in m.get("emission", [0, 0, 0]))
 
-                    # Skip meshes that Cycles hides from camera — they're light
-                    # portals (e.g. classroom's `windows` dayLight_portal) meant
-                    # to inject light but never appear as geometry on the
-                    # rendered image. Without this check the emissive portal
-                    # bleeds over the ceiling / walls.
-                    if not getattr(obj, "visible_camera", True):
+                    has_emissive_slot = any(
+                        _slot_is_emissive(mid) for mid in slot_mat_ids
+                    )
+
+                    visible_camera = getattr(obj, "visible_camera", True)
+                    if has_emissive_slot and not visible_camera and not inst.is_instance:
+                        # Camera-hidden emissive meshes get the BLAS-
+                        # coexistence path when the rect-promotion
+                        # approximation isn't a strict win: BMW27's
+                        # `Light` (single quad pure emissive) actually
+                        # benefits from real mesh-light NEE (|diff|
+                        # 0.060 → 0.050). But classroom's camera-hidden
+                        # multi-poly / textured emissives saw worse
+                        # results (|diff| 0.096 → 0.122) because the
+                        # actual mesh geometry over-delivered vs the
+                        # rect-proxy summary. Keep rect-promotion as
+                        # the default for now; opt into BLAS coexist
+                        # only when single-quad pure emissive (where
+                        # rect approximation == mesh geometry exactly).
+                        single_quad_pure = (
+                            len(slot_mat_ids) == 1
+                            and len(obj_eval.data.polygons) == 1
+                            and len(obj_eval.data.polygons[0].vertices) == 4
+                            and not any(k in materials[slot_mat_ids[0]] for k in
+                                ("base_color_tex", "color_graph", "emission_tex"))
+                            and max(materials[slot_mat_ids[0]].get("base_color", [0, 0, 0])) < 0.01
+                        )
+                        if not single_quad_pure:
+                            # Legacy rect-promotion path for everything
+                            # else (multi-poly, textured, mixed-emissive).
+                            if len(slot_mat_ids) == 1:
+                                rect = _try_emissive_quad_as_rect_light(
+                                    obj, obj_eval, materials[slot_mat_ids[0]]
+                                )
+                                if rect is not None:
+                                    lights_json.append(rect)
+                            continue
+                        # Single-quad pure emissive: fall through to
+                        # add to BLAS with camera_visible=False, mesh-
+                        # light NEE on the actual quad geometry. The
+                        # rect promotion would have produced an
+                        # equivalent shape (its single-quad fast path
+                        # uses the same edges as U/V axes), so this is
+                        # the same delivery via a more general code
+                        # path.
+
+                    # Skip camera-hidden non-emissive meshes. This catches
+                    # both plain transparent geometry and Cycles daylight
+                    # portals (classroom's `windows`): the portal slot was
+                    # demoted to non-emissive in `resolve_material` so it
+                    # falls into this branch, sky NEE/miss naturally
+                    # delivers the lighting through the empty space, and
+                    # we avoid double-counting the world envmap via a fake
+                    # mesh emitter.
+                    if not visible_camera and not has_emissive_slot:
                         continue
 
                     # Particle scatter emitters: when the source object has
@@ -2468,7 +2915,43 @@ def _export_into(
                     # rectangular shadow-cutouts on the ceiling.
                     if not getattr(obj, "visible_shadow", True):
                         obj_desc["cast_shadow"] = False
+                    # Cycles' Ray Visibility → Camera. False = camera ray
+                    # and specular bounce chains skip this instance via
+                    # the OptiX visibility mask, while diffuse-bounce
+                    # rays + NEE shadow rays still see the geometry. The
+                    # mesh participates in mesh-light NEE for its
+                    # emissive surfaces — replaces the legacy rect-
+                    # promotion approximation with the actual mesh.
+                    if not visible_camera:
+                        obj_desc["camera_visible"] = False
+                        # Camera-hidden emissive meshes are typically pure
+                        # emissive panels (BMW27's `Light`). The artist's
+                        # intent is "inject light from this surface, but
+                        # don't block other lights' shadow rays from the
+                        # same direction" — BMW27's `Light` doesn't
+                        # occlude the ceiling reflections it sits on.
+                        # Forcing cast_shadow=False matches that intent
+                        # and mirrors what the old rect-promotion path
+                        # implicitly did (rects aren't in the BLAS so
+                        # never blocked anything). Cycles daylight
+                        # portals look superficially similar but are
+                        # detected upstream and demoted to non-emissive,
+                        # so they never reach this branch.
+                        obj_desc["cast_shadow"] = False
+                    new_obj_idx = len(objects)
                     objects.append(obj_desc)
+
+                    # Register the object for mesh-light NEE if any of its
+                    # material slots emits. The loader walks the per-triangle
+                    # material indices, picks out the emissive ones, and
+                    # builds a triangle table + CDF. Single-quad pure-emissive
+                    # panels go through this path too — slightly more CDF
+                    # entries (2 triangles) than the dropped-rect alternative
+                    # but the BSDF / NEE code paths see one consistent kind
+                    # of emissive surface, and textured / multi-material
+                    # cases that the rect promotion couldn't handle now work.
+                    if has_emissive_slot:
+                        mesh_lights_json.append({"object_idx": new_obj_idx})
 
                     # Hair particle systems on this object: tessellate to
                     # ribbons + emit a sibling mesh/object. Skipped for
@@ -2514,7 +2997,8 @@ def _export_into(
                 raise RuntimeError("No active camera in scene")
 
             t_world = time.perf_counter()
-            world = _export_world(scene.world, writer, textures, lights_json)
+            world = _export_world(scene.world, writer, textures, lights_json,
+                                   scene=scene)
             world_volume = _export_world_volume(scene.world)
             world_s = time.perf_counter() - t_world
 
@@ -2591,6 +3075,7 @@ def _export_into(
         "textures": textures,
         "objects": objects,
         "lights": lights_json,
+        "mesh_lights": mesh_lights_json,
         "world": world,
     }
     if world_volume is not None:

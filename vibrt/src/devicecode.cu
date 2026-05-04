@@ -404,6 +404,19 @@ struct PathVertex {
   // material graph can lerp ColorRamps and Mix nodes per instance.
   float object_random;
   int hit; // 1 if hit, 0 if miss
+  // Mesh-light index for the instance this hit landed on (-1 when the
+  // instance isn't registered for mesh-light NEE). Mirrors the SBT's
+  // `HitGroupData::area_light_group`. Lets `trace_path` decide whether
+  // a BSDF-sampled emission contribution should be MIS-weighted against
+  // the NEE sampler — without indexing into the mesh_lights array, since
+  // the joint pmf reduces to `area × lum / total_power` regardless of
+  // which mesh-light owns the triangle.
+  int mesh_light_idx;
+  // World-space triangle area of the hit primitive. Closest_hit computes
+  // it from the post-transform vertices so `trace_path`'s MIS gate can
+  // form `pdf_solid = d² / (area × cos_light)` without re-fetching the
+  // BLAS triangle. Zero on misses / non-mesh-light hits.
+  float prim_area;
 };
 
 static __forceinline__ __device__ void *unpack_ptr(unsigned int hi,
@@ -1109,6 +1122,14 @@ static __device__ float3 eval_color_graph(
 }
 
 // ---------- Principled BSDF ----------
+//
+// Material evaluation is a two-step process. `eval_material` walks the
+// surface's binary Mix tree (`PrincipledGpu` left/right children) and
+// flattens it into a flat list of (closure, weight) pairs — one
+// `MaterialEval` per leaf. `eval_bsdf` / `sample_bsdf` then evaluate as
+// a weighted sum / mixture over those leaves. This handles arbitrary
+// binary topologies (right-leaning `Mix(A, Mix(B, C))`, left-leaning
+// `Mix(Mix(A, B), C)`, balanced `Mix(Mix(A, B), Mix(C, D))`) uniformly.
 struct MaterialEval {
   float3 base_color;
   float metallic;
@@ -1130,15 +1151,33 @@ struct MaterialEval {
   PrincipledGpu *mat; // raw material ptr for coat/sheen/sss params
 };
 
+// Group of leaf MaterialEvals + their per-leaf weights. The weights sum
+// to 1 across the group (modulo per-pixel mix_fac quantisation). Built
+// by `eval_material` from the binary Mix tree at the hit. Capped at
+// `MAX_LEAVES` slots — anything deeper truncates the deepest branch
+// (silently, since the exporter caps tree depth too).
+constexpr int MAX_LEAVES = 4;
+struct MaterialEvalGroup {
+  MaterialEval *slots; // n elements
+  float *weights;      // n elements, sum to ≈1
+  int n;
+};
+
 // `min_alpha` is the path's "filter glossy" floor — Cycles' filter-glossy
 // settings inflate the BSDF roughness on indirect glossy bounces so that
 // near-mirror bounces can't resample a tiny solid angle and produce
 // fireflies. We approximate it by raising `alpha`, `alpha_x`, `alpha_y`
 // to at least this value. 0 = primary ray (no inflation).
-static __device__ MaterialEval eval_material(const PathVertex &v,
-                                              float min_alpha = 0.0f) {
+//
+// Single-closure eval — takes an explicit `PrincipledGpu* m` so the same
+// body can serve both the primary closure (m = v.mat) and the secondary
+// (m = v.mat->secondary). The vertex-level inputs (uv, vertex color,
+// tangents, normals) come from `v` regardless of which closure is being
+// evaluated.
+static __device__ MaterialEval eval_material_one(const PathVertex &v,
+                                                  PrincipledGpu *m,
+                                                  float min_alpha = 0.0f) {
   MaterialEval e;
-  PrincipledGpu *m = v.mat;
   e.mat = m;
   e.base_color = make_f3(m->base_color);
   e.metallic = m->metallic;
@@ -1307,6 +1346,110 @@ static __device__ MaterialEval eval_material(const PathVertex &v,
   return e;
 }
 
+// Compute the per-pixel mix factor for a single MixShader level, evaluating
+// the level's `mix_fac_tex` (if any) at the hit's UV through the level's own
+// uv_transform. Cycles' MixShader factor is sampled at the surface point,
+// not in either lobe's texture coordinates. Constant-fac is the common case
+// (mix_fac_tex == nullptr); the texture branch supports per-pixel masks for
+// things like edge-wear blends or multi-material decals.
+static __device__ float compute_level_mix_fac(PrincipledGpu *m, float2 uv_raw) {
+  const float *M = m->uv_transform;
+  float2 uv_xform =
+      make_float2(M[0] * uv_raw.x + M[1] * uv_raw.y + M[2],
+                  M[3] * uv_raw.x + M[4] * uv_raw.y + M[5]);
+  float f = m->mix_fac;
+  if (m->mix_fac_tex != nullptr) {
+    float t = sample_rgba(m->mix_fac_tex, m->mix_fac_tex_w,
+                          m->mix_fac_tex_h,
+                          m->mix_fac_tex_channels, uv_xform).x;
+    f *= t;
+  }
+  return fminf(fmaxf(f, 0.0f), 1.0f);
+}
+
+// Walk the material's binary Mix tree and flatten it into the caller-
+// provided `slots[]` + `weights[]` arrays as a flat list of leaves.
+// Returns the number of leaves emitted (1..max_leaves). Each
+// PrincipledGpu node is interpreted as:
+//   - secondary == null && left_subtree == null:  leaf (own lobe params)
+//   - secondary != null && left_subtree == null:  Mix(self_as_leaf, secondary)
+//   - secondary != null && left_subtree != null:  Mix(left_subtree, secondary)
+//                                                  (own params unused)
+//   - secondary == null && left_subtree != null:  not produced by exporter,
+//                                                  treated as leaf for safety
+//
+// Walks iteratively via an explicit stack — CUDA call recursion is
+// supported but slow. Stack depth bounded by `STACK_DEPTH`; with
+// MAX_LEAVES=4 a fully balanced binary tree has 4 leaves + 3 internal
+// = 7 nodes, so STACK_DEPTH=8 is safe headroom.
+//
+// `max_leaves == 1` makes this behave like the AOV-pass single-closure
+// query (just emit the leftmost leaf). `slots == nullptr` is treated
+// the same way (return 0 leaves — caller signalled "I don't care").
+static __device__ int eval_material(const PathVertex &v,
+                                     MaterialEval *slots,
+                                     float *weights,
+                                     int max_leaves,
+                                     float min_alpha = 0.0f) {
+  if (slots == nullptr || max_leaves <= 0) {
+    return 0;
+  }
+  constexpr int STACK_DEPTH = 8;
+  struct Frame {
+    PrincipledGpu *node;
+    float weight;
+    bool as_leaf; // true => use own params as a leaf, ignore secondary/left
+  };
+  Frame stack[STACK_DEPTH];
+  int sp = 0;
+  stack[sp++] = {v.mat, 1.0f, false};
+  int n = 0;
+  while (sp > 0 && n < max_leaves) {
+    Frame f = stack[--sp];
+    PrincipledGpu *node = f.node;
+    bool has_right = (node->secondary != nullptr);
+    bool has_left = (node->left_subtree != nullptr);
+    bool is_internal = !f.as_leaf && (has_right || has_left);
+    if (!is_internal) {
+      // Emit as leaf — evaluate this node's own lobe params.
+      slots[n] = eval_material_one(v, node, min_alpha);
+      weights[n] = f.weight;
+      ++n;
+      continue;
+    }
+    float fac = compute_level_mix_fac(node, v.uv);
+    float w_left = f.weight * (1.0f - fac);
+    float w_right = f.weight * fac;
+    // Push right then left so left is processed first (preserves
+    // depth-first order, helps determinism if anything else inspects
+    // the leaf order).
+    if (sp + 2 > STACK_DEPTH) {
+      // Overflow safeguard: collapse remaining sub-tree into one leaf
+      // using own params, weighted by the unspent weight. Should not
+      // trigger with a sane exporter cap.
+      slots[n] = eval_material_one(v, node, min_alpha);
+      weights[n] = f.weight;
+      ++n;
+      continue;
+    }
+    if (has_right) {
+      stack[sp++] = {node->secondary, w_right, false};
+    } else {
+      // No right child but left_subtree set: treat node itself as
+      // self-leaf carrying right's intended weight (defensive fallback;
+      // the exporter doesn't produce this shape).
+      stack[sp++] = {node, w_right, true};
+    }
+    if (has_left) {
+      stack[sp++] = {node->left_subtree, w_left, false};
+    } else {
+      // Right-leaning compact case: own lobe params are the left leaf.
+      stack[sp++] = {node, w_left, true};
+    }
+  }
+  return n;
+}
+
 // Evaluate BSDF * |cos(wi, Ns)| for a given outgoing wo and incoming wi (both
 // world space, pointing away from P). Returns f_r and the sampling PDF used
 // by the combined sample routine (for MIS weighting).
@@ -1353,8 +1496,12 @@ static __device__ BsdfEval eval_hair(const MaterialEval &e, float3 wo,
   return r;
 }
 
-static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
-                                     float3 wi) {
+// Single-closure eval. The legacy body — handles diffuse / spec / coat /
+// transmission / sheen / sss / translucent for one PrincipledGpu. The
+// outer `eval_bsdf` wrapper below combines this with the secondary
+// closure (when present).
+static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
+                                         float3 wi) {
   BsdfEval r;
   r.f = make_float3(0, 0, 0);
   r.pdf = 0.0f;
@@ -1667,8 +1814,13 @@ struct BsdfSample {
   int lobe;      // LOBE_DIFFUSE / LOBE_GLOSSY / LOBE_TRANSMISSION
 };
 
-static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
-                                         RNG &rng) {
+// Single-closure sampler. The outer `sample_bsdf` wrapper below picks
+// between primary and secondary by `mix_fac` and delegates here. The
+// inner `eval_bsdf(e, wo, s.wi)` call near the end of this function is
+// rewritten to `eval_bsdf_one` so it sees only this closure — the
+// wrapper recomputes the combined f / pdf for MIS afterwards.
+static __device__ BsdfSample sample_bsdf_one(const MaterialEval &e, float3 wo,
+                                              RNG &rng) {
   BsdfSample s;
   s.wi = make_float3(0, 0, 1);
   s.f = make_float3(0, 0, 0);
@@ -1822,9 +1974,60 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
     s.lobe = LOBE_GLOSSY;
   }
 
-  BsdfEval ev = eval_bsdf(e, wo, s.wi);
+  // Single-closure eval — the outer wrapper recomputes the combined
+  // f / pdf via `eval_bsdf` (which folds in the secondary) when needed.
+  BsdfEval ev = eval_bsdf_one(e, wo, s.wi);
   s.f = ev.f;
   s.pdf = ev.pdf;
+  return s;
+}
+
+// Multi-closure eval: weighted sum over the leaves emitted by
+// `eval_material`. Both f and pdf are linearly weighted; the combined
+// pdf is the mixture pdf, which is what the path tracer needs for MIS
+// against light pdfs (and what `sample_bsdf` below produces). When
+// `g.n == 1` this is just `eval_bsdf_one(g.slots[0], wo, wi)`.
+static __device__ BsdfEval eval_bsdf(const MaterialEvalGroup &g,
+                                     float3 wo, float3 wi) {
+  BsdfEval r;
+  r.f = make_float3(0.0f, 0.0f, 0.0f);
+  r.pdf = 0.0f;
+  for (int i = 0; i < g.n; ++i) {
+    BsdfEval ev = eval_bsdf_one(g.slots[i], wo, wi);
+    float w = g.weights[i];
+    r.f = r.f + ev.f * w;
+    r.pdf += ev.pdf * w;
+  }
+  return r;
+}
+
+// Multi-closure sampler. Picks one leaf by its weight, samples within
+// it, then recomputes the combined f / pdf via the `eval_bsdf` wrapper
+// so MIS weights against light samplers see the real mixture density.
+// `lobe` and `specular` come from the inner sample — they describe
+// which closure produced wi for the per-lobe bounce-cap accounting in
+// trace_path.
+static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
+                                         float3 wo, RNG &rng) {
+  if (g.n == 1) {
+    return sample_bsdf_one(g.slots[0], wo, rng);
+  }
+  float u = rng.next();
+  int picked = g.n - 1; // last leaf catches residual mass
+  float acc = 0.0f;
+  for (int i = 0; i < g.n - 1; ++i) {
+    acc += g.weights[i];
+    if (u < acc) {
+      picked = i;
+      break;
+    }
+  }
+  BsdfSample s = sample_bsdf_one(g.slots[picked], wo, rng);
+  if (s.pdf <= 0.0f)
+    return s;
+  BsdfEval comb = eval_bsdf(g, wo, s.wi);
+  s.f = comb.f;
+  s.pdf = comb.pdf;
   return s;
 }
 
@@ -1954,7 +2157,7 @@ static __device__ float ies_lookup(const float *ies_data,
 // `shadow_transmittance` returns RGB so each light contribution is attenuated
 // by the per-channel volume transmittance. On scenes without volumes it
 // short-circuits to the legacy binary `shadow_visible` path.
-static __device__ float3 direct_light(const MaterialEval &e, float3 P,
+static __device__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
                                       float3 wo, RNG &rng,
                                       const VolumeStack &vstack) {
   float3 L = make_float3(0, 0, 0);
@@ -1980,7 +2183,14 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
     L = L + b.f * vis * make_f3(pl.emission) * ies / fmaxf(d * d, 1e-6f);
   }
 
-  // Sun lights: sample within cone
+  // Sun lights: sample within cone, MIS-weight against BSDF sampling.
+  // The kernel's `emission` field already encodes `Le_per_dir × sun_omega`
+  // (= irradiance), so the unweighted estimator `bsdf × cos × emission`
+  // equals `bsdf × cos × Le × sun_omega = f(x) / pdf` for a uniform-cone
+  // sampler with `pdf = 1/sun_omega`. Multiplying by `w_sun` keeps the
+  // estimator unbiased while letting the matching BSDF-side branch in
+  // `trace_path`'s envmap-miss block carry the BSDF-sampled contribution
+  // when a scatter ray happens to land inside the sun cone.
   for (int i = 0; i < params.num_sun_lights; i++) {
     SunLight &sl = params.sun_lights[i];
     float3 dir = make_f3(sl.direction);
@@ -1999,7 +2209,10 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
     if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi);
-    L = L + b.f * vis * make_f3(sl.emission);
+    float sun_omega = 2.0f * M_PIf * fmaxf(1.0f - cos_a, 1e-30f);
+    float pdf_sun = 1.0f / sun_omega;
+    float w_sun = power_heuristic(pdf_sun, b.pdf);
+    L = L + b.f * vis * make_f3(sl.emission) * w_sun;
   }
 
   // Spot lights
@@ -2064,6 +2277,97 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
               float ies = ies_lookup(ar.ies_data, ar.ies_n_v, ar.ies_n_h,
                                      ar.light_rotation, -wi);
               L = L + b.f * vis * make_f3(ar.emission) * ies / pdf;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Mesh lights: two-stage CDF — outer over per-mesh-light total power,
+  // inner over per-triangle area × luminance(emission). Same solid-angle
+  // pdf math as area_rect (uniform sample on triangle, then the standard
+  // d² / (area × cos_light) Jacobian). MIS-weighted against BSDF
+  // sampling via `power_heuristic` — the matching closest-hit branch
+  // in `trace_path`'s emission gate adds the BSDF-side weighted
+  // contribution when a sampled wi happens to land on a mesh-light
+  // triangle. Shadow ray uses standard `shadow_transmittance` which
+  // subtracts ~1mm from tmax internally, so it doesn't self-intersect
+  // the sampled light triangle.
+  if (params.num_mesh_lights > 0) {
+    float u = rng.next();
+    int mli = cdf_search(params.mesh_light_cdf, params.num_mesh_lights, u);
+    MeshLight &ml = params.mesh_lights[mli];
+    float pmf_outer =
+        (params.mesh_light_cdf[mli + 1] - params.mesh_light_cdf[mli]);
+    if (pmf_outer > 0.0f && ml.num_triangles > 0) {
+      float ut = rng.next();
+      int ti = cdf_search(ml.cdf, (int)ml.num_triangles, ut);
+      MeshLightTri &tri = ml.triangles[ti];
+      float pmf_tri = ml.cdf[ti + 1] - ml.cdf[ti];
+      if (pmf_tri > 0.0f) {
+        // Uniform area sample on the triangle via the Turk √r mapping.
+        float r1 = rng.next();
+        float r2 = rng.next();
+        float sq = sqrtf(r1);
+        float b0 = 1.0f - sq;
+        float b1 = sq * (1.0f - r2);
+        float b2 = sq * r2;
+        float3 v0 = make_f3(tri.v0);
+        float3 v1 = make_f3(tri.v1);
+        float3 v2 = make_f3(tri.v2);
+        float3 Pl = v0 * b0 + v1 * b1 + v2 * b2;
+        float3 e1 = v1 - v0;
+        float3 e2 = v2 - v0;
+        float3 ng = cross3(e1, e2);
+        float ng_len2 = dot3(ng, ng);
+        if (ng_len2 > 1e-20f) {
+          float3 n = ng * (1.0f / sqrtf(ng_len2));
+          float3 ld = Pl - P;
+          float d2 = dot3(ld, ld);
+          float d = sqrtf(d2);
+          if (d > 1e-4f) {
+            float3 wi = ld / d;
+            float cos_light = -dot3(n, wi);
+            if (ml.two_sided != 0u)
+              cos_light = fabsf(cos_light);
+            if (cos_light > 0.0f) {
+              float3 vis = shadow_transmittance(P, wi, d, vstack);
+              if (luminance(vis) > 0.0f) {
+                BsdfEval b = eval_bsdf(e, wo, wi);
+                float area = tri.area;
+                float pdf_area = 1.0f / fmaxf(area, 1e-12f);
+                float pdf_solid = pdf_area * d2 / cos_light;
+                float pdf_light = pdf_solid * pmf_outer * pmf_tri;
+                if (pdf_light > 0.0f) {
+                  // Per-sample emission radiance. The constant `tri.emission`
+                  // is the material's emission strength multiplier (the
+                  // Cycles Principled `Emission` socket × `Emission
+                  // Strength`). When `emission_tex` is set, sample the
+                  // texture at the barycentric → UV-interpolated coordinate
+                  // so a textured emissive surface (LED panel, CRT screen,
+                  // billboard) delivers per-pixel detail at the NEE-sampled
+                  // point — without this, all triangles of a textured
+                  // emissive mesh deliver a uniform glow regardless of
+                  // which texel they cover.
+                  float3 Le = make_f3(tri.emission);
+                  if (tri.emission_tex != nullptr) {
+                    float2 uv = make_float2(
+                        tri.uv0[0] * b0 + tri.uv1[0] * b1 + tri.uv2[0] * b2,
+                        tri.uv0[1] * b0 + tri.uv1[1] * b1 + tri.uv2[1] * b2);
+                    float3 t = sample_rgba(
+                        tri.emission_tex, tri.emission_tex_w,
+                        tri.emission_tex_h, tri.emission_tex_channels, uv);
+                    Le = Le * t;
+                  }
+                  // MIS against BSDF sampling. Power heuristic with β=2 —
+                  // matches the envmap NEE block's choice. The matching
+                  // BSDF-side branch in `trace_path` uses (1-w_light) on
+                  // emission contributions that hit mesh-light triangles.
+                  float w_light = power_heuristic(pdf_light, b.pdf);
+                  L = L + b.f * vis * Le * (w_light / pdf_light);
+                }
+              }
             }
           }
         }
@@ -2207,6 +2511,76 @@ static __device__ float3 direct_light_volume(float3 P, float3 wi_world,
       }
     }
   }
+  // Mesh lights — same two-stage CDF as the surface NEE block, contribution
+  // routed through `add` (phase function in place of BSDF eval). No MIS
+  // on the volume in-scatter path: phase sampling + light NEE for volumes
+  // is one-sample importance sampling (matches the rect-light + envmap
+  // volume blocks above), so the BSDF-side weight gate doesn't apply.
+  if (params.num_mesh_lights > 0) {
+    float u = rng.next();
+    int mli = cdf_search(params.mesh_light_cdf, params.num_mesh_lights, u);
+    MeshLight &ml = params.mesh_lights[mli];
+    float pmf_outer =
+        (params.mesh_light_cdf[mli + 1] - params.mesh_light_cdf[mli]);
+    if (pmf_outer > 0.0f && ml.num_triangles > 0) {
+      float ut = rng.next();
+      int ti = cdf_search(ml.cdf, (int)ml.num_triangles, ut);
+      MeshLightTri &tri = ml.triangles[ti];
+      float pmf_tri = ml.cdf[ti + 1] - ml.cdf[ti];
+      if (pmf_tri > 0.0f) {
+        float r1 = rng.next();
+        float r2 = rng.next();
+        float sq = sqrtf(r1);
+        float b0 = 1.0f - sq;
+        float b1 = sq * (1.0f - r2);
+        float b2 = sq * r2;
+        float3 v0 = make_f3(tri.v0);
+        float3 v1 = make_f3(tri.v1);
+        float3 v2 = make_f3(tri.v2);
+        float3 Pl = v0 * b0 + v1 * b1 + v2 * b2;
+        float3 e1 = v1 - v0;
+        float3 e2 = v2 - v0;
+        float3 ng = cross3(e1, e2);
+        float ng_len2 = dot3(ng, ng);
+        if (ng_len2 > 1e-20f) {
+          float3 n = ng * (1.0f / sqrtf(ng_len2));
+          float3 ld = Pl - P;
+          float d2 = dot3(ld, ld);
+          float d = sqrtf(d2);
+          if (d > 1e-4f) {
+            float3 wi = ld / d;
+            float cos_light = -dot3(n, wi);
+            if (ml.two_sided != 0u)
+              cos_light = fabsf(cos_light);
+            if (cos_light > 0.0f) {
+              float3 vis = shadow_transmittance(P, wi, d, vstack);
+              if (luminance(vis) > 0.0f) {
+                float area = tri.area;
+                float pdf_area = 1.0f / fmaxf(area, 1e-12f);
+                float pdf_solid = pdf_area * d2 / cos_light;
+                float pdf = pdf_solid * pmf_outer * pmf_tri;
+                if (pdf > 0.0f) {
+                  // Per-sample emission radiance — same texture-aware
+                  // path as the surface NEE block.
+                  float3 Le = make_f3(tri.emission);
+                  if (tri.emission_tex != nullptr) {
+                    float2 uv = make_float2(
+                        tri.uv0[0] * b0 + tri.uv1[0] * b1 + tri.uv2[0] * b2,
+                        tri.uv0[1] * b0 + tri.uv1[1] * b1 + tri.uv2[1] * b2);
+                    float3 t = sample_rgba(
+                        tri.emission_tex, tri.emission_tex_w,
+                        tri.emission_tex_h, tri.emission_tex_channels, uv);
+                    Le = Le * t;
+                  }
+                  add(wi, Le / pdf, vis);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
   if (params.world_type != 0 && params.envmap_integral > 0.0f) {
     EnvSample es = sample_envmap(rng);
     if (es.pdf > 0.0f) {
@@ -2253,6 +2627,22 @@ extern "C" __global__ void __closesthit__ch() {
   float3 e2 = p2 - p0;
   float3 Ng_local = normalize3(cross3(e1, e2));
   float3 Ng = normalize3(optixTransformNormalFromObjectToWorldSpace(Ng_local));
+
+  // World-space triangle area for trace_path's mesh-light MIS gate. The
+  // post-transform vertices feed `pdf_solid = d²/(area·cos_light)` so the
+  // BSDF-sampler-side weight matches what the NEE sampler computed at
+  // sample time. A non-uniform instance scale would change this versus
+  // the object-space area; transforming the cross product by the scale
+  // factor below is what `optixTransformVectorFromObjectToWorldSpace`
+  // implicitly does, but we compute the world-space cross from world
+  // vertices for transparency.
+  float3 p0_w = optixTransformPointFromObjectToWorldSpace(p0);
+  float3 p1_w = optixTransformPointFromObjectToWorldSpace(p1);
+  float3 p2_w = optixTransformPointFromObjectToWorldSpace(p2);
+  float3 e1_w = p1_w - p0_w;
+  float3 e2_w = p2_w - p0_w;
+  float3 ng_w = cross3(e1_w, e2_w);
+  float prim_area = 0.5f * sqrtf(dot3(ng_w, ng_w));
 
   float3 Ns = Ng;
   if (hg->normals != nullptr) {
@@ -2320,6 +2710,8 @@ extern "C" __global__ void __closesthit__ch() {
   h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
   h = (h >> 22u) ^ h;
   v->object_random = (float)h * (1.0f / 4294967296.0f);
+  v->mesh_light_idx = hg->area_light_group;
+  v->prim_area = prim_area;
   v->hit = 1;
 }
 
@@ -2566,8 +2958,15 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
     // just past it and shade it as a dark interior. The back-face advance
     // mimics Cycles' "skip the whole hidden object" intent.
     float ray_tmin = (bounce == 0 && camera_skip == 0) ? first_ray_tmin : 1e-4f;
+    // Per-bounce visibility mask: primary radiance (0x01) for camera ray
+    // and specular bounce chains, secondary radiance (0x04) for diffuse
+    // bounces. Camera-hidden emissive instances drop their 0x01 bit so
+    // they appear in the lighting solution (via mesh-light NEE +
+    // diffuse-bounce hits) but stay invisible to the camera/specular
+    // path — matches Cycles' Ray Visibility → Camera flag semantics.
+    unsigned int rad_mask = (bounce == 0 || last_specular) ? 0x01u : 0x04u;
     optixTrace(params.traversable, origin, dir, ray_tmin, 1e20f, 0.0f,
-               OptixVisibilityMask(0x01), OPTIX_RAY_FLAG_NONE,
+               OptixVisibilityMask(rad_mask), OPTIX_RAY_FLAG_NONE,
                0, // SBT offset (radiance ray type)
                2, // SBT stride (2 ray types: radiance + shadow)
                0, // miss index (radiance miss)
@@ -2724,6 +3123,46 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
       if (bounce > 0)
         bg_contrib = clamp_indirect(bg_contrib, params.clamp_indirect);
       L = L + bg_contrib;
+
+      // Sun-light MIS BSDF-side branch: when a BSDF-sampled scatter ray
+      // happens to land inside a SunLight's cone, deliver the sun's
+      // emission weighted against the cone-sampler pdf
+      // (`pdf_sun = 1/sun_omega`). Sun is removed from the envmap during
+      // extraction, so `bg` above is the residual sky only — without
+      // this branch BSDF samples that hit the sun direction would carry
+      // ~zero radiance and miss the highlight that NEE alone leaves
+      // noisy on glossy/specular surfaces aimed at the sun. Skipped on
+      // camera/specular rays where w_bsdf = 1 already (NEE didn't fire
+      // on delta lobes at the previous vertex, so the sun's emission
+      // would arrive unweighted from the surface-hit branch instead —
+      // but the sun isn't a surface we hit in BLAS, so even there the
+      // contribution would be lost without this code).
+      for (int i = 0; i < params.num_sun_lights; i++) {
+        SunLight &sl = params.sun_lights[i];
+        float3 sun_dir = make_f3(sl.direction);
+        float cos_to_sun = dot3(dir, sun_dir);
+        if (cos_to_sun <= sl.cos_angle)
+          continue;
+        // Inside this sun's cone — deliver Le_per_dir × MIS weight.
+        // The kernel's `emission` field stores `Le × sun_omega`, so
+        // we recover Le by dividing back out.
+        float sun_omega = 2.0f * M_PIf * fmaxf(1.0f - sl.cos_angle, 1e-30f);
+        float pdf_sun = 1.0f / sun_omega;
+        float w_bsdf;
+        if (bounce == 0 || last_specular) {
+          // Camera ray or after specular chain: NEE didn't fire on the
+          // delta lobe at the previous vertex (or there was no previous
+          // vertex), so the sun's emission arrives unweighted here.
+          w_bsdf = 1.0f;
+        } else {
+          w_bsdf = power_heuristic(prev_bsdf_pdf, pdf_sun);
+        }
+        float3 Le_sun = make_f3(sl.emission) / sun_omega;
+        float3 sun_contrib = throughput * Le_sun * w_bsdf;
+        if (bounce > 0)
+          sun_contrib = clamp_indirect(sun_contrib, params.clamp_indirect);
+        L = L + sun_contrib;
+      }
       break;
     }
 
@@ -2749,31 +3188,96 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
       continue;
     }
 
-    MaterialEval e = eval_material(v, min_alpha);
+    // Stack-allocated leaves of the material's binary Mix tree. Lifetime
+    // covers every direct_light / sample_bsdf call that reads `e_group`.
+    MaterialEval e_slots[MAX_LEAVES];
+    float e_weights[MAX_LEAVES];
+    int e_n = eval_material(v, e_slots, e_weights, MAX_LEAVES, min_alpha);
+    MaterialEvalGroup e_group = {e_slots, e_weights, e_n};
     // Flip normal if ray hit backside (for dielectric transmission). Mirror
     // the bitangent instead of rebuilding the frame so the authored tangent
     // rotation (anisotropy axis) survives on back-faces; negating one axis
-    // keeps (T, B, Ns) right-handed. Also invert e.ior: sample_bsdf and
+    // keeps (T, B, Ns) right-handed. Also invert ior: sample_bsdf and
     // eval_bsdf read it as η_t/η_i for the current incident side, so on a
     // back-face hit (ray exiting the medium) we need 1/ior to get correct
-    // Fresnel and TIR.
+    // Fresnel and TIR. Apply uniformly across every leaf — they all share
+    // the surface; only per-lobe params differ.
     if (dot3(v.Ns, -dir) < 0.0f) {
-      e.Ns = -e.Ns;
-      e.B = -e.B;
-      e.ior = 1.0f / e.ior;
+      for (int i = 0; i < e_n; ++i) {
+        e_slots[i].Ns = -e_slots[i].Ns;
+        e_slots[i].B = -e_slots[i].B;
+        e_slots[i].ior = 1.0f / e_slots[i].ior;
+      }
+    }
+    // Build a scalar/aggregate `e` that legacy code paths can read for
+    // surface-level properties (Ns / T / B / ior / mat / emission). The
+    // per-leaf eval/sample paths consume `e_group` directly.
+    MaterialEval e = e_slots[0];
+    {
+      float3 em = make_float3(0.0f, 0.0f, 0.0f);
+      for (int i = 0; i < e_n; ++i)
+        em = em + e_slots[i].emission * e_weights[i];
+      e.emission = em;
     }
 
-    // Emission (add on primary or after specular bounce)
+    // Emission gate. Three cases:
+    //   1. Camera ray (bounce == 0) or after a specular chain
+    //      (last_specular): NEE didn't sample this surface (no NEE on
+    //      delta lobes), so the BSDF is the only path and we add full
+    //      emission unweighted.
+    //   2. Diffuse bounce that landed on a registered mesh-light triangle:
+    //      NEE *did* sample this lamp, so we MIS-weight the BSDF-side
+    //      contribution against the NEE-side. Power heuristic with β=2,
+    //      same as the envmap miss block. Without this branch the BSDF
+    //      side was wasted (legacy gate suppressed it) and noisy small
+    //      lamps were sampled at NEE's mercy alone.
+    //   3. Diffuse bounce on an emissive surface that *isn't* in any
+    //      mesh-light (textured emission, camera-hidden rect-proxy
+    //      meshes, or any constant-emission material on an unregistered
+    //      object): emission is dropped — the same legacy behaviour
+    //      that's been in place since before mesh-light NEE existed.
+    //      Promoting more meshes through the mesh-light path is the
+    //      proper fix; double-counting them here without NEE coverage
+    //      would over-deliver.
     if (bounce == 0 || last_specular) {
       float3 e_contrib = throughput * e.emission;
       if (bounce > 0)
         e_contrib = clamp_indirect(e_contrib, params.clamp_indirect);
       L = L + e_contrib;
+    } else if (v.mesh_light_idx >= 0 && v.mat != nullptr
+               && v.mat->emission_tex == nullptr
+               && luminance(e.emission) > 0.0f
+               && params.mesh_light_total_power > 0.0f
+               && v.prim_area > 1e-12f
+               && prev_bsdf_pdf > 0.0f) {
+      // Mesh-light pdf evaluated at this hit. The joint pmf
+      // `pmf_outer × pmf_tri` reduces to `area × lum / total_power`
+      // regardless of which mesh-light owns this triangle (the
+      // per-light index cancels in the product), so we don't need to
+      // look up `mesh_light_idx` to recover the right pdf.
+      float3 ld = v.P - origin;
+      float d2 = dot3(ld, ld);
+      float lum_e = luminance(e.emission);
+      // `dir` is the incoming ray direction (origin → hit). cos_light is
+      // the angle between the surface normal and -dir. Two-sided emitters
+      // (the default for emissive meshes registered as mesh-lights —
+      // matches the NEE block above) take the absolute value.
+      float cos_light = fabsf(dot3(v.Ng, dir));
+      if (cos_light > 1e-6f) {
+        float pmf = v.prim_area * lum_e /
+                    fmaxf(params.mesh_light_total_power, 1e-30f);
+        float pdf_solid = d2 / fmaxf(v.prim_area * cos_light, 1e-30f);
+        float pdf_light = pdf_solid * pmf;
+        float w_bsdf = power_heuristic(prev_bsdf_pdf, pdf_light);
+        float3 e_contrib = throughput * e.emission * w_bsdf;
+        e_contrib = clamp_indirect(e_contrib, params.clamp_indirect);
+        L = L + e_contrib;
+      }
     }
 
     // NEE
     float3 wo = -dir;
-    float3 nee = throughput * direct_light(e, v.P, wo, rng, vstack);
+    float3 nee = throughput * direct_light(e_group, v.P, wo, rng, vstack);
     // bounce==0 → camera-ray NEE, clamp via Cycles' sample_clamp_direct.
     // bounce>0 → indirect-bounce NEE, clamp via sample_clamp_indirect.
     // Cycles applies clamping at exactly the same path-vertex layering.
@@ -2784,7 +3288,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
     L = L + nee;
 
     // Sample BSDF for next bounce
-    BsdfSample bs = sample_bsdf(e, wo, rng);
+    BsdfSample bs = sample_bsdf(e_group, wo, rng);
     if (bs.pdf <= 0.0f)
       break;
     float3 contrib = bs.f / bs.pdf;
@@ -2924,7 +3428,16 @@ extern "C" __global__ void __raygen__rg() {
     float3 alb = make_float3(0, 0, 0);
     float3 nrm = make_float3(0, 0, 0);
     if (v.hit != 0) {
-      MaterialEval e = eval_material(v);
+      // AOV pass only reads albedo / normal — the secondary's color is
+      // not blended in here (would smear the denoiser's albedo guide on
+      // multi-lobe materials). Ask eval_material for just the leftmost
+      // leaf (max_leaves=1) so the AOV reads the primary closure's
+      // colour verbatim — same Cycles approximation Cycles uses for its
+      // denoiser albedo guide.
+      MaterialEval e_aov_slots[1];
+      float e_aov_weights[1];
+      int n = eval_material(v, e_aov_slots, e_aov_weights, 1);
+      MaterialEval e = (n > 0) ? e_aov_slots[0] : eval_material_one(v, v.mat);
       if (dot3(e.Ns, -dir0) < 0.0f)
         e.Ns = -e.Ns;
       alb = e.base_color;

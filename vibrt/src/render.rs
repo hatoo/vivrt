@@ -10,6 +10,7 @@
 
 use crate::gpu_types::*;
 use crate::scene_format;
+use crate::scene_loader;
 use crate::scene_loader::LoadedScene;
 use crate::{camera, pipeline, principled, CudaResultExt};
 
@@ -191,6 +192,7 @@ struct GasEntry {
     sbt_offset: u32,
     transform: [f32; 12],
     cast_shadow: bool,
+    camera_visible: bool,
 }
 
 fn build_rect_light_cdf(rects: &[AreaRectLight]) -> Vec<f32> {
@@ -241,7 +243,7 @@ pub fn render_to_pixels(
     render_settings.max_depth = render_settings.max_depth.min(31);
 
     progress.log(&format!(
-        "Scene: {}x{} @ {} spp, {} objects, {} meshes, {} mats, {} textures, lights(p/s/spot/rect): {}/{}/{}/{}",
+        "Scene: {}x{} @ {} spp, {} objects, {} meshes, {} mats, {} textures, lights(p/s/spot/rect/mesh): {}/{}/{}/{}/{}",
         render_settings.width,
         render_settings.height,
         render_settings.spp,
@@ -253,6 +255,7 @@ pub fn render_to_pixels(
         scene.sun_lights.len(),
         scene.spot_lights.len(),
         scene.rect_lights.len(),
+        scene.mesh_lights.len(),
     ));
 
     let cuda_ctx = CudaContext::new(0).cuda().context("CUDA context")?;
@@ -318,7 +321,15 @@ pub fn render_to_pixels(
     )
     .context("pipeline")?
     .value;
-    pipeline.set_stack_size(2048, 2048, 2048, 2)?;
+    // 4096 bytes for the continuation stack (was 2048): trace_path
+    // stack-allocates a small array of MaterialEval slots (one per
+    // secondary closure level) so nested MixShader chains can be
+    // evaluated; with MAX_SECONDARY=3 in devicecode.cu, four
+    // ~144-byte MaterialEvals plus the surrounding locals push past
+    // 2048 on classroom and trip CUDA_ERROR_INVALID_PC. Doubling
+    // restores headroom; OptiX recomputes per-thread stacks lazily so
+    // there's no static cost when shallow scenes are rendered.
+    pipeline.set_stack_size(2048, 2048, 4096, 2)?;
 
     // --- Upload textures (shared across materials) ---
     let mut _tex_buffers: Vec<CudaSlice<f32>> = Vec::new();
@@ -335,28 +346,86 @@ pub fn render_to_pixels(
     // holds a pointer back to it (or null when absent).
     let mut _volume_storage: Vec<optix_sys::CUdeviceptr> = Vec::new();
     let mut mat_device_ptrs: Vec<optix_sys::CUdeviceptr> = Vec::new();
-    for mat in &scene.file.materials {
+    // Recursively upload one material node (and its left/right binary-tree
+    // children, when present) to the device, returning the device pointer
+    // to its PrincipledGpu. Each call may allocate its own color graph
+    // buffer + volume buffer + child sub-trees. The depth cap is a sanity
+    // guard against producer bugs — even a fully balanced 4-leaf tree only
+    // recurses 3 levels deep, so >8 is well past any artist intent.
+    fn upload_one_mat(
+        mat: &scene_format::PrincipledMaterial,
+        tex_slots: &[(optix_sys::CUdeviceptr, i32, i32)],
+        stream: &Arc<CudaStream>,
+        color_graph_buffers: &mut Vec<CudaSlice<u32>>,
+        color_graph_lut_buffers: &mut Vec<CudaSlice<f32>>,
+        volume_storage: &mut Vec<optix_sys::CUdeviceptr>,
+        depth: u32,
+    ) -> Result<optix_sys::CUdeviceptr> {
+        if depth > 8 {
+            anyhow::bail!(
+                "PrincipledMaterial Mix tree deeper than 8 levels — likely a \
+                 producer-side bug; refusing to recurse further"
+            );
+        }
         let graph = match &mat.color_graph {
             Some(g) => principled::upload_color_graph(
                 g,
-                &tex_slots,
-                &stream,
-                &mut _color_graph_buffers,
-                &mut _color_graph_lut_buffers,
+                tex_slots,
+                stream,
+                color_graph_buffers,
+                color_graph_lut_buffers,
             )?,
             None => principled::ColorGraphGpu::default(),
         };
         let volume_ptr = match &mat.volume {
             Some(v) => {
                 let vg = principled::make_volume_gpu(v);
-                let p = alloc_and_copy(&stream, &vg)?;
-                _volume_storage.push(p);
+                let p = alloc_and_copy(stream, &vg)?;
+                volume_storage.push(p);
                 p
             }
             None => 0,
         };
-        let gpu = principled::make_material_data(mat, &tex_slots, graph, volume_ptr);
-        mat_device_ptrs.push(alloc_and_copy(&stream, &gpu)?);
+        let secondary_ptr = match &mat.secondary {
+            Some(sec) => upload_one_mat(
+                sec,
+                tex_slots,
+                stream,
+                color_graph_buffers,
+                color_graph_lut_buffers,
+                volume_storage,
+                depth + 1,
+            )?,
+            None => 0,
+        };
+        let left_subtree_ptr = match &mat.left_subtree {
+            Some(lhs) => upload_one_mat(
+                lhs,
+                tex_slots,
+                stream,
+                color_graph_buffers,
+                color_graph_lut_buffers,
+                volume_storage,
+                depth + 1,
+            )?,
+            None => 0,
+        };
+        let gpu = principled::make_material_data(
+            mat, tex_slots, graph, volume_ptr, secondary_ptr, left_subtree_ptr,
+        );
+        Ok(alloc_and_copy(stream, &gpu)?)
+    }
+    for mat in &scene.file.materials {
+        let p = upload_one_mat(
+            mat,
+            &tex_slots,
+            &stream,
+            &mut _color_graph_buffers,
+            &mut _color_graph_lut_buffers,
+            &mut _volume_storage,
+            0,
+        )?;
+        mat_device_ptrs.push(p);
     }
     // World volume sits in LaunchParams and is shared by every ray that
     // doesn't enter a tighter mesh-bounded volume. Allocated once.
@@ -490,6 +559,21 @@ pub fn render_to_pixels(
     }
     stream.synchronize().cuda()?;
 
+    // Reverse mapping object_idx → mesh_light_idx (or -1 when the object
+    // isn't registered as a mesh-light). Built before the SBT loop so each
+    // HitGroupData can carry the right `area_light_group`. The mesh-light
+    // device upload itself happens later (after light gathering) — it
+    // only consumes the table; doesn't write to it.
+    let object_to_mesh_light: Vec<i32> = {
+        let mut m = vec![-1i32; scene.objects.len()];
+        for (i, ml) in scene.mesh_lights.iter().enumerate() {
+            if let Some(slot) = m.get_mut(ml.object_idx as usize) {
+                *slot = i as i32;
+            }
+        }
+        m
+    };
+
     // --- Build per-object SBT records (2 per object: radiance + shadow) ---
     let mut tri_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
     let mut gas_entries: Vec<GasEntry> = Vec::new();
@@ -534,7 +618,14 @@ pub fn render_to_pixels(
             indices: m.d_indices,
             uvs: m.d_uvs,
             num_vertices: m.num_verts,
-            area_light_group: -1,
+            // Mesh-light index for this instance, or -1 when the object
+            // isn't registered for mesh-light NEE. The closest-hit shader
+            // checks `>= 0` to enable MIS-weighting of BSDF-sampled
+            // emission against the NEE sampler.
+            area_light_group: object_to_mesh_light
+                .get(obj_idx)
+                .copied()
+                .unwrap_or(-1),
             material_indices: m.d_mat_indices,
             materials: materials_ptr,
             num_materials,
@@ -548,6 +639,7 @@ pub fn render_to_pixels(
             sbt_offset: (obj_idx as u32) * 2,
             transform: obj.transform,
             cast_shadow: scene.file.objects[obj_idx].cast_shadow,
+            camera_visible: scene.file.objects[obj_idx].camera_visible,
         });
     }
 
@@ -555,19 +647,34 @@ pub fn render_to_pixels(
     if gas_entries.is_empty() {
         anyhow::bail!("no geometry in scene");
     }
-    // Visibility mask bits: 0x01 = visible to radiance rays (everyone),
-    // 0x02 = blocks shadow rays (default; off for objects with cast_shadow=false).
+    // Visibility mask bits (mirrored in `scene_loader::VIS_MASK_*`):
+    //   0x01 = primary radiance (camera ray + specular bounce chain)
+    //   0x02 = shadow ray (= "blocks NEE shadow rays from receivers"
+    //          when AND-masked into the ray's mask)
+    //   0x04 = secondary radiance (diffuse bounce continuation)
+    // Camera-hidden emissive meshes drop the 0x01 bit so camera/specular
+    // rays pass straight through, while still appearing on diffuse-bounce
+    // rays + appearing as a NEE source via mesh-lights.
     let instances: Vec<optix_sys::OptixInstance> = gas_entries
         .iter()
         .enumerate()
-        .map(|(i, e)| optix_sys::OptixInstance {
-            transform: e.transform,
-            instanceId: i as u32,
-            sbtOffset: e.sbt_offset,
-            visibilityMask: if e.cast_shadow { 0x03 } else { 0x01 },
-            flags: optix_sys::OptixInstanceFlags::OPTIX_INSTANCE_FLAG_NONE.0 as u32,
-            traversableHandle: e.handle,
-            pad: [0; 2],
+        .map(|(i, e)| {
+            let mut mask: u32 = scene_loader::VIS_MASK_SECONDARY;
+            if e.camera_visible {
+                mask |= scene_loader::VIS_MASK_PRIMARY;
+            }
+            if e.cast_shadow {
+                mask |= scene_loader::VIS_MASK_SHADOW;
+            }
+            optix_sys::OptixInstance {
+                transform: e.transform,
+                instanceId: i as u32,
+                sbtOffset: e.sbt_offset,
+                visibilityMask: mask,
+                flags: optix_sys::OptixInstanceFlags::OPTIX_INSTANCE_FLAG_NONE.0 as u32,
+                traversableHandle: e.handle,
+                pad: [0; 2],
+            }
         })
         .collect();
     let d_instances = alloc_and_copy_slice(&stream, &instances)?;
@@ -649,6 +756,80 @@ pub fn render_to_pixels(
     let d_rects = alloc_and_copy_slice(&stream, &rect_lights)?;
     let rect_cdf = build_rect_light_cdf(&rect_lights);
     let d_rect_cdf = alloc_and_copy_slice(&stream, &rect_cdf)?;
+
+    // Mesh lights: convert each host triangle into the GPU `MeshLightTri`
+    // POD, resolving `emission_tex_idx` to the device-side texture
+    // pointer/dimensions from `tex_slots`. Then upload per-triangle
+    // table + inner CDF, copy the outer `MeshLight` array, and build
+    // the outer CDF over per-light total power.
+    let mut mesh_lights_gpu: Vec<MeshLight> = Vec::with_capacity(scene.mesh_lights.len());
+    let mut mesh_light_outer_cdf = vec![0.0f32; scene.mesh_lights.len() + 1];
+    for (i, ml) in scene.mesh_lights.iter().enumerate() {
+        let gpu_tris: Vec<MeshLightTri> = ml
+            .triangles
+            .iter()
+            .map(|t| {
+                let (tex_ptr, tex_w, tex_h, tex_c) = match t.emission_tex_idx {
+                    Some(idx) => match tex_slots.get(idx as usize).copied() {
+                        // tex_slots returns (CUdeviceptr, w, h); channels
+                        // are always 4 in vibrt's texture pipeline (RGBA
+                        // f32). Mirrors how `make_material_data` resolves
+                        // texture slots in principled.rs.
+                        Some((p, w, h)) => (p, w, h, 4),
+                        None => (0, 0, 0, 0),
+                    },
+                    None => (0, 0, 0, 0),
+                };
+                MeshLightTri {
+                    v0: t.v0,
+                    _pad0: 0.0,
+                    v1: t.v1,
+                    _pad1: 0.0,
+                    v2: t.v2,
+                    area: t.area,
+                    emission: t.emission,
+                    _pad2: 0.0,
+                    uv0: t.uv0,
+                    uv1: t.uv1,
+                    uv2: t.uv2,
+                    _pad3: [0.0, 0.0],
+                    emission_tex: tex_ptr,
+                    emission_tex_w: tex_w,
+                    emission_tex_h: tex_h,
+                    emission_tex_channels: tex_c,
+                    _pad4: [0, 0, 0],
+                }
+            })
+            .collect();
+        let d_tris = alloc_and_copy_slice(&stream, &gpu_tris)?;
+        let d_cdf = alloc_and_copy_slice(&stream, &ml.cdf)?;
+        mesh_lights_gpu.push(MeshLight {
+            triangles: d_tris,
+            cdf: d_cdf,
+            num_triangles: ml.triangles.len() as u32,
+            two_sided: if ml.two_sided { 1 } else { 0 },
+            power: ml.power,
+            _pad: 0,
+        });
+        mesh_light_outer_cdf[i + 1] = mesh_light_outer_cdf[i] + ml.power.max(0.0);
+    }
+    let mesh_light_total_power = *mesh_light_outer_cdf.last().unwrap_or(&0.0);
+    if mesh_light_total_power > 0.0 {
+        let inv = 1.0 / mesh_light_total_power;
+        for v in mesh_light_outer_cdf.iter_mut().skip(1) {
+            *v *= inv;
+        }
+    }
+    let d_mesh_lights = if mesh_lights_gpu.is_empty() {
+        0
+    } else {
+        alloc_and_copy_slice(&stream, &mesh_lights_gpu)?
+    };
+    let d_mesh_light_cdf = if mesh_lights_gpu.is_empty() {
+        0
+    } else {
+        alloc_and_copy_slice(&stream, &mesh_light_outer_cdf)?
+    };
 
     // --- World / envmap ---
     let (world_type, world_color, world_strength) = match &scene.file.world {
@@ -780,6 +961,10 @@ pub fn render_to_pixels(
         num_rect_lights: scene.rect_lights.len() as i32,
         rect_lights: d_rects,
         rect_light_cdf: d_rect_cdf,
+        num_mesh_lights: scene.mesh_lights.len() as i32,
+        mesh_lights: d_mesh_lights,
+        mesh_light_cdf: d_mesh_light_cdf,
+        mesh_light_total_power,
         world_type,
         world_color,
         world_strength,

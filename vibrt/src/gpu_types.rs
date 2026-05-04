@@ -150,6 +150,26 @@ pub struct PrincipledGpu {
     /// transmission — matches Cycles' `alpha × principled +
     /// (1-alpha) × transparent` blend. Default 1.0 = fully opaque.
     pub alpha_blend: f32,
+    /// Right child of a binary Mix node. Null = no Mix (leaf), unless
+    /// `left_subtree` is also non-null (balanced internal node). When
+    /// non-null, `mix_fac × mix_fac_tex(uv)` is the right-side weight in
+    /// [0, 1]. The kernel walks the binary tree (left, right, mix_fac)
+    /// into a flat list of (closure, weight) leaves and evaluates them
+    /// as a weighted sum.
+    pub secondary: optix_sys::CUdeviceptr,
+    /// Left child of a binary Mix node. Null + `secondary != null` means
+    /// the left side is "this node's own lobe params used as a leaf"
+    /// (the right-leaning compact case — `Mix(A, …)`). Non-null lets the
+    /// exporter encode `Mix(Mix(A,B), C)` and balanced topologies
+    /// (`Mix(Mix(A,B), Mix(C,D))`) where the left side is itself a
+    /// sub-Mix. Internal nodes (`secondary != null && left_subtree !=
+    /// null`) ignore their own lobe params.
+    pub left_subtree: optix_sys::CUdeviceptr,
+    pub mix_fac: f32,
+    pub mix_fac_tex: optix_sys::CUdeviceptr,
+    pub mix_fac_tex_w: i32,
+    pub mix_fac_tex_h: i32,
+    pub mix_fac_tex_channels: i32,
 }
 
 /// Homogeneous volume parameters precomputed by the host. Layout mirrors
@@ -277,6 +297,59 @@ pub struct AreaRectLight {
     pub light_rotation: [f32; 9],
 }
 
+/// Single triangle of an emissive mesh, prepared for NEE sampling. World-
+/// space vertices baked at scene-load time so the device doesn't have to
+/// reach back through the instance transform. `area` and `emission` feed
+/// the per-triangle CDF (weight = area * luminance(emission)) and the
+/// NEE-side radiance lookup.
+///
+/// For materials with textured emission, the kernel uses the per-vertex
+/// UVs to sample the texture at the barycentric NEE-sample point —
+/// preserving the texture's spatial detail across the triangle. When
+/// `emission_tex == 0` the triangle is constant-emissive and the kernel
+/// just uses `emission` directly. The constant `emission` field also
+/// scales the texture sample (multiplicative pre-factor for emission
+/// strength), matching Cycles' Principled BSDF emission strength path.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct MeshLightTri {
+    pub v0: [f32; 3],
+    pub _pad0: f32,
+    pub v1: [f32; 3],
+    pub _pad1: f32,
+    pub v2: [f32; 3],
+    pub area: f32,
+    pub emission: [f32; 3],
+    pub _pad2: f32,
+    pub uv0: [f32; 2],
+    pub uv1: [f32; 2],
+    pub uv2: [f32; 2],
+    pub _pad3: [f32; 2],
+    pub emission_tex: optix_sys::CUdeviceptr,
+    pub emission_tex_w: i32,
+    pub emission_tex_h: i32,
+    pub emission_tex_channels: i32,
+    pub _pad4: [i32; 3],
+}
+const _: () = assert!(std::mem::size_of::<MeshLightTri>() == 128);
+
+/// One emissive mesh (or sub-mesh) addressed by NEE. `triangles` and
+/// `cdf` point into per-light device buffers built at scene-load time;
+/// `cdf` has `num_triangles + 1` entries normalised so [0, 1).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct MeshLight {
+    pub triangles: optix_sys::CUdeviceptr,
+    pub cdf: optix_sys::CUdeviceptr,
+    pub num_triangles: u32,
+    /// 1 = emit from both faces (Blender emissive-mesh default).
+    pub two_sided: u32,
+    /// Sum over triangles of `area * luminance(emission)`. Used to build
+    /// the outer CDF over mesh lights.
+    pub power: f32,
+    pub _pad: u32,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct LaunchParams {
@@ -323,6 +396,23 @@ pub struct LaunchParams {
     pub num_rect_lights: i32,
     pub rect_lights: optix_sys::CUdeviceptr,
     pub rect_light_cdf: optix_sys::CUdeviceptr,
+
+    /// Mesh-light NEE: `mesh_lights` is a `MeshLight[num_mesh_lights]`,
+    /// `mesh_light_cdf` is `f32[num_mesh_lights + 1]` normalised over
+    /// per-mesh-light total power (area × luminance(emission)). Each
+    /// `MeshLight` carries its own per-triangle table + inner CDF.
+    pub num_mesh_lights: i32,
+    pub mesh_lights: optix_sys::CUdeviceptr,
+    pub mesh_light_cdf: optix_sys::CUdeviceptr,
+    /// Sum over all mesh-lights of `area_i × luminance(emission_i)`.
+    /// Equals the un-normalised total of the outer CDF — same scalar that
+    /// makes the joint pmf cancel out the per-mesh-light index:
+    ///   `pmf_outer × pmf_tri = (area_t × lum_t) / total_power`
+    /// regardless of which mesh-light owns triangle t. Used in trace_path's
+    /// MIS gate (the BSDF-sampler-side weight) so closest_hit can compute
+    /// the NEE-side pdf at a hit without needing per-instance mesh-light
+    /// indexing or per-triangle id lookups.
+    pub mesh_light_total_power: f32,
 
     /// World background: 0 = constant, 1 = single envmap, 2 = mixed (two layers).
     pub world_type: i32,

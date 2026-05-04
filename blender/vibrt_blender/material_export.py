@@ -116,6 +116,41 @@ def _node_tag(node) -> str:
     return f"{node.name!r} ({node.bl_idname})"
 
 
+def _chain_contains_texsky(sock) -> bool:
+    """Return True if any node feeding `sock` (transitively) is a
+    `ShaderNodeTexSky`. Used to recognise daylight-portal materials —
+    `MixShader(Emission, Transparent)` where Emission's Color is driven
+    by the sky texture is Cycles' canonical portal idiom (a transparent
+    window that helps importance-sample the sky). vibrt has no portal
+    sampling, so the right approximation is to treat the mesh as fully
+    transparent geometry: skip it from the BLAS, sky NEE/miss naturally
+    fires through the empty space, and we avoid double-counting the
+    same sky light via both the world envmap and a fake mesh emitter.
+    """
+    if not getattr(sock, "is_linked", False):
+        return False
+    visited: set[int] = set()
+    stack = [sock]
+    while stack:
+        s = stack.pop()
+        if not getattr(s, "is_linked", False):
+            continue
+        node = s.links[0].from_node
+        key = node.as_pointer()
+        if key in visited:
+            continue
+        visited.add(key)
+        if node.bl_idname == "NodeReroute":
+            stack.append(node.inputs[0])
+            continue
+        if node.bl_idname == "ShaderNodeTexSky":
+            return True
+        for inp in node.inputs:
+            if getattr(inp, "is_linked", False):
+                stack.append(inp)
+    return False
+
+
 def _follow_reroutes(sock):
     """Skip any chain of `NodeReroute` nodes feeding `sock`.
 
@@ -421,13 +456,24 @@ def _socket_f(sock) -> float:
 def _warn_linked_scalar(node, input_name: str) -> float:
     """Return the effective constant value for a scalar input socket.
 
-    If the socket is unlinked, returns its default. If linked, tries an
-    *exact* fold (Value / Math / Clamp / scalar Mix / Invert of a constant) —
-    those chains compute a single deterministic number, so we honour them
-    silently. Lossy paths (texture means, procedural mean-colour
-    substitution) still warn, because the renderer's scalar slot can't
-    carry per-pixel variation and hiding that would silently drop the
-    effect.
+    Tries three strategies in order:
+      1. *Exact* fold (Value / Math / Clamp / scalar Mix / Invert of a
+         constant) — a single deterministic number, honoured silently.
+      2. *Lossy* fold via `_resolve_constant_scalar` — texture mean
+         luminance, ColorRamp average, Invert(texture) mean, etc. Better
+         than the socket's stale default value when the artist's intent
+         was a texture-driven scalar (the socket default is whatever
+         they left in the UI before linking, not what Cycles computes).
+         Emits the warn so the loss of per-pixel variation is visible
+         but uses the lossy mean as the value.
+      3. Socket default — last resort when even the lossy fold returns
+         None (procedural / leaf can't be approximated). Same as the
+         original behaviour.
+
+    Specifically rescues flat_archiviz materials (Pillow_*, Fabric_Sofa,
+    Floor Tiles, Velvet, Fabric Pouf 2) whose `Specular IOR Level` was
+    linked to `Invert(ColorRamp(tex))` and falling back to default 1.0
+    (peak F0 multiplier = 2× over) instead of the texture's mean (~0.5).
     """
     sock = node.inputs.get(input_name)
     if sock is None:
@@ -439,6 +485,16 @@ def _warn_linked_scalar(node, input_name: str) -> float:
     if resolved is not None:
         return resolved
     src = sock.links[0].from_node
+    lossy = _resolve_constant_scalar(sock)
+    if lossy is not None:
+        _warn(
+            f"linked-scalar:{node.as_pointer()}:{input_name}",
+            f"{_node_tag(node)}: input {input_name!r} linked to "
+            f"{src.bl_idname} — folded to lossy mean {lossy:.4f} "
+            f"(per-pixel variation lost; closer to Cycles than the "
+            f"socket default {sock.default_value})",
+        )
+        return lossy
     _warn(
         f"linked-scalar:{node.as_pointer()}:{input_name}",
         f"{_node_tag(node)}: input {input_name!r} linked to {src.bl_idname} "
@@ -4276,33 +4332,51 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
     fac_sock = _follow_reroutes(node.inputs[0])
     view_ior = _view_dependent_ior(fac_sock) if fac_sock.is_linked else None
     if view_ior is not None:
-        # Fresnel/LayerWeight-driven MixShader is Blender's clearcoat
-        # idiom: shader1 is the base lobe, shader2 dominates at grazing.
-        # Decompose shader2 onto the Principled coat lobe above shader1:
-        #   coat_ior       ← factor's Fresnel IOR (matches `fac(c)` in
-        #                    Cycles' `(1-fac)·F₁ + fac·F₂` mix shape)
-        #   coat_weight    ← luminance(shader2.base_color) — Cycles
-        #                    Glossy has F=Schlick(F₀=Color), so shader2's
-        #                    peak reflectance at normal scales the lobe
-        #   coat_roughness ← shader2.roughness
-        # Loses shader2's hue (coat is a white dielectric lobe) but
-        # captures the view-angle falloff and highlight intensity —
-        # what actually sells the metallic paint. Requires the renderer
-        # to importance-sample the coat lobe (see `sample_bsdf`); a pure
-        # eval-only coat over a broad base lobe under-samples the sharp
-        # clearcoat highlight.
-        if (p1.get("coat_weight", 0.0) == 0.0
-                and p2.get("emission", [0, 0, 0]) == [0, 0, 0]
-                and p2.get("transmission", 0.0) == 0.0):
+        # Fresnel/LayerWeight-driven MixShader. Two flavours:
+        #   (a) Disney clearcoat idiom — shader1 is the diffuse-ish base
+        #       lobe, shader2 is a *sharp glossy* lobe that dominates at
+        #       grazing (`Mix(Diffuse, Glossy, fac=Fresnel)`). Routes onto
+        #       the Principled coat slot below: `coat_weight = lum(shader2
+        #       .base_color)`, `coat_roughness = shader2.roughness`,
+        #       `coat_ior = fac's IOR`. Loses shader2's hue (coat is a
+        #       white dielectric lobe) but captures the view-angle falloff
+        #       — what sells the metallic-paint highlight. Importance-
+        #       sampled by `sample_bsdf`'s coat lobe.
+        #   (b) Generic Fresnel-blended pair — neither side is a sharp
+        #       glossy clearcoat (e.g. flat_archiviz Lampshade:
+        #       `Mix(Translucent, Principled-fabric, fac=LayerWeight)`,
+        #       artist's intent "see the opaque fabric at grazing,
+        #       translucency at front"). Treating shader2 as a coat lobe
+        #       there manufactures fake glossy reflection that didn't
+        #       exist in Cycles, over-brightening the lampshade-and-
+        #       surroundings. Compute the hemispheric mean of Fresnel
+        #       (Schlick F_avg = F0 + (1-F0)/21) and fall through to the
+        #       constant-fac secondary closure path so the proper BSDF
+        #       mixture is evaluated.
+        p2_rough = p2.get("roughness", 0.5)
+        is_clearcoat_pattern = (
+            p1.get("coat_weight", 0.0) == 0.0
+            and p2.get("emission", [0, 0, 0]) == [0, 0, 0]
+            and p2.get("transmission", 0.0) == 0.0
+            and p2_rough < 0.3
+            # Sharp-glossy / metal-like — the clearcoat shape. Fabric /
+            # diffuse / translucent shader2 sides fall through.
+            and not p2.get("translucent_weight", 0.0) > 0.0
+            and not p2.get("hair_weight", 0.0) > 0.0
+        )
+        if is_clearcoat_pattern:
             bc2 = p2.get("base_color", [1.0, 1.0, 1.0])
             lum2 = 0.2126 * bc2[0] + 0.7152 * bc2[1] + 0.0722 * bc2[2]
             out = dict(p1)
             out["coat_weight"] = max(0.0, min(1.0, lum2))
-            out["coat_roughness"] = p2.get("roughness", 0.03)
+            out["coat_roughness"] = p2_rough
             out["coat_ior"] = view_ior
             return out
-        return dict(p1)
-    if fac_sock.is_linked:
+        # Generic Fresnel mix → constant fac via Schlick hemispheric mean.
+        # Falls through to the secondary-detection / lerp blocks below.
+        f0 = ((view_ior - 1.0) / (view_ior + 1.0)) ** 2
+        fac = f0 + (1.0 - f0) / 21.0
+    elif fac_sock.is_linked:
         # Special case: MixShader(Principled, Transparent, fac=texture) is
         # Blender's canonical alpha-cutout idiom for vegetation / decals.
         # `fac=0` selects shader1, `fac=1` selects shader2 — for
@@ -4351,10 +4425,207 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
             return dict(p1)
     else:
         fac = _socket_f(fac_sock)
+
+    # Special-case `MixShader(Transparent, OpaqueBSDF, fac)` *before* the
+    # secondary-closure path. Transparent is a delta-passthrough closure —
+    # treating it as a normal BSDF in the secondary mixer would give
+    # `(1-fac)·nothing + fac·BSDF = fac·BSDF`, halving the opaque side
+    # and dropping Cycles' shadow-ray transmission through the
+    # transparent fraction. The kernel's `alpha_blend` field is the
+    # purpose-built path: it carries the opaque-side weight and adds a
+    # straight-through transparent-passthrough branch with weight
+    # `1 - alpha_blend`, exactly mirroring Cycles' Principled `Alpha`
+    # socket / `MixShader(Principled, Transparent)` semantics.
+    #
+    # Triggered when the dedicated alpha-cutout helpers above couldn't
+    # bake the texture-driven mask (complex per-pixel chains like
+    # classroom's `crinkledPaper_paper`, where the mask depends on
+    # ObjectInfo.Random). The constant `fac` we resolved above is then
+    # the average mask value — same per-pixel-detail loss the texture →
+    # constant fallback already accepts elsewhere in the exporter.
+    if n1 is not None and n2 is not None:
+        n1_trans = n1.bl_idname == "ShaderNodeBsdfTransparent"
+        n2_trans = n2.bl_idname == "ShaderNodeBsdfTransparent"
+        if n1_trans and not n2_trans:
+            out = dict(p2)
+            out["alpha_blend"] = max(0.0, min(1.0, fac))
+            if (n2.bl_idname == "ShaderNodeEmission"
+                    and _chain_contains_texsky(n2.inputs["Color"])):
+                out["_is_daylight_portal"] = True
+            return out
+        if n2_trans and not n1_trans:
+            out = dict(p1)
+            out["alpha_blend"] = max(0.0, min(1.0, 1.0 - fac))
+            if (n1.bl_idname == "ShaderNodeEmission"
+                    and _chain_contains_texsky(n1.inputs["Color"])):
+                out["_is_daylight_portal"] = True
+            return out
+
+    # When the two sides differ in lobe character (different shader type
+    # flags, different textures, different colour graphs), single-Principled
+    # lerping loses information that no constant-fold can recover —
+    # `Mix(Diffuse, Glossy)` collapsed to one Principled either drops a
+    # lobe entirely or smears its colour into the other. Emit a true
+    # two-closure material instead so the kernel evaluates the proper
+    # `(1-fac)*primary + fac*secondary` mixture. Cycles' MixShader is a
+    # closure mix at the BSDF level, not a parameter lerp.
+    if (1e-3 < fac < 1.0 - 1e-3
+            and n1 is not None and n2 is not None
+            and _sides_need_secondary(p1, p2)):
+        # Build a binary Mix node. Each side may itself be a Mix sub-tree
+        # (right-leaning, left-leaning, or balanced); the kernel walks
+        # the tree iteratively into a flat list of leaves at hit time
+        # (`devicecode.cu::eval_material`) and evaluates them as a
+        # weighted sum. `MAX_LEAVES=4` in the kernel caps the total leaf
+        # count — _truncate_tree below collapses deeper sub-trees so
+        # neither side individually exceeds half the cap.
+        side_left = _truncate_tree(dict(p1), max_leaves=2)
+        side_right = _truncate_tree(dict(p2), max_leaves=2)
+        # When `side_left` is itself a Mix sub-tree we have to encode it
+        # explicitly via `left_subtree` (the kernel can't recover it from
+        # the outer node's own params). When `side_left` is a plain leaf
+        # (no secondary, no left_subtree) we use the right-leaning compact
+        # encoding: the outer node IS the leaf for the left side, and
+        # `secondary` is the right.
+        is_left_internal = (side_left.get("secondary") is not None
+                            or side_left.get("left_subtree") is not None)
+        if is_left_internal:
+            # Balanced / left-leaning: outer node has no own lobe params;
+            # both children encode independent sub-trees.
+            out = _default_params()
+            out["left_subtree"] = side_left
+            out["secondary"] = side_right
+            out["mix_fac"] = fac
+        else:
+            # Right-leaning compact: outer's own params are the left leaf.
+            out = side_left
+            out["secondary"] = side_right
+            out["mix_fac"] = fac
+        return out
+
+    return _lerp_principled(p1, p2, fac)
+
+
+def _count_leaves(d: dict) -> int:
+    """Count leaves in the binary Mix tree rooted at d (== the number of
+    closures `eval_material` will emit). A leaf has neither `secondary`
+    nor `left_subtree`; an internal node has at least one of them. When
+    a node has `secondary != None && left_subtree == None`, its own params
+    are the left leaf (right-leaning compact encoding)."""
+    has_right = d.get("secondary") is not None
+    has_left = d.get("left_subtree") is not None
+    if not has_right and not has_left:
+        return 1
+    n_left = (_count_leaves(d["left_subtree"]) if has_left else 1)
+    n_right = (_count_leaves(d["secondary"]) if has_right else 0)
+    return n_left + n_right
+
+
+def _truncate_tree(d: dict, max_leaves: int) -> dict:
+    """Collapse the deepest Mix nodes until the tree rooted at `d` has at
+    most `max_leaves` leaves. Returns a deep copy; the caller's dict is
+    never mutated. Strategy: find any internal node whose two children
+    can both be collapsed (cheapest collapse first), and merge them via
+    `_lerp_principled`. Repeat until the leaf count fits."""
+    import copy
+    head = copy.deepcopy(d)
+    # Iterate until we're under the cap or no further collapse possible.
+    for _ in range(8):
+        n = _count_leaves(head)
+        if n <= max_leaves:
+            return head
+        # Find a collapsible internal node — one whose left side is a
+        # right-leaning compact internal (so its left child is the node's
+        # own params) AND whose right side is a leaf. That's the easiest
+        # to collapse via `_lerp_principled` without losing structure
+        # higher up.
+        head = _collapse_one(head, max_leaves)
+    return head
+
+
+def _collapse_one(d: dict, max_leaves: int) -> dict:
+    """Collapse one Mix node in the tree to reduce leaf count by one.
+    Walks the tree recursively, prioritising the deepest internal node
+    that has at least one leaf child. Mutates a copy in-place."""
+    has_right = d.get("secondary") is not None
+    has_left = d.get("left_subtree") is not None
+    if not has_right and not has_left:
+        return d  # leaf, nothing to collapse
+    # Try to collapse children first (depth-first).
+    child_changed = False
+    if has_left:
+        before = _count_leaves(d["left_subtree"])
+        d["left_subtree"] = _collapse_one(d["left_subtree"], max_leaves)
+        if _count_leaves(d["left_subtree"]) < before:
+            child_changed = True
+    if not child_changed and has_right:
+        before = _count_leaves(d["secondary"])
+        d["secondary"] = _collapse_one(d["secondary"], max_leaves)
+        if _count_leaves(d["secondary"]) < before:
+            child_changed = True
+    if child_changed:
+        return d
+    # Otherwise collapse here. Three sub-cases:
+    if has_left and has_right:
+        # Internal node with both children explicit.
+        left = d["left_subtree"]
+        right = d["secondary"]
+        # Both children must already be leaves (we recursed above). Lerp.
+        merged = _lerp_principled(left, right, float(d.get("mix_fac", 0.5)))
+        return merged
+    if has_right and not has_left:
+        # Right-leaning compact (own params = left leaf).
+        right = d["secondary"]
+        own = {k: v for k, v in d.items()
+               if k not in ("secondary", "mix_fac", "left_subtree")}
+        return _lerp_principled(own, right, float(d.get("mix_fac", 0.5)))
+    if has_left and not has_right:
+        # Pathological (exporter doesn't produce). Strip to left.
+        return d["left_subtree"]
+    return d
+
+
+def _truncate_secondary_chain(d: dict, max_depth: int) -> dict:
+    """Walk d's secondary chain. If the chain depth exceeds `max_depth`,
+    collapse the deepest mix via `_lerp_principled` so the chain length
+    drops to `max_depth`. Returns a deep copy; the caller's dict is
+    never mutated. `max_depth=0` means "leaf only" (no secondary at all).
+    """
+    import copy
+    head = copy.deepcopy(d)
+    cur = head
+    depth = 0
+    while cur.get("secondary") is not None:
+        if depth >= max_depth:
+            inner = cur.pop("secondary")
+            inner_fac = cur.pop("mix_fac", 0.0)
+            collapsed = _lerp_principled(
+                {k: v for k, v in cur.items()
+                 if k not in ("secondary", "mix_fac")},
+                inner,
+                float(inner_fac),
+            )
+            # Propagate any further nested secondary up: collapsing the
+            # current pair drops one level, but if `inner` itself had a
+            # secondary chain, it's now living in `collapsed` (lerp
+            # picks dominant side's secondary). Re-walk so the invariant
+            # `chain depth ≤ max_depth` holds at every level.
+            cur.update(collapsed)
+            continue
+        cur = cur["secondary"]
+        depth += 1
+    return head
+
+
+def _lerp_principled(p1: dict, p2: dict, fac: float) -> dict:
+    """Single-Principled lerp of two material params dicts. Used as the
+    legacy fallback when both sides have similar lobe character, and as
+    the depth-2 collapse for nested MixShaders. Picks the dominant side
+    for textures/graphs (since you can't lerp two different textures
+    into one slot) and lerps scalars + base_color.
+    """
     primary = p1 if fac < 0.5 else p2
     out = dict(primary)
-    # Scalar params lerp; textures / graphs / normal maps come from `primary`
-    # (they can't be weighted on the host).
     if "base_color_tex" not in out and "color_graph" not in out:
         bc1, bc2 = p1["base_color"], p2["base_color"]
         out["base_color"] = [
@@ -4379,6 +4650,54 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
     if t1 != 0.0 or t2 != 0.0:
         out["translucent_weight"] = t1 * (1.0 - fac) + t2 * fac
     return out
+
+
+# Per-lobe parameters that the legacy single-Principled lerp can't faithfully
+# combine. When either side carries any of these in a way the other doesn't
+# match, _from_mix routes through the secondary-closure path instead so the
+# kernel can compute the actual `(1-fac)·p1 + fac·p2` BSDF mixture.
+_LOBE_FLAGS = (
+    "pure_diffuse", "pure_glossy", "translucent_weight",
+    "sheen_weight", "sss_weight", "hair_weight", "transmission",
+)
+_LOBE_TEXS = (
+    "base_color_tex", "roughness_tex", "metallic_tex",
+    "normal_tex", "transmission_tex", "emission_tex",
+    "color_graph",
+)
+
+
+def _sides_need_secondary(p1: dict, p2: dict) -> bool:
+    """True when the two MixShader sides differ in a way that a single-
+    Principled lerp can't represent. Conservative: returns False for
+    Mix(Principled_A, Principled_B) where both sides are constant-only
+    Principled with the same lobe budget — the legacy lerp captures
+    those exactly. Returns True as soon as either side has a per-lobe
+    texture / colour graph the other doesn't share, or when their lobe
+    flags (pure_diffuse / pure_glossy / translucent_weight etc.) differ.
+    """
+    # Either side is itself an internal Mix sub-tree → must use closure
+    # mix or we'd silently flatten the sub-tree in `_lerp_principled`.
+    for side in (p1, p2):
+        if side.get("secondary") is not None:
+            return True
+        if side.get("left_subtree") is not None:
+            return True
+    for k in _LOBE_FLAGS:
+        v1 = p1.get(k, 0)
+        v2 = p2.get(k, 0)
+        # Treat True/1 the same; floats compare directly.
+        if isinstance(v1, bool) or isinstance(v2, bool):
+            if bool(v1) != bool(v2):
+                return True
+        elif v1 != v2:
+            return True
+    for k in _LOBE_TEXS:
+        if (k in p1) != (k in p2):
+            return True
+        if k in p1 and p1[k] != p2[k]:
+            return True
+    return False
 
 
 def _from_group(node, writer, textures, mat_name: str) -> dict:
